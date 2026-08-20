@@ -14,11 +14,12 @@
   ],
   "durable_objects": {
     "bindings": [
+      { "name": "Sandbox", "class_name": "Sandbox" },
       { "name": "Agent", "class_name": "HermesAgent" }
     ]
   },
   "migrations": [
-    { "new_sqlite_classes": ["HermesAgent"], "tag": "v1" }
+    { "new_sqlite_classes": ["Sandbox", "HermesAgent"], "tag": "v1" }
   ],
   "r2_buckets": [
     { "binding": "STATE_BUCKET", "bucket_name": "hermes-agent-state" }

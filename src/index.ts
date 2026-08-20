@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import { getSandbox } from "@cloudflare/sandbox";
+export { Sandbox } from "@cloudflare/sandbox";
 import type { Env } from "./env";
 import { HermesAgent } from "./agent";
 
@@ -129,6 +131,52 @@ app.get("/api/status", async (c) => {
   const status = await statusRes.json();
 
   return c.json({ userId, ...status });
+});
+
+// ---------------------------------------------------------------------------
+// Wake sandbox: ensure container is running with tunnel + state
+// ---------------------------------------------------------------------------
+
+app.post("/api/wake", async (c) => {
+  const userId = c.get("userId");
+
+  // Get tunnel token from R2
+  const tokenObj = await c.env.STATE_BUCKET.get(`users/${userId}/cloudflared/token`);
+  if (!tokenObj) {
+    return c.json({ error: "Tunnel not provisioned. Call /api/client-init first." }, 400);
+  }
+  const tunnelToken = await tokenObj.text();
+
+  // Get or create sandbox
+  const sandbox = getSandbox(c.env.Sandbox, userId, {
+    sleepAfter: "30m",
+  });
+
+  // Check if cloudflared is running
+  const ps = await sandbox.exec("pgrep -f 'cloudflared tunnel'");
+  if (ps.exitCode !== 0) {
+    await sandbox.exec(`cloudflared tunnel run --no-autoupdate --token ${tunnelToken}`);
+  }
+
+  // Check if state needs restoring
+  const sentinel = await sandbox.exec("test -f /home/hermes/.local/bin/hermes");
+  if (sentinel.exitCode !== 0) {
+    const stateKey = `users/${userId}/state.sqfs`;
+    const stateObj = await c.env.STATE_BUCKET.get(stateKey);
+    if (stateObj) {
+      const stateData = await stateObj.arrayBuffer();
+      await sandbox.writeFile("/tmp/state.sqfs", new Uint8Array(stateData));
+      await sandbox.exec("unsquashfs -f -d /home/hermes /tmp/state.sqfs");
+    }
+  }
+
+  // Ensure Hermes is running
+  const hermesPs = await sandbox.exec("pgrep -f 'hermes serve'");
+  if (hermesPs.exitCode !== 0) {
+    await sandbox.exec("hermes serve &");
+  }
+
+  return c.json({ userId, status: "awake" });
 });
 
 export { HermesAgent };
