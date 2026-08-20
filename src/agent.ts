@@ -2,11 +2,9 @@ import type { Env } from "./env";
 
 export class HermesAgent {
   private state: DurableObjectState;
-  private env: Env;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
-    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {

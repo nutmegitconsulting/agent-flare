@@ -1,8 +1,13 @@
 import { Hono } from "hono";
 import { getSandbox } from "@cloudflare/sandbox";
-export { Sandbox } from "@cloudflare/sandbox";
+export { HermesSandbox } from "./sandbox";
 import type { Env } from "./env";
 import { HermesAgent } from "./agent";
+
+// Helper to avoid deep type instantiation
+function getSandboxAny(ns: any, id: string, options?: any): any {
+  return getSandbox(ns, id, options);
+}
 
 const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
@@ -19,7 +24,7 @@ app.use("*", async (c, next) => {
       "https://calm-waterfall-91be.cloudflareaccess.com/cdn-cgi/access/certs"
     );
     if (!certsRes.ok) throw new Error("Failed to fetch Access certs");
-    const certs = await certsRes.json<{ keys: { kid: string; x5c: string[] }[] }>();
+    const certs = await certsRes.json() as { keys: { kid: string; x5c: string[] }[] };
 
     const [headerB64, payloadB64] = jwt.split(".");
     const header = JSON.parse(atob(headerB64)) as { kid: string };
@@ -54,21 +59,19 @@ app.post("/api/client-init", async (c) => {
   const id = c.env.Agent.idFromName(userId);
   const stub = c.env.Agent.get(id);
 
-  // Check if already provisioned
   const statusRes = await stub.fetch(new Request("http://internal/status", { method: "GET" }));
-  const status = await statusRes.json<{ provisioned: boolean; hostname?: string }>();
+  const status = await statusRes.json() as { provisioned: boolean; hostname?: string };
 
   if (status.provisioned && status.hostname) {
     return c.json({ userId, hostname: status.hostname, existing: true });
   }
 
-  // Create new tunnel via Cloudflare API
   const tunnelRes = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel`,
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${c.env.CF_API_TOKEN}`,
+        Authorization: "Bearer " + c.env.CF_API_TOKEN,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ name: `hermes-${userId}`, config_src: "cloudflare" }),
@@ -81,18 +84,17 @@ app.post("/api/client-init", async (c) => {
     return c.json({ error: "Failed to create tunnel", detail: err }, 500);
   }
 
-  const tunnelJson = await tunnelRes.json<{ result: { id: string; token: string } }>();
+  const tunnelJson = await tunnelRes.json() as { result: { id: string; token: string } };
   const tunnelId = tunnelJson.result.id;
   const tunnelToken = tunnelJson.result.token;
 
-  // Create DNS route
-  const hostname = `hermes-${userId}.yourdomain.com`; // TODO: replace with your domain
+  const hostname = `hermes-${userId}.yourdomain.com`;
   await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`,
     {
       method: "PUT",
       headers: {
-        Authorization: `Bearer ${c.env.CF_API_TOKEN}`,
+        Authorization: "Bearer " + c.env.CF_API_TOKEN,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -106,20 +108,17 @@ app.post("/api/client-init", async (c) => {
     }
   );
 
-  // Store in DO and R2
   await stub.fetch(new Request("http://internal/set-tunnel", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ hostname, token: tunnelToken }),
   }));
 
-  await c.env.STATE_BUCKET.put(`users/${userId}/cloudflared/token`, tunnelToken);
-
   return c.json({ userId, hostname, existing: false });
 });
 
 // ---------------------------------------------------------------------------
-// Status: check if tunnel and sandbox are ready
+// Status: check if tunnel is ready
 // ---------------------------------------------------------------------------
 
 app.get("/api/status", async (c) => {
@@ -128,9 +127,9 @@ app.get("/api/status", async (c) => {
   const stub = c.env.Agent.get(id);
 
   const statusRes = await stub.fetch(new Request("http://internal/status", { method: "GET" }));
-  const status = await statusRes.json();
+  const status = await statusRes.json() as { provisioned: boolean; hostname: string | null };
 
-  return c.json({ userId, ...status });
+  return c.json({ userId, provisioned: status.provisioned, hostname: status.hostname });
 });
 
 // ---------------------------------------------------------------------------
@@ -140,40 +139,28 @@ app.get("/api/status", async (c) => {
 app.post("/api/wake", async (c) => {
   const userId = c.get("userId");
 
-  // Get tunnel token from R2
-  const tokenObj = await c.env.STATE_BUCKET.get(`users/${userId}/cloudflared/token`);
-  if (!tokenObj) {
+  const agentId = c.env.Agent.idFromName(userId);
+  const agentStub = c.env.Agent.get(agentId);
+  const tunnelRes = await agentStub.fetch(new Request("http://internal/get-tunnel", { method: "GET" }));
+  if (tunnelRes.status !== 200) {
     return c.json({ error: "Tunnel not provisioned. Call /api/client-init first." }, 400);
   }
-  const tunnelToken = await tokenObj.text();
+  const { token: tunnelToken } = await tunnelRes.json() as { token: string };
 
-  // Get or create sandbox
-  const sandbox = getSandbox(c.env.Sandbox, userId, {
-    sleepAfter: "30m",
-  });
+  // getSandbox will create or reuse the container.
+  // The container's entrypoint.sh handles:
+  //   - restoring state from R2 on boot (if sentinel missing)
+  //   - starting cloudflared with the tunnel token
+  //   - starting hermes serve
+  //   - background hourly squashfs snapshots to R2
+  //   - SIGTERM trap for final snapshot before sleep
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId, { sleepAfter: "30m" });
 
-  // Check if cloudflared is running
-  const ps = await sandbox.exec("pgrep -f 'cloudflared tunnel'");
-  if (ps.exitCode !== 0) {
-    await sandbox.exec(`cloudflared tunnel run --no-autoupdate --token ${tunnelToken}`);
-  }
-
-  // Check if state needs restoring
-  const sentinel = await sandbox.exec("test -f /home/hermes/.local/bin/hermes");
-  if (sentinel.exitCode !== 0) {
-    const stateKey = `users/${userId}/state.sqfs`;
-    const stateObj = await c.env.STATE_BUCKET.get(stateKey);
-    if (stateObj) {
-      const stateData = await stateObj.arrayBuffer();
-      await sandbox.writeFile("/tmp/state.sqfs", new Uint8Array(stateData));
-      await sandbox.exec("unsquashfs -f -d /home/hermes /tmp/state.sqfs");
-    }
-  }
-
-  // Ensure Hermes is running
-  const hermesPs = await sandbox.exec("pgrep -f 'hermes serve'");
-  if (hermesPs.exitCode !== 0) {
-    await sandbox.exec("hermes serve &");
+  // Warmup ping to force container creation if sleeping
+  try {
+    await sandbox.fetch(new Request("http://internal/ping", { method: "GET" }));
+  } catch {
+    // container may still be booting; client can retry
   }
 
   return c.json({ userId, status: "awake" });
