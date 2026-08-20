@@ -1,0 +1,21 @@
+{
+  "name": "hermes-cloudflare-v6",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "^0.7.0",
+    "hono": "^4.5.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240806.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.125.0"
+  }
+}

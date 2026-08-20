@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hermes-cloudflare-v6",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-03",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "lite",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "Agent", "class_name": "HermesAgent" }
+    ]
+  },
+  "migrations": [
+    { "new_sqlite_classes": ["HermesAgent"], "tag": "v1" }
+  ],
+  "r2_buckets": [
+    { "binding": "STATE_BUCKET", "bucket_name": "hermes-agent-state" }
+  ],
+  "ai": { "binding": "AI" }
+}
