@@ -16,7 +16,28 @@ This project deploys the Hermes AI Agent inside Cloudflare Sandbox containers, u
 
 ## Quick Start
 
-See `plans/Hermes Implementation Plan V6.md` for full architecture specification.
+See `plans/ONBOARDING.md` for full setup instructions.
+
+## Security Notes
+
+The current implementation places two sensitive values in the container environment via `setEnvVars`:
+
+- **`UPLOAD_TOKEN`** — a global bearer token used by the container to authenticate snapshot uploads to the Worker's `/internal/upload-snapshot` endpoint.
+- **`TUNNEL_TOKEN`** — the per-user Cloudflare Tunnel credential used by `cloudflared tunnel run`.
+
+Both tokens are visible to any process running inside the container, including the Hermes agent itself. This means a compromised or misconfigured AI agent could theoretically read these values and leak them into a repository upload, chat output, or other untrusted destination.
+
+**This is a known compromise.** We accept it for now because:
+
+- The in-container snapshot loop requires some form of authentication to write state back to R2.
+- The Cloudflare Tunnel architecture requires the token to be accessible to the `cloudflared` process.
+- Cloudflare Sandbox is a single-container runtime; there is no sidecar or separate-privilege model to isolate cloudflared from the agent.
+
+**Future hardening (not yet implemented):**
+
+1. **Replace `UPLOAD_TOKEN`** with per-session presigned URLs or SDK `createBackup()` / `restoreBackup()` methods, eliminating the global bearer from container env entirely.
+2. **Move `TUNNEL_TOKEN` to a restricted file** (e.g., `/run/creds.json` with `0400 root:root` permissions) and run `cloudflared` as a separate user from the Hermes agent, preventing accidental reads.
+3. **Evaluate Worker-driven snapshots** as an alternative to the in-container loop, which would remove all upload credentials from the container.
 
 ## License
 
