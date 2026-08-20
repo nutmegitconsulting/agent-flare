@@ -20,16 +20,14 @@ See `plans/Hermes Implementation Plan V6.md` for full architecture specification
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+This project is licensed under the MIT License.
 
-## Attribution
-
-This project is derived from concepts and patterns found in [**hermes-flare**](https://github.com/carimura/hermes-flare) by Carter Morgan. Specifically:
+Portions of this project are derived from [**hermes-flare**](https://github.com/carimura/hermes-flare) by Carter Morgan, which is licensed under the Apache License, Version 2.0. Specifically:
 
 - The R2-backed squashfs state persistence pattern (`createBackup` / `restoreBackup`)
 - The sentinel-file integrity check approach for ephemeral container state hydration
 - The separation of install path (`/opt/hermes-install`) from mutable state (`/home/hermes`)
 
-hermes-flare is licensed under the Apache License, Version 2.0. This project adopts the same license in recognition of its derivative relationship.
+The Apache License, Version 2.0 applies to those derived portions. A copy of the Apache 2.0 license is included in this repository for compliance. All original work in this project is licensed under MIT.
 
 We gratefully acknowledge the hermes-flare project for demonstrating Cloudflare Sandbox persistence patterns that inform this implementation.
