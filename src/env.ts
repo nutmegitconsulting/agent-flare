@@ -9,4 +9,5 @@ export interface Env {
   ACCESS_AUD_TAG: string;
   CF_ACCOUNT_ID: string;
   CF_API_TOKEN: string;
+  UPLOAD_TOKEN: string;
 }

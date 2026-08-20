@@ -12,10 +12,14 @@ function getSandboxAny(ns: any, id: string, options?: any): any {
 const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
 // ---------------------------------------------------------------------------
-// Middleware: Cloudflare Access JWT validation
+// Middleware: Cloudflare Access JWT validation (skip for /internal/*)
 // ---------------------------------------------------------------------------
 
 app.use("*", async (c, next) => {
+  if (c.req.path.startsWith("/internal/")) {
+    return await next();
+  }
+
   const jwt = c.req.header("CF-Access-Jwt-Assertion");
   if (!jwt) return c.text("missing Access JWT", 401);
 
@@ -147,14 +151,17 @@ app.post("/api/wake", async (c) => {
   }
   const { token: tunnelToken } = await tunnelRes.json() as { token: string };
 
-  // getSandbox will create or reuse the container.
-  // The container's entrypoint.sh handles:
-  //   - restoring state from R2 on boot (if sentinel missing)
-  //   - starting cloudflared with the tunnel token
-  //   - starting hermes serve
-  //   - background hourly squashfs snapshots to R2
-  //   - SIGTERM trap for final snapshot before sleep
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId, { sleepAfter: "30m" });
+
+  // Set env vars BEFORE first container interaction so entrypoint sees them on boot
+  const workerOrigin = new URL(c.req.url).origin;
+  await sandbox.setEnvVars({
+    HERMES_USER_ID: userId,
+    CLOUDFLARED_TOKEN: tunnelToken,
+    SNAPSHOT_UPLOAD_URL: `${workerOrigin}/internal/upload-snapshot`,
+    SNAPSHOT_DOWNLOAD_URL: `${workerOrigin}/internal/download-snapshot`,
+    UPLOAD_TOKEN: c.env.UPLOAD_TOKEN,
+  });
 
   // Warmup ping to force container creation if sleeping
   try {
@@ -164,6 +171,91 @@ app.post("/api/wake", async (c) => {
   }
 
   return c.json({ userId, status: "awake" });
+});
+
+// ---------------------------------------------------------------------------
+// Internal: container -> Worker -> R2 snapshot upload
+// ---------------------------------------------------------------------------
+
+app.post("/internal/upload-snapshot", async (c) => {
+  const auth = c.req.header("Authorization");
+  if (!auth || auth !== `Bearer ${c.env.UPLOAD_TOKEN}`) {
+    return c.text("unauthorized", 401);
+  }
+
+  const userId = c.req.header("X-User-Id");
+  const type = c.req.header("X-Snapshot-Type") || "hourly";
+  if (!userId) return c.text("missing X-User-Id", 400);
+
+  const body = await c.req.arrayBuffer();
+  if (!body || body.byteLength === 0) {
+    return c.text("empty body", 400);
+  }
+
+  const key = type === "final"
+    ? `backups/${userId}/final.sqfs`
+    : `backups/${userId}/hourly/${Date.now()}.sqfs`;
+
+  await c.env.BACKUP_BUCKET.put(key, body, {
+    httpMetadata: { contentType: "application/octet-stream" },
+  });
+
+  // Prune old hourly snapshots (keep last 24)
+  if (type === "hourly") {
+    const list = await c.env.BACKUP_BUCKET.list({ prefix: `backups/${userId}/hourly/` });
+    const objects = list.objects.sort(
+      (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+    );
+    for (let i = 24; i < objects.length; i++) {
+      await c.env.BACKUP_BUCKET.delete(objects[i].key);
+    }
+  }
+
+  return c.json({ success: true, key });
+});
+
+// ---------------------------------------------------------------------------
+// Internal: container -> Worker -> R2 snapshot download (for restore)
+// ---------------------------------------------------------------------------
+
+app.get("/internal/download-snapshot", async (c) => {
+  const auth = c.req.header("Authorization");
+  if (!auth || auth !== `Bearer ${c.env.UPLOAD_TOKEN}`) {
+    return c.text("unauthorized", 401);
+  }
+
+  const userId = c.req.query("userId");
+  if (!userId) return c.text("missing userId", 400);
+
+  // Try final first, then latest hourly
+  const finalKey = `backups/${userId}/final.sqfs`;
+  const finalObj = await c.env.BACKUP_BUCKET.head(finalKey);
+  if (finalObj) {
+    const obj = await c.env.BACKUP_BUCKET.get(finalKey);
+    if (obj && obj.body) {
+      return new Response(obj.body, {
+        headers: { "Content-Type": "application/octet-stream" },
+      });
+    }
+  }
+
+  const list = await c.env.BACKUP_BUCKET.list({ prefix: `backups/${userId}/hourly/` });
+  if (!list.objects.length) {
+    return c.text("no snapshot found", 404);
+  }
+
+  const latest = list.objects.sort(
+    (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+  )[0];
+
+  const obj = await c.env.BACKUP_BUCKET.get(latest.key);
+  if (!obj || !obj.body) {
+    return c.text("snapshot not found", 404);
+  }
+
+  return new Response(obj.body, {
+    headers: { "Content-Type": "application/octet-stream" },
+  });
 });
 
 export { HermesAgent };
