@@ -22,6 +22,21 @@ $hostname     = $profile.hostname
 $accessAppUrl = $profile.accessAppUrl
 $localPort    = if ($profile.localPort) { $profile.localPort } else { "9119" }
 
+# Sanitize userId from profile (strip domain from email if present)
+$userId = if ($profile.userId) { $profile.userId.Split("@")[0] } else { $null }
+
+# Display saved session token for Hermes Desktop GUI
+if ($profile.sessionToken) {
+    Write-Host ""
+    Write-Host "========================================"
+    Write-Host "  Hermes Dashboard Session Token"
+    Write-Host "========================================"
+    Write-Host "$($profile.sessionToken)"
+    Write-Host "========================================"
+    Write-Host "Copy the token above into your Hermes Desktop GUI if needed."
+    Write-Host ""
+}
+
 # ---------------------------------------------------------------------------
 # 2. Verify cloudflared
 # ---------------------------------------------------------------------------

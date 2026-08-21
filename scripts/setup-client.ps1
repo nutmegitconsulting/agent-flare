@@ -63,6 +63,10 @@ try {
 
 $hostname = $initRes.hostname
 $userId   = $initRes.userId
+$sessionToken = $initRes.sessionToken
+
+# Sanitize userId for local use (strip domain from email)
+$userId = $userId.Split("@")[0]
 
 if (-not $hostname -or -not $userId) {
     Write-Error "Worker response missing hostname or userId."
@@ -72,6 +76,18 @@ if (-not $hostname -or -not $userId) {
 Write-Host "Tunnel provisioned:"
 Write-Host "  User ID:  $userId"
 Write-Host "  Hostname: $hostname"
+
+# Display session token for Hermes Desktop GUI
+if ($sessionToken) {
+    Write-Host ""
+    Write-Host "========================================"
+    Write-Host "  Hermes Dashboard Session Token"
+    Write-Host "========================================"
+    Write-Host "$sessionToken"
+    Write-Host "========================================"
+    Write-Host "Copy the token above into your Hermes Desktop GUI."
+    Write-Host ""
+}
 
 # ---------------------------------------------------------------------------
 # 4. Wake sandbox container
@@ -112,6 +128,7 @@ $profile = @{
     workerUrl    = $WorkerUrl
     hostname     = $hostname
     userId       = $userId
+    sessionToken = $sessionToken
     accessAppUrl = $AccessAppUrl
     localPort    = $LocalPort
     createdAt    = (Get-Date -Format "o")
