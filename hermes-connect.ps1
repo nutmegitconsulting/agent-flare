@@ -1,6 +1,6 @@
 # Hermes V6 Daily Connector
 # Reads profile from setup-client.ps1 and starts the local TCP proxy.
-# Re-authenticates with Cloudflare Access silently if cached, falls back to browser.
+# Uses cloudflared access curl (avoids PowerShell Invoke-RestMethod / Windows curl alias issues).
 
 param(
     [string]$ProfilePath = (Join-Path $env:USERPROFILE ".hermes-cloudflare-v6\profile.json"),
@@ -34,33 +34,27 @@ if (-not $CloudflaredPath) {
 # 3. Re-authenticate with Cloudflare Access
 # ---------------------------------------------------------------------------
 Write-Host "Authenticating with Cloudflare Access..."
-$jwt = & $CloudflaredPath access token -app=$accessAppUrl 2> $null
-
-if (-not $jwt) {
-    Write-Host "No cached token. Running cloudflared access login..."
-    & $CloudflaredPath access login $accessAppUrl 2> $null
-
-    $jwt = & $CloudflaredPath access token -app=$accessAppUrl 2> $null
-    if (-not $jwt) {
-        Write-Error "Access authentication failed. Complete browser login and retry."
-        exit 1
-    }
+& $CloudflaredPath access login $accessAppUrl 2> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "cloudflared access login failed."
+    exit 1
 }
-
 Write-Host "Access authentication successful."
 
 # ---------------------------------------------------------------------------
 # 4. Wake sandbox (idempotent — no-op if already awake)
 # ---------------------------------------------------------------------------
 Write-Host "Waking sandbox..."
-try {
-    $wakeRes = Invoke-RestMethod -Uri "$workerUrl/api/wake" `
-        -Method POST `
-        -Headers @{ "CF-Access-Jwt-Assertion" = $jwt } `
-        -ContentType "application/json"
-    Write-Host "Sandbox: $($wakeRes.status)"
-} catch {
-    Write-Warning "Wake call failed (may be cold starting): $($_.Exception.Message)"
+$wakeJson = & $CloudflaredPath access curl -s -X POST "$workerUrl/api/wake" 2> $null
+if ($LASTEXITCODE -eq 0 -and $wakeJson) {
+    try {
+        $wakeRes = $wakeJson | ConvertFrom-Json
+        Write-Host "Sandbox: $($wakeRes.status)"
+    } catch {
+        Write-Warning "Non-JSON wake response: $wakeJson"
+    }
+} else {
+    Write-Warning "Wake call failed (may be cold starting or Access token expired)."
 }
 
 # ---------------------------------------------------------------------------
