@@ -3,7 +3,6 @@ import { getSandbox } from "@cloudflare/sandbox";
 import { HermesSandbox } from "./sandbox";
 export { HermesSandbox };
 import type { Env } from "./env";
-import { HermesAgent } from "./agent";
 
 // Helper to avoid deep type instantiation
 function getSandboxAny(ns: any, id: string, options?: any): any {
@@ -56,20 +55,25 @@ app.use("*", async (c, next) => {
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 // ---------------------------------------------------------------------------
-// Client init: provision tunnel for this user
+// Client init: provision tunnel for this user (R2-backed, no DO)
 // ---------------------------------------------------------------------------
 
 app.post("/api/client-init", async (c) => {
   const userId = c.get("userId");
-  const id = c.env.Agent.idFromName(userId);
-  const stub = c.env.Agent.get(id);
+  const credsKey = `users/${userId}/cloudflared/creds.json`;
 
-  const statusRes = await stub.fetch(new Request("http://internal/status", { method: "GET" }));
-  const status = await statusRes.json() as { provisioned: boolean; hostname?: string };
-
-  if (status.provisioned && status.hostname) {
-    return c.json({ userId, hostname: status.hostname, existing: true });
+  // Check if already provisioned in R2
+  const existing = await c.env.BACKUP_BUCKET.head(credsKey);
+  if (existing) {
+    const obj = await c.env.BACKUP_BUCKET.get(credsKey);
+    const data = obj ? await obj.json() as { hostname: string } : null;
+    if (data?.hostname) {
+      return c.json({ userId, hostname: data.hostname, existing: true });
+    }
   }
+
+  // Race: two requests could both pass the head() check above.
+  // We accept this small window; the second write will overwrite with the same data.
 
   const tunnelRes = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel`,
@@ -93,7 +97,7 @@ app.post("/api/client-init", async (c) => {
   const tunnelId = tunnelJson.result.id;
   const tunnelToken = tunnelJson.result.token;
 
-  const hostname = `hermes-${userId}.yourdomain.com`;
+  const hostname = `hermes-${userId}.hermes-test.app`;
   await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`,
     {
@@ -113,11 +117,10 @@ app.post("/api/client-init", async (c) => {
     }
   );
 
-  await stub.fetch(new Request("http://internal/set-tunnel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ hostname, token: tunnelToken }),
-  }));
+  // Store in R2 for persistence across sleeps
+  await c.env.BACKUP_BUCKET.put(credsKey, JSON.stringify({ hostname, token: tunnelToken }), {
+    httpMetadata: { contentType: "application/json" },
+  });
 
   return c.json({ userId, hostname, existing: false });
 });
@@ -128,13 +131,21 @@ app.post("/api/client-init", async (c) => {
 
 app.get("/api/status", async (c) => {
   const userId = c.get("userId");
-  const id = c.env.Agent.idFromName(userId);
-  const stub = c.env.Agent.get(id);
+  const credsKey = `users/${userId}/cloudflared/creds.json`;
 
-  const statusRes = await stub.fetch(new Request("http://internal/status", { method: "GET" }));
-  const status = await statusRes.json() as { provisioned: boolean; hostname: string | null };
+  const obj = await c.env.BACKUP_BUCKET.head(credsKey);
+  const provisioned = !!obj;
 
-  return c.json({ userId, provisioned: status.provisioned, hostname: status.hostname });
+  let hostname: string | null = null;
+  if (provisioned) {
+    const getObj = await c.env.BACKUP_BUCKET.get(credsKey);
+    if (getObj) {
+      const data = await getObj.json() as { hostname: string };
+      hostname = data.hostname || null;
+    }
+  }
+
+  return c.json({ userId, provisioned, hostname });
 });
 
 // ---------------------------------------------------------------------------
@@ -143,14 +154,14 @@ app.get("/api/status", async (c) => {
 
 app.post("/api/wake", async (c) => {
   const userId = c.get("userId");
+  const credsKey = `users/${userId}/cloudflared/creds.json`;
 
-  const agentId = c.env.Agent.idFromName(userId);
-  const agentStub = c.env.Agent.get(agentId);
-  const tunnelRes = await agentStub.fetch(new Request("http://internal/get-tunnel", { method: "GET" }));
-  if (tunnelRes.status !== 200) {
+  const getObj = await c.env.BACKUP_BUCKET.get(credsKey);
+  if (!getObj) {
     return c.json({ error: "Tunnel not provisioned. Call /api/client-init first." }, 400);
   }
-  const { token: tunnelToken } = await tunnelRes.json() as { token: string };
+
+  const { token: tunnelToken } = await getObj.json() as { token: string };
 
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId, { sleepAfter: "30m" });
 
@@ -259,5 +270,4 @@ app.get("/internal/download-snapshot", async (c) => {
   });
 });
 
-export { HermesAgent };
 export default app;
