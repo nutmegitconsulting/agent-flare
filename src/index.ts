@@ -99,7 +99,20 @@ app.post("/api/client-init", async (c) => {
     const obj = await c.env.BACKUP_BUCKET.get(credsKey);
     const data = obj ? await obj.json() as { hostname: string } : null;
     if (data?.hostname) {
-      return c.json({ userId, hostname: data.hostname, existing: true });
+      // Fetch or generate session token even for existing tunnels
+      const tokenKey = `users/${userId}/session-token.json`;
+      let sessionToken = "";
+      const tokenObj = await c.env.BACKUP_BUCKET.get(tokenKey);
+      if (tokenObj) {
+        const tokenData = await tokenObj.json() as { token: string };
+        sessionToken = tokenData.token;
+      } else {
+        sessionToken = generateSessionToken();
+        await c.env.BACKUP_BUCKET.put(tokenKey, JSON.stringify({ token: sessionToken }), {
+          httpMetadata: { contentType: "application/json" },
+        });
+      }
+      return c.json({ userId, hostname: data.hostname, sessionToken, existing: true });
     }
   }
 
@@ -277,6 +290,25 @@ app.post("/api/admin/destroy", async (c) => {
   const userId = c.req.query("userId");
   if (!userId) {
     return c.json({ error: "Missing userId query param" }, 400);
+  }
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  try {
+    await sandbox.destroy();
+    return c.json({ userId, status: "destroyed" });
+  } catch (e: any) {
+    return c.json({ userId, error: e.message || String(e) }, 500);
+  }
+});
+
+// Internal admin: destroy by userId (token-auth, for scripts)
+app.post("/internal/destroy", async (c) => {
+  const auth = c.req.header("Authorization");
+  if (!auth || auth !== `Bearer ${c.env.UPLOAD_TOKEN}`) {
+    return c.text("unauthorized", 401);
+  }
+  const userId = c.req.query("userId");
+  if (!userId) {
+    return c.text("missing userId", 400);
   }
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
   try {
