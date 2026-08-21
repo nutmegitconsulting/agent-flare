@@ -10,27 +10,6 @@ param(
 )
 
 # ---------------------------------------------------------------------------
-# Helper: find real curl.exe (bypass PowerShell curl alias)
-# ---------------------------------------------------------------------------
-$curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
-if (-not $curlExe) {
-    # Try common locations
-    $candidates = @(
-        "C:\Windows\System32\curl.exe",
-        "C:\Windows\SysWOW64\curl.exe",
-        "${env:ProgramFiles}\curl\bin\curl.exe",
-        "${env:LOCALAPPDATA}\Microsoft\WindowsApps\curl.exe"
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { $curlExe = $c; break }
-    }
-}
-if (-not $curlExe) {
-    Write-Error "curl.exe not found. Install curl or add it to PATH."
-    exit 1
-}
-
-# ---------------------------------------------------------------------------
 # 1. Verify cloudflared is installed
 # ---------------------------------------------------------------------------
 if (-not $CloudflaredPath) {
@@ -39,41 +18,39 @@ if (-not $CloudflaredPath) {
     exit 1
 }
 Write-Host "cloudflared found at: $CloudflaredPath"
-Write-Host "curl.exe found at: $curlExe"
 
 # ---------------------------------------------------------------------------
-# 2. Authenticate with Cloudflare Access
+# 2. Authenticate with Cloudflare Access (opens browser once, caches locally)
 # ---------------------------------------------------------------------------
 Write-Host "`nAuthenticating with Cloudflare Access..."
 Write-Host "  App URL: $AccessAppUrl"
 
-# Explicit login first (opens browser, caches token locally)
-& $CloudflaredPath access login $AccessAppUrl 2> $null
+& $CloudflaredPath access login $AccessAppUrl 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "cloudflared access login failed."
+    Write-Error "cloudflared access login failed (exit code $LASTEXITCODE)."
     exit 1
 }
-
-# Retrieve cached token (documented command)
-$jwt = & $CloudflaredPath access token -app=$AccessAppUrl 2> $null
-if (-not $jwt) {
-    Write-Error "cloudflared access token returned empty. Complete browser login and retry."
-    exit 1
-}
-
-Write-Host "Access token acquired."
+Write-Host "Access authentication successful."
 
 # ---------------------------------------------------------------------------
 # 3. Provision tunnel (one-time per user)
 # ---------------------------------------------------------------------------
 Write-Host "`nProvisioning tunnel via Worker..."
 
-$initJson = & $curlExe -s -X POST "$WorkerUrl/api/client-init" `
-    -H "CF-Access-Jwt-Assertion: $jwt" `
-    -H "Content-Type: application/json" 2> $null
+# Use cloudflared access curl (documented at developers.cloudflare.com).
+# We capture stderr too so any error is visible.
+$proc = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$WorkerUrl/api/client-init") `
+    -RedirectStandardOutput "client-init-out.txt" `
+    -RedirectStandardError  "client-init-err.txt" `
+    -Wait -PassThru -NoNewWindow
 
-if ($LASTEXITCODE -ne 0 -or -not $initJson) {
-    Write-Error "HTTP request to /api/client-init failed (curl exit code $LASTEXITCODE, empty response)."
+$initJson = Get-Content "client-init-out.txt" -Raw -ErrorAction SilentlyContinue
+$initErr  = Get-Content "client-init-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "client-init-out.txt", "client-init-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc.ExitCode -ne 0 -or -not $initJson) {
+    Write-Error "cloudflared access curl failed (exit code $($proc.ExitCode)).`nSTDERR:`n$initErr"
     exit 1
 }
 
@@ -101,12 +78,18 @@ Write-Host "  Hostname: $hostname"
 # ---------------------------------------------------------------------------
 Write-Host "`nWaking sandbox container..."
 
-$wakeJson = & $curlExe -s -X POST "$WorkerUrl/api/wake" `
-    -H "CF-Access-Jwt-Assertion: $jwt" `
-    -H "Content-Type: application/json" 2> $null
+$proc2 = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$WorkerUrl/api/wake") `
+    -RedirectStandardOutput "wake-out.txt" `
+    -RedirectStandardError  "wake-err.txt" `
+    -Wait -PassThru -NoNewWindow
 
-if ($LASTEXITCODE -ne 0 -or -not $wakeJson) {
-    Write-Error "HTTP request to /api/wake failed."
+$wakeJson = Get-Content "wake-out.txt" -Raw -ErrorAction SilentlyContinue
+$wakeErr  = Get-Content "wake-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "wake-out.txt", "wake-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc2.ExitCode -ne 0 -or -not $wakeJson) {
+    Write-Error "cloudflared access curl failed (exit code $($proc2.ExitCode)).`nSTDERR:`n$wakeErr"
     exit 1
 }
 
