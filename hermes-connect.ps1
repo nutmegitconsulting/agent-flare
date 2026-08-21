@@ -1,31 +1,11 @@
 # Hermes V6 Daily Connector
 # Reads profile from setup-client.ps1 and starts the local TCP proxy.
-# Uses curl.exe (not PowerShell Invoke-RestMethod) to avoid Windows curl alias issues.
+# Uses cloudflared access curl for HTTP calls (avoids PowerShell Invoke-RestMethod issues).
 
 param(
     [string]$ProfilePath = (Join-Path $env:USERPROFILE ".hermes-cloudflare-v6\profile.json"),
     [string]$CloudflaredPath = (Get-Command cloudflared -ErrorAction SilentlyContinue).Source
 )
-
-# ---------------------------------------------------------------------------
-# Helper: find real curl.exe (bypass PowerShell curl alias)
-# ---------------------------------------------------------------------------
-$curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
-if (-not $curlExe) {
-    $candidates = @(
-        "C:\Windows\System32\curl.exe",
-        "C:\Windows\SysWOW64\curl.exe",
-        "${env:ProgramFiles}\curl\bin\curl.exe",
-        "${env:LOCALAPPDATA}\Microsoft\WindowsApps\curl.exe"
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { $curlExe = $c; break }
-    }
-}
-if (-not $curlExe) {
-    Write-Error "curl.exe not found. Install curl or add it to PATH."
-    exit 1
-}
 
 # ---------------------------------------------------------------------------
 # 1. Load profile
@@ -54,28 +34,29 @@ if (-not $CloudflaredPath) {
 # 3. Re-authenticate with Cloudflare Access
 # ---------------------------------------------------------------------------
 Write-Host "Authenticating with Cloudflare Access..."
-& $CloudflaredPath access login $accessAppUrl 2> $null
+& $CloudflaredPath access login $accessAppUrl 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "cloudflared access login failed."
+    Write-Error "cloudflared access login failed (exit code $LASTEXITCODE)."
     exit 1
 }
-
-$jwt = & $CloudflaredPath access token -app=$accessAppUrl 2> $null
-if (-not $jwt) {
-    Write-Error "cloudflared access token returned empty."
-    exit 1
-}
-Write-Host "Access token acquired."
+Write-Host "Access authentication successful."
 
 # ---------------------------------------------------------------------------
 # 4. Wake sandbox (idempotent — no-op if already awake)
 # ---------------------------------------------------------------------------
 Write-Host "Waking sandbox..."
-$wakeJson = & $curlExe -s -X POST "$workerUrl/api/wake" `
-    -H "CF-Access-Jwt-Assertion: $jwt" `
-    -H "Content-Type: application/json" 2> $null
 
-if ($LASTEXITCODE -eq 0 -and $wakeJson) {
+$proc = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$workerUrl/api/wake") `
+    -RedirectStandardOutput "wake-out.txt" `
+    -RedirectStandardError  "wake-err.txt" `
+    -Wait -PassThru -NoNewWindow
+
+$wakeJson = Get-Content "wake-out.txt" -Raw -ErrorAction SilentlyContinue
+$wakeErr  = Get-Content "wake-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "wake-out.txt", "wake-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc.ExitCode -eq 0 -and $wakeJson) {
     try {
         $wakeRes = $wakeJson | ConvertFrom-Json
         Write-Host "Sandbox: $($wakeRes.status)"
@@ -83,7 +64,7 @@ if ($LASTEXITCODE -eq 0 -and $wakeJson) {
         Write-Warning "Non-JSON wake response: $wakeJson"
     }
 } else {
-    Write-Warning "Wake call failed (exit code $LASTEXITCODE). May be cold starting."
+    Write-Warning "Wake call failed (exit code $($proc.ExitCode)).`nSTDERR:`n$wakeErr"
 }
 
 # ---------------------------------------------------------------------------
