@@ -2,6 +2,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "hermes-cloudflare-v6",
   "main": "src/index.ts",
+  "workers_dev": false,
+  "routes": [{ "pattern": "hermes-agent.hermes-test.app", "custom_domain": true }],
   "compatibility_date": "2026-08-03",
   "compatibility_flags": ["nodejs_compat"],
   "containers": [
