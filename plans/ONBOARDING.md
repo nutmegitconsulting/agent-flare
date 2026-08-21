@@ -53,17 +53,23 @@ From the repo directory:
 ```bash
 cd /home/user/projects/hermes-cloudflare-v6
 
-# Set secrets
+# Set Worker-level secrets
 npx wrangler secret put CF_API_TOKEN
 # Paste the token from Step 2
 
 npx wrangler secret put UPLOAD_TOKEN
 # Generate one: openssl rand -hex 32
-
-# Add values to wrangler.jsonc (or use vars)
-# ACCESS_AUD_TAG, CF_ACCOUNT_ID are public — add them as plain vars:
-#   npx wrangler secret put ACCESS_AUD_TAG  (or use vars in dashboard)
 ```
+
+**What UPLOAD_TOKEN is:**
+- A global bearer token shared between the Worker and all containers.
+- The container sends it in the `Authorization` header when POSTing squashfs snapshots to the Worker's `/internal/upload-snapshot` endpoint.
+- The Worker validates it, then writes the snapshot to R2 using its own `BACKUP_BUCKET` binding.
+- The container **never** talks to R2 directly and has no R2 credentials.
+
+Add the public vars in `wrangler.jsonc` or via the dashboard:
+- `ACCESS_AUD_TAG` (from Step 4)
+- `CF_ACCOUNT_ID` (from Step 3)
 
 Deploy:
 
