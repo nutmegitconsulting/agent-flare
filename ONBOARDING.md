@@ -67,9 +67,14 @@ npx wrangler secret put UPLOAD_TOKEN
 - The Worker validates it, then writes the snapshot to R2 using its own `BACKUP_BUCKET` binding.
 - The container **never** talks to R2 directly and has no R2 credentials.
 
-Add the public vars in `wrangler.jsonc` or via the dashboard:
-- `ACCESS_AUD_TAG` (from Step 4)
-- `CF_ACCOUNT_ID` (from Step 3)
+Add the public vars **via Wrangler vars** (not in the repo file):
+
+```bash
+npx wrangler vars put ACCESS_AUD_TAG="your-aud-tag-from-step-4"
+npx wrangler vars put CF_ACCOUNT_ID="your-account-id-from-step-3"
+```
+
+These are stored in Cloudflare's platform, not in your repo.
 
 Deploy:
 
