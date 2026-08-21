@@ -272,6 +272,21 @@ app.get("/api/debug/exec", async (c) => {
   }
 });
 
+// Admin: destroy a specific user's sandbox instance (idempotent)
+app.post("/api/admin/destroy", async (c) => {
+  const userId = c.req.query("userId");
+  if (!userId) {
+    return c.json({ error: "Missing userId query param" }, 400);
+  }
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  try {
+    await sandbox.destroy();
+    return c.json({ userId, status: "destroyed" });
+  } catch (e: any) {
+    return c.json({ userId, error: e.message || String(e) }, 500);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Internal: container -> Worker -> R2 snapshot upload
 // ---------------------------------------------------------------------------
