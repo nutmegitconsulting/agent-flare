@@ -3,7 +3,6 @@ import type { Sandbox } from "@cloudflare/sandbox";
 
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
-  Agent: DurableObjectNamespace;
   BACKUP_BUCKET: R2Bucket;
   AI: Ai;
   ACCESS_AUD_TAG: string;
