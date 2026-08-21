@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { getSandbox } from "@cloudflare/sandbox";
-export { HermesSandbox } from "./sandbox";
+import { HermesSandbox } from "./sandbox";
+export { HermesSandbox };
 import type { Env } from "./env";
 import { HermesAgent } from "./agent";
 
