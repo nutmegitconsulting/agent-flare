@@ -47,7 +47,7 @@ Write-Host "Access authentication successful."
 Write-Host "Waking sandbox..."
 
 $proc = Start-Process -FilePath $CloudflaredPath `
-    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$workerUrl/api/wake") `
+    -ArgumentList @("access", "curl", "$workerUrl/api/wake", "-s", "-X", "POST") `
     -RedirectStandardOutput "wake-out.txt" `
     -RedirectStandardError  "wake-err.txt" `
     -Wait -PassThru -NoNewWindow
