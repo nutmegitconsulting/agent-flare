@@ -258,13 +258,23 @@ app.post("/api/wake", async (c) => {
   });
 
   // Warmup ping to force container creation if sleeping
+  let pingOk = false;
   try {
     await sandbox.fetch(new Request("http://internal/ping", { method: "GET" }));
+    pingOk = true;
   } catch {
     // container may still be booting; client can retry
   }
 
-  return c.json({ userId, status: "awake" });
+  // Get actual container state for client polling
+  let state = null;
+  try {
+    state = await sandbox.getState();
+  } catch {
+    // DO may be new, no state yet
+  }
+
+  return c.json({ userId, status: "awake", pingOk, state });
 });
 
 // ---------------------------------------------------------------------------
@@ -310,6 +320,21 @@ app.post("/api/admin/stop", async (c) => {
   try {
     await sandbox.stop();
     return c.json({ userId, status: "stopped" });
+  } catch (e: any) {
+    return c.json({ userId, error: e.message || String(e) }, 500);
+  }
+});
+
+// Admin: check container state for userId
+app.get("/api/admin/status", async (c) => {
+  const userId = c.req.query("userId");
+  if (!userId) {
+    return c.json({ error: "Missing userId query param" }, 400);
+  }
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  try {
+    const state = await sandbox.getState();
+    return c.json({ userId, state });
   } catch (e: any) {
     return c.json({ userId, error: e.message || String(e) }, 500);
   }

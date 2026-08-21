@@ -37,8 +37,6 @@ Write-Host "Access authentication successful."
 # ---------------------------------------------------------------------------
 Write-Host "`nProvisioning tunnel via Worker..."
 
-# Use cloudflared access curl (documented at developers.cloudflare.com).
-# We capture stderr too so any error is visible.
 $proc = Start-Process -FilePath $CloudflaredPath `
     -ArgumentList @("access", "curl", "$WorkerUrl/api/client-init", "-s", "-X", "POST") `
     -RedirectStandardOutput "client-init-out.txt" `
@@ -116,10 +114,70 @@ try {
     exit 1
 }
 
-Write-Host "Sandbox status: $($wakeRes.status)"
+# ---------------------------------------------------------------------------
+# 5. Poll container until it's actually running (provisioning can take 2-5 min)
+# ---------------------------------------------------------------------------
+$maxWaitSeconds = 300  # 5 minutes
+$pollIntervalSeconds = 10
+$elapsed = 0
+$isReady = $false
+$state = $null
+
+# If wake returned pingOk=true, container is already running
+if ($wakeRes.pingOk -eq $true) {
+    Write-Host "Sandbox status: running (ready immediately)"
+    $isReady = $true
+} else {
+    Write-Host "Sandbox status: $($wakeRes.status)"
+    Write-Host "Container is provisioning — this may take 2-5 minutes on first boot..."
+
+    while ($elapsed -lt $maxWaitSeconds) {
+        Start-Sleep -Seconds $pollIntervalSeconds
+        $elapsed += $pollIntervalSeconds
+
+        $pollProc = Start-Process -FilePath $CloudflaredPath `
+            -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/status?userId=$userId", "-s") `
+            -RedirectStandardOutput "status-out.txt" `
+            -RedirectStandardError  "status-err.txt" `
+            -Wait -PassThru -NoNewWindow
+
+        $pollJson = Get-Content "status-out.txt" -Raw -ErrorAction SilentlyContinue
+        $pollErr  = Get-Content "status-err.txt"  -Raw -ErrorAction SilentlyContinue
+        Remove-Item "status-out.txt", "status-err.txt" -ErrorAction SilentlyContinue
+
+        if ($pollProc.ExitCode -eq 0 -and $pollJson) {
+            try {
+                $pollRes = $pollJson | ConvertFrom-Json
+                $state = $pollRes.state
+                $status = if ($state.status) { $state.status } else { "unknown" }
+
+                if ($status -eq "running" -or $status -eq "healthy") {
+                    Write-Host "Sandbox status: $status (ready!)"
+                    $isReady = $true
+                    break
+                } elseif ($status -eq "stopped_with_code") {
+                    Write-Host "Sandbox status: stopped_with_code (exit code $($state.exitCode)) — provisioning may have failed."
+                    Write-Host "Response: $pollJson"
+                    exit 1
+                } else {
+                    Write-Host "Sandbox status: $status (${elapsed}s elapsed)..."
+                }
+            } catch {
+                Write-Host "Waiting... (${elapsed}s elapsed, could not parse status)"
+            }
+        } else {
+            Write-Host "Waiting... (${elapsed}s elapsed, status check failed)"
+        }
+    }
+}
+
+if (-not $isReady) {
+    Write-Error "Timed out waiting for container to be ready after $maxWaitSeconds seconds.`nLast state: $($state | ConvertTo-Json -Compress)"
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
-# 5. Save connection profile for daily use
+# 6. Save connection profile for daily use
 # ---------------------------------------------------------------------------
 $profileDir = Join-Path $env:USERPROFILE ".hermes-cloudflare-v6"
 New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
@@ -140,7 +198,7 @@ Set-Content -Path $profilePath -Value $profile
 Write-Host "`nProfile saved to: $profilePath"
 
 # ---------------------------------------------------------------------------
-# 6. Start local TCP proxy
+# 7. Start local TCP proxy
 # ---------------------------------------------------------------------------
 Write-Host "`nStarting cloudflared access tcp proxy..."
 Write-Host "  Remote:  $hostname"
