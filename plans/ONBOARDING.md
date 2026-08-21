@@ -23,11 +23,13 @@ End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backe
    - **Account:R2:Read & Write**
 4. Account Resources: include your account
 5. Save the token value — this is `CF_API_TOKEN`
+6. [REDACTED - ROTATED]
 
 ### Step 3. Note Your Account ID
 
 1. In the Cloudflare dashboard right sidebar, copy **Account ID**
 2. This is `CF_ACCOUNT_ID`
+3. [REDACTED-CF-ACCOUNT-ID]
 
 ### Step 4. Set Up Cloudflare Access Application
 
@@ -42,6 +44,7 @@ End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backe
    - **Policies:** add a rule allowing your email domain or specific users
 5. Save
 6. Copy the **Audience (AUD) Tag** from the application settings page — this is `ACCESS_AUD_TAG`
+7. [REDACTED-CF-ACCESS-AUD]
 
 ### Step 5. Deploy the Worker
 
