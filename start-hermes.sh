@@ -97,6 +97,6 @@ _term() {
 trap _term SIGTERM
 
 # ---------------------------------------------------------------------------
-# Start Hermes (foreground — keeps container alive)
+# Start Hermes (foreground — script blocks here, but container still sleeps after idle timeout)
 # ---------------------------------------------------------------------------
 exec hermes serve
