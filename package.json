@@ -10,11 +10,11 @@
     "types": "wrangler types"
   },
   "dependencies": {
-    "@cloudflare/sandbox": "^0.7.0",
+    "@cloudflare/sandbox": "^0.12.7",
     "hono": "^4.5.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240806.0",
+    "@cloudflare/workers-types": "^5.20260820.1",
     "typescript": "^5.5.0",
     "wrangler": "^4.125.0"
   }
