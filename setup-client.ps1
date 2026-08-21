@@ -10,6 +10,27 @@ param(
 )
 
 # ---------------------------------------------------------------------------
+# Helper: find real curl.exe (bypass PowerShell curl alias)
+# ---------------------------------------------------------------------------
+$curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+if (-not $curlExe) {
+    # Try common locations
+    $candidates = @(
+        "C:\Windows\System32\curl.exe",
+        "C:\Windows\SysWOW64\curl.exe",
+        "${env:ProgramFiles}\curl\bin\curl.exe",
+        "${env:LOCALAPPDATA}\Microsoft\WindowsApps\curl.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $curlExe = $c; break }
+    }
+}
+if (-not $curlExe) {
+    Write-Error "curl.exe not found. Install curl or add it to PATH."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
 # 1. Verify cloudflared is installed
 # ---------------------------------------------------------------------------
 if (-not $CloudflaredPath) {
@@ -18,6 +39,7 @@ if (-not $CloudflaredPath) {
     exit 1
 }
 Write-Host "cloudflared found at: $CloudflaredPath"
+Write-Host "curl.exe found at: $curlExe"
 
 # ---------------------------------------------------------------------------
 # 2. Authenticate with Cloudflare Access
@@ -31,16 +53,27 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "cloudflared access login failed."
     exit 1
 }
-Write-Host "Access authentication successful."
+
+# Retrieve cached token (documented command)
+$jwt = & $CloudflaredPath access token -app=$AccessAppUrl 2> $null
+if (-not $jwt) {
+    Write-Error "cloudflared access token returned empty. Complete browser login and retry."
+    exit 1
+}
+
+Write-Host "Access token acquired."
 
 # ---------------------------------------------------------------------------
 # 3. Provision tunnel (one-time per user)
 # ---------------------------------------------------------------------------
 Write-Host "`nProvisioning tunnel via Worker..."
 
-$initJson = & $CloudflaredPath access curl -s -X POST "$WorkerUrl/api/client-init" 2> $null
+$initJson = & $curlExe -s -X POST "$WorkerUrl/api/client-init" `
+    -H "CF-Access-Jwt-Assertion: $jwt" `
+    -H "Content-Type: application/json" 2> $null
+
 if ($LASTEXITCODE -ne 0 -or -not $initJson) {
-    Write-Error "Failed to provision tunnel. Ensure Access login succeeded."
+    Write-Error "HTTP request to /api/client-init failed (curl exit code $LASTEXITCODE, empty response)."
     exit 1
 }
 
@@ -68,9 +101,12 @@ Write-Host "  Hostname: $hostname"
 # ---------------------------------------------------------------------------
 Write-Host "`nWaking sandbox container..."
 
-$wakeJson = & $CloudflaredPath access curl -s -X POST "$WorkerUrl/api/wake" 2> $null
+$wakeJson = & $curlExe -s -X POST "$WorkerUrl/api/wake" `
+    -H "CF-Access-Jwt-Assertion: $jwt" `
+    -H "Content-Type: application/json" 2> $null
+
 if ($LASTEXITCODE -ne 0 -or -not $wakeJson) {
-    Write-Error "Failed to wake sandbox."
+    Write-Error "HTTP request to /api/wake failed."
     exit 1
 }
 
