@@ -20,25 +20,17 @@ if (-not $CloudflaredPath) {
 Write-Host "cloudflared found at: $CloudflaredPath"
 
 # ---------------------------------------------------------------------------
-# 2. Authenticate with Cloudflare Access (non-interactive where possible)
+# 2. Authenticate with Cloudflare Access
 # ---------------------------------------------------------------------------
 Write-Host "`nAuthenticating with Cloudflare Access..."
 Write-Host "  App URL: $AccessAppUrl"
 
-# Try silent token fetch first (cached from previous login)
-$jwt = & $CloudflaredPath access token -app=$AccessAppUrl 2> $null
-
-if (-not $jwt) {
-    Write-Host "No cached token. Opening browser for login..."
-    & $CloudflaredPath access login $AccessAppUrl 2> $null
-
-    $jwt = & $CloudflaredPath access token -app=$AccessAppUrl 2> $null
-    if (-not $jwt) {
-        Write-Error "Access authentication failed. Complete browser login and retry."
-        exit 1
-    }
+# Explicit login first (opens browser, caches token locally)
+& $CloudflaredPath access login $AccessAppUrl 2> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "cloudflared access login failed."
+    exit 1
 }
-
 Write-Host "Access authentication successful."
 
 # ---------------------------------------------------------------------------
@@ -46,18 +38,26 @@ Write-Host "Access authentication successful."
 # ---------------------------------------------------------------------------
 Write-Host "`nProvisioning tunnel via Worker..."
 
+$initJson = & $CloudflaredPath access curl -s -X POST "$WorkerUrl/api/client-init" 2> $null
+if ($LASTEXITCODE -ne 0 -or -not $initJson) {
+    Write-Error "Failed to provision tunnel. Ensure Access login succeeded."
+    exit 1
+}
+
 try {
-    $initRes = Invoke-RestMethod -Uri "$WorkerUrl/api/client-init" `
-        -Method POST `
-        -Headers @{ "CF-Access-Jwt-Assertion" = $jwt } `
-        -ContentType "application/json"
+    $initRes = $initJson | ConvertFrom-Json
 } catch {
-    Write-Error "Failed to provision tunnel: $($_.Exception.Message)"
+    Write-Error "Invalid JSON from Worker: $initJson"
     exit 1
 }
 
 $hostname = $initRes.hostname
 $userId   = $initRes.userId
+
+if (-not $hostname -or -not $userId) {
+    Write-Error "Worker response missing hostname or userId."
+    exit 1
+}
 
 Write-Host "Tunnel provisioned:"
 Write-Host "  User ID:  $userId"
@@ -68,16 +68,20 @@ Write-Host "  Hostname: $hostname"
 # ---------------------------------------------------------------------------
 Write-Host "`nWaking sandbox container..."
 
-try {
-    $wakeRes = Invoke-RestMethod -Uri "$WorkerUrl/api/wake" `
-        -Method POST `
-        -Headers @{ "CF-Access-Jwt-Assertion" = $jwt } `
-        -ContentType "application/json"
-    Write-Host "Sandbox status: $($wakeRes.status)"
-} catch {
-    Write-Error "Failed to wake sandbox: $($_.Exception.Message)"
+$wakeJson = & $CloudflaredPath access curl -s -X POST "$WorkerUrl/api/wake" 2> $null
+if ($LASTEXITCODE -ne 0 -or -not $wakeJson) {
+    Write-Error "Failed to wake sandbox."
     exit 1
 }
+
+try {
+    $wakeRes = $wakeJson | ConvertFrom-Json
+} catch {
+    Write-Error "Invalid JSON from Worker: $wakeJson"
+    exit 1
+}
+
+Write-Host "Sandbox status: $($wakeRes.status)"
 
 # ---------------------------------------------------------------------------
 # 5. Save connection profile for daily use
