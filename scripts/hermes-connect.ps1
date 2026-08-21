@@ -11,7 +11,7 @@ param(
 # 1. Load profile
 # ---------------------------------------------------------------------------
 if (-not (Test-Path $ProfilePath)) {
-    Write-Error "Profile not found at $ProfilePath. Run setup-client.ps1 first."
+    Write-Error "Profile not found at $ProfilePath. Run scripts\setup-client.ps1 first."
     exit 1
 }
 
