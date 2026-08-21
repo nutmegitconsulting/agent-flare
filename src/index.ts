@@ -16,13 +16,7 @@ const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 // ---------------------------------------------------------------------------
 
 app.use("*", async (c, next) => {
-  if (
-    c.req.path.startsWith("/internal/") ||
-    c.req.path === "/api/wake" ||
-    c.req.path === "/api/status" ||
-    c.req.path === "/api/client-init" ||
-    c.req.path.startsWith("/api/debug/")
-  ) {
+  if (c.req.path.startsWith("/internal/")) {
     return await next();
   }
 
@@ -65,10 +59,7 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 // ---------------------------------------------------------------------------
 
 app.post("/api/client-init", async (c) => {
-  const userId = c.get("userId") || c.req.query("userId");
-  if (!userId) {
-    return c.json({ error: "Missing userId. Provide JWT or ?userId=..." }, 400);
-  }
+  const userId = c.get("userId");
   const credsKey = `users/${userId}/cloudflared/creds.json`;
 
   // Check if already provisioned in R2
@@ -126,6 +117,25 @@ app.post("/api/client-init", async (c) => {
     }
   );
 
+  // Create DNS CNAME pointing tunnel hostname to Cloudflare argo tunnel
+  await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${c.env.CF_ZONE_ID}/dns_records`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + c.env.CF_API_TOKEN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "CNAME",
+        name: hostname,
+        content: `${tunnelId}.cfargotunnel.com`,
+        ttl: 1,
+        proxied: true,
+      }),
+    }
+  );
+
   // Store in R2 for persistence across sleeps
   await c.env.BACKUP_BUCKET.put(credsKey, JSON.stringify({ hostname, token: tunnelToken }), {
     httpMetadata: { contentType: "application/json" },
@@ -140,9 +150,6 @@ app.post("/api/client-init", async (c) => {
 
 app.get("/api/status", async (c) => {
   const userId = c.get("userId");
-  if (!userId) {
-    return c.json({ status: "ok", version: "v6" });
-  }
   const credsKey = `users/${userId}/cloudflared/creds.json`;
 
   const obj = await c.env.BACKUP_BUCKET.head(credsKey);
@@ -165,10 +172,7 @@ app.get("/api/status", async (c) => {
 // ---------------------------------------------------------------------------
 
 app.post("/api/wake", async (c) => {
-  const userId = c.get("userId") || c.req.query("userId");
-  if (!userId) {
-    return c.json({ error: "Missing userId. Provide JWT or ?userId=..." }, 400);
-  }
+  const userId = c.get("userId");
   const credsKey = `users/${userId}/cloudflared/creds.json`;
 
   const getObj = await c.env.BACKUP_BUCKET.get(credsKey);
