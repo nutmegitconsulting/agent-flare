@@ -1,30 +1,47 @@
-# Stage 1: Pull latest Hermes agent from Nous Research
-FROM ghcr.io/nousresearch/hermes-agent:latest AS hermes-src
+# =============================================================================
+# Hermes Agent on Cloudflare Sandbox (V6)
+# =============================================================================
+# Base: cloudflare/sandbox:0.12.7-python (matches npm package version).
+# Hermes install.sh handles its own Node/Python/uv prerequisites.
+# When run as root it installs to /usr/local/lib/hermes-agent (FHS layout).
+# We only install cloudflared + squashfs-tools as root.
+# =============================================================================
 
-# Stage 2: Cloudflare Sandbox base
-FROM docker.io/cloudflare/sandbox:0.7.0
+FROM docker.io/cloudflare/sandbox:0.12.7-python
 
-# Install cloudflared and tools needed for state management
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    squashfs-tools \
-    && curl -L --output /usr/local/bin/cloudflared \
-       https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-    && chmod +x /usr/local/bin/cloudflared \
-    && apt-get autoremove -y \
+USER root
+
+# --- System tools ---
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         curl ca-certificates git squashfs-tools build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Hermes agent from Nous Research container (fresh on every build)
-COPY --from=hermes-src /usr/local/bin/hermes /usr/local/bin/hermes
-# If Hermes has additional data/lib directories, copy them too:
-# COPY --from=hermes-src /opt/hermes /opt/hermes
-# COPY --from=hermes-src /usr/share/hermes /usr/share/hermes
+# --- cloudflared ---
+RUN curl -sfL --output /usr/local/bin/cloudflared \
+        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+    && chmod +x /usr/local/bin/cloudflared
 
-# Entrypoint script handles cloudflared, hermes, background snapshots, SIGTERM
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# --- Hermes install (as root -> FHS layout) ---
+# install.sh detects root and uses /usr/local/lib/hermes-agent
+# HERMES_HOME controls where data (sessions, skills, config) lives
+ENV HERMES_HOME=/home/hermes/.hermes
+ENV UV_NO_CONFIG=1
+RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
+    | bash -s -- --skip-setup --non-interactive
 
-EXPOSE 9119
+# --- hermes user for runtime ---
+# Create after install so install.sh runs as root (FHS layout)
+RUN useradd --create-home --shell /bin/bash --uid 1000 hermes \
+    && mkdir -p /home/hermes/.hermes \
+    && chown -R hermes:hermes /home/hermes
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Snapshot-friendly perms
+RUN chmod -R a+rX /home/hermes
+
+# --- Startup ---
+COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
+RUN chmod +x /usr/local/bin/start-hermes.sh
+
+# sandbox binary is ENTRYPOINT; CMD is spawned as child
+CMD ["/usr/local/bin/start-hermes.sh"]
