@@ -315,6 +315,39 @@ app.post("/api/admin/stop", async (c) => {
   }
 });
 
+// Admin: upload existing snapshot from container filesystem to R2
+app.post("/api/admin/upload-snapshot-from-container", async (c) => {
+  const userId = c.req.query("userId");
+  const snapPath = c.req.query("path") || "/tmp/snapshot-1787348514.sqsh";
+  if (!userId) {
+    return c.json({ error: "Missing userId query param" }, 400);
+  }
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  try {
+    const stream = await sandbox.readFileStream(snapPath);
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalLen = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      totalLen += value.length;
+    }
+    const combined = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    const key = `backups/${userId}/final.sqfs`;
+    await c.env.BACKUP_BUCKET.put(key, combined);
+    return c.json({ userId, path: snapPath, r2Key: key, bytes: totalLen, status: "uploaded" });
+  } catch (e: any) {
+    return c.json({ userId, path: snapPath, error: e.message || String(e) }, 500);
+  }
+});
+
 // Internal admin: destroy by userId (token-auth, for scripts)
 app.post("/internal/destroy", async (c) => {
   const auth = c.req.header("Authorization");
