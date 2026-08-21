@@ -23,11 +23,13 @@ End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backe
    - **Account:R2:Read & Write**
 4. Account Resources: include your account
 5. Save the token value — this is `CF_API_TOKEN`
+6. [REDACTED - ROTATED]
 
 ### Step 3. Note Your Account ID
 
 1. In the Cloudflare dashboard right sidebar, copy **Account ID**
 2. This is `CF_ACCOUNT_ID`
+3. [REDACTED-CF-ACCOUNT-ID]
 
 ### Step 4. Set Up Cloudflare Access Application
 
@@ -42,6 +44,7 @@ End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backe
    - **Policies:** add a rule allowing your email domain or specific users
 5. Save
 6. Copy the **Audience (AUD) Tag** from the application settings page — this is `ACCESS_AUD_TAG`
+7. [REDACTED-CF-ACCESS-AUD]
 
 ### Step 5. Deploy the Worker
 
@@ -50,17 +53,23 @@ From the repo directory:
 ```bash
 cd /home/user/projects/hermes-cloudflare-v6
 
-# Set secrets
+# Set Worker-level secrets
 npx wrangler secret put CF_API_TOKEN
 # Paste the token from Step 2
 
 npx wrangler secret put UPLOAD_TOKEN
 # Generate one: openssl rand -hex 32
-
-# Add values to wrangler.jsonc (or use vars)
-# ACCESS_AUD_TAG, CF_ACCOUNT_ID are public — add them as plain vars:
-#   npx wrangler secret put ACCESS_AUD_TAG  (or use vars in dashboard)
 ```
+
+**What UPLOAD_TOKEN is:**
+- A global bearer token shared between the Worker and all containers.
+- The container sends it in the `Authorization` header when POSTing squashfs snapshots to the Worker's `/internal/upload-snapshot` endpoint.
+- The Worker validates it, then writes the snapshot to R2 using its own `BACKUP_BUCKET` binding.
+- The container **never** talks to R2 directly and has no R2 credentials.
+
+Add the public vars in `wrangler.jsonc` or via the dashboard:
+- `ACCESS_AUD_TAG` (from Step 4)
+- `CF_ACCOUNT_ID` (from Step 3)
 
 Deploy:
 
