@@ -300,6 +300,21 @@ app.post("/api/admin/destroy", async (c) => {
   }
 });
 
+// Admin: graceful stop by userId (SIGTERM, triggers onStop + backup)
+app.post("/api/admin/stop", async (c) => {
+  const userId = c.req.query("userId");
+  if (!userId) {
+    return c.json({ error: "Missing userId query param" }, 400);
+  }
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  try {
+    await sandbox.stop();
+    return c.json({ userId, status: "stopped" });
+  } catch (e: any) {
+    return c.json({ userId, error: e.message || String(e) }, 500);
+  }
+});
+
 // Internal admin: destroy by userId (token-auth, for scripts)
 app.post("/internal/destroy", async (c) => {
   const auth = c.req.header("Authorization");
