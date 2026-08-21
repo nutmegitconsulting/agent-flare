@@ -223,7 +223,7 @@ If the sandbox is sleeping (after 30 min idle), the first request will wake it a
 
 ## Phase 4 — Full Automation Script
 
-Save as `hermes-connect.ps1`:
+Save as `scripts/hermes-connect.ps1`:
 
 ```powershell
 param(
@@ -253,7 +253,7 @@ cloudflared access tcp --hostname $Hostname --url localhost:9119
 Run:
 
 ```powershell
-.\hermes-connect.ps1
+.\scripts\hermes-connect.ps1
 ```
 
 ---

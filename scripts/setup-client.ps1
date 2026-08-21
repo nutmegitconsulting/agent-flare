@@ -20,15 +20,14 @@ if (-not $CloudflaredPath) {
 Write-Host "cloudflared found at: $CloudflaredPath"
 
 # ---------------------------------------------------------------------------
-# 2. Authenticate with Cloudflare Access
+# 2. Authenticate with Cloudflare Access (opens browser once, caches locally)
 # ---------------------------------------------------------------------------
 Write-Host "`nAuthenticating with Cloudflare Access..."
 Write-Host "  App URL: $AccessAppUrl"
 
-# Explicit login first (opens browser, caches token locally)
-& $CloudflaredPath access login $AccessAppUrl 2> $null
+& $CloudflaredPath access login $AccessAppUrl 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "cloudflared access login failed."
+    Write-Error "cloudflared access login failed (exit code $LASTEXITCODE)."
     exit 1
 }
 Write-Host "Access authentication successful."
@@ -38,9 +37,20 @@ Write-Host "Access authentication successful."
 # ---------------------------------------------------------------------------
 Write-Host "`nProvisioning tunnel via Worker..."
 
-$initJson = & $CloudflaredPath access curl -s -X POST "$WorkerUrl/api/client-init" 2> $null
-if ($LASTEXITCODE -ne 0 -or -not $initJson) {
-    Write-Error "Failed to provision tunnel. Ensure Access login succeeded."
+# Use cloudflared access curl (documented at developers.cloudflare.com).
+# We capture stderr too so any error is visible.
+$proc = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$WorkerUrl/api/client-init") `
+    -RedirectStandardOutput "client-init-out.txt" `
+    -RedirectStandardError  "client-init-err.txt" `
+    -Wait -PassThru -NoNewWindow
+
+$initJson = Get-Content "client-init-out.txt" -Raw -ErrorAction SilentlyContinue
+$initErr  = Get-Content "client-init-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "client-init-out.txt", "client-init-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc.ExitCode -ne 0 -or -not $initJson) {
+    Write-Error "cloudflared access curl failed (exit code $($proc.ExitCode)).`nSTDERR:`n$initErr"
     exit 1
 }
 
@@ -68,9 +78,18 @@ Write-Host "  Hostname: $hostname"
 # ---------------------------------------------------------------------------
 Write-Host "`nWaking sandbox container..."
 
-$wakeJson = & $CloudflaredPath access curl -s -X POST "$WorkerUrl/api/wake" 2> $null
-if ($LASTEXITCODE -ne 0 -or -not $wakeJson) {
-    Write-Error "Failed to wake sandbox."
+$proc2 = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$WorkerUrl/api/wake") `
+    -RedirectStandardOutput "wake-out.txt" `
+    -RedirectStandardError  "wake-err.txt" `
+    -Wait -PassThru -NoNewWindow
+
+$wakeJson = Get-Content "wake-out.txt" -Raw -ErrorAction SilentlyContinue
+$wakeErr  = Get-Content "wake-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "wake-out.txt", "wake-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc2.ExitCode -ne 0 -or -not $wakeJson) {
+    Write-Error "cloudflared access curl failed (exit code $($proc2.ExitCode)).`nSTDERR:`n$wakeErr"
     exit 1
 }
 
