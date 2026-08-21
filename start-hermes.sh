@@ -41,7 +41,7 @@ chmod -R a+rX "$HERMES_HOME" 2>/dev/null || true
 # cloudflared tunnel (background)
 # ---------------------------------------------------------------------------
 if [ -n "${CLOUDFLARED_TOKEN:-}" ]; then
-    cloudflared access tcp --token "$CLOUDFLARED_TOKEN" &
+    cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARED_TOKEN" &
 fi
 
 # ---------------------------------------------------------------------------

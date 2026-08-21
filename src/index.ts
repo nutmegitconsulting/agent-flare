@@ -16,7 +16,13 @@ const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 // ---------------------------------------------------------------------------
 
 app.use("*", async (c, next) => {
-  if (c.req.path.startsWith("/internal/")) {
+  if (
+    c.req.path.startsWith("/internal/") ||
+    c.req.path === "/api/wake" ||
+    c.req.path === "/api/status" ||
+    c.req.path === "/api/client-init" ||
+    c.req.path.startsWith("/api/debug/")
+  ) {
     return await next();
   }
 
@@ -59,7 +65,10 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 // ---------------------------------------------------------------------------
 
 app.post("/api/client-init", async (c) => {
-  const userId = c.get("userId");
+  const userId = c.get("userId") || c.req.query("userId");
+  if (!userId) {
+    return c.json({ error: "Missing userId. Provide JWT or ?userId=..." }, 400);
+  }
   const credsKey = `users/${userId}/cloudflared/creds.json`;
 
   // Check if already provisioned in R2
@@ -131,6 +140,9 @@ app.post("/api/client-init", async (c) => {
 
 app.get("/api/status", async (c) => {
   const userId = c.get("userId");
+  if (!userId) {
+    return c.json({ status: "ok", version: "v6" });
+  }
   const credsKey = `users/${userId}/cloudflared/creds.json`;
 
   const obj = await c.env.BACKUP_BUCKET.head(credsKey);
@@ -153,7 +165,10 @@ app.get("/api/status", async (c) => {
 // ---------------------------------------------------------------------------
 
 app.post("/api/wake", async (c) => {
-  const userId = c.get("userId");
+  const userId = c.get("userId") || c.req.query("userId");
+  if (!userId) {
+    return c.json({ error: "Missing userId. Provide JWT or ?userId=..." }, 400);
+  }
   const credsKey = `users/${userId}/cloudflared/creds.json`;
 
   const getObj = await c.env.BACKUP_BUCKET.get(credsKey);
@@ -183,6 +198,24 @@ app.post("/api/wake", async (c) => {
   }
 
   return c.json({ userId, status: "awake" });
+});
+
+// ---------------------------------------------------------------------------
+// Debug: run a command inside the sandbox and return output
+// ---------------------------------------------------------------------------
+app.get("/api/debug/exec", async (c) => {
+  const userId = c.get("userId") || c.req.query("userId");
+  if (!userId) {
+    return c.json({ error: "Missing userId" }, 400);
+  }
+  const cmd = c.req.query("cmd") || "ps aux";
+  const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  try {
+    const res = await sandbox.exec(cmd);
+    return c.json({ userId, cmd, stdout: res.stdout || "", stderr: res.stderr || "", exitCode: res.exitCode ?? -1 });
+  } catch (e: any) {
+    return c.json({ userId, cmd, error: e.message || String(e) }, 500);
+  }
 });
 
 // ---------------------------------------------------------------------------
