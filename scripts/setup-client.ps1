@@ -40,7 +40,7 @@ Write-Host "`nProvisioning tunnel via Worker..."
 # Use cloudflared access curl (documented at developers.cloudflare.com).
 # We capture stderr too so any error is visible.
 $proc = Start-Process -FilePath $CloudflaredPath `
-    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$WorkerUrl/api/client-init") `
+    -ArgumentList @("access", "curl", "$WorkerUrl/api/client-init", "-s", "-X", "POST") `
     -RedirectStandardOutput "client-init-out.txt" `
     -RedirectStandardError  "client-init-err.txt" `
     -Wait -PassThru -NoNewWindow
@@ -79,7 +79,7 @@ Write-Host "  Hostname: $hostname"
 Write-Host "`nWaking sandbox container..."
 
 $proc2 = Start-Process -FilePath $CloudflaredPath `
-    -ArgumentList @("access", "curl", "-s", "-X", "POST", "$WorkerUrl/api/wake") `
+    -ArgumentList @("access", "curl", "$WorkerUrl/api/wake", "-s", "-X", "POST") `
     -RedirectStandardOutput "wake-out.txt" `
     -RedirectStandardError  "wake-err.txt" `
     -Wait -PassThru -NoNewWindow
