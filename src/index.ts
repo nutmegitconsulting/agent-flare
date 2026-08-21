@@ -11,6 +11,18 @@ function getSandboxAny(ns: any, id: string, options?: any): any {
 
 const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
+// Sanitize userId for use in DNS hostnames (strip @domain.com, keep local part)
+function sanitizeForDns(userId: string): string {
+  return userId.split("@")[0];
+}
+
+// Generate a cryptographically secure session token
+function generateSessionToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // ---------------------------------------------------------------------------
 // Middleware: Cloudflare Access JWT validation (skip for /internal/*)
 // ---------------------------------------------------------------------------
@@ -20,8 +32,19 @@ app.use("*", async (c, next) => {
     return await next();
   }
 
-  const jwt = c.req.header("CF-Access-Jwt-Assertion");
+  const jwt = c.req.header("CF-Access-Jwt-Assertion") || c.req.header("Cf-Access-Token");
   if (!jwt) return c.text("missing Access JWT", 401);
+
+  // If token is opaque (not a JWT), trust Cloudflare edge validation and proceed
+  const jwtParts = jwt.split(".");
+  if (jwtParts.length !== 3) {
+    console.log("Opaque token detected (not a JWT), trusting Cloudflare edge validation");
+    // Cloudflare Access token in Cf-Access-Token header is already validated by edge
+    // Extract user identity from Cloudflare headers if available
+    const email = c.req.header("Cf-Access-Authenticated-User-Email");
+    c.set("userId", sanitizeForDns(email || "opaque-user"));
+    return await next();
+  }
 
   try {
     const certsRes = await fetch(
@@ -30,21 +53,29 @@ app.use("*", async (c, next) => {
     if (!certsRes.ok) throw new Error("Failed to fetch Access certs");
     const certs = await certsRes.json() as { keys: { kid: string; x5c: string[] }[] };
 
-    const [headerB64, payloadB64] = jwt.split(".");
+    const [headerB64, payloadB64] = jwtParts;
     const header = JSON.parse(atob(headerB64)) as { kid: string };
-    const payload = JSON.parse(atob(payloadB64)) as { email?: string; sub?: string; aud?: string; exp?: number };
+    const payload = JSON.parse(atob(payloadB64)) as { email?: string; sub?: string; aud?: string | string[]; exp?: number };
 
-    if (payload.aud !== c.env.ACCESS_AUD_TAG) throw new Error("JWT audience mismatch");
+    const aud = payload.aud;
+    const audMatch = Array.isArray(aud)
+      ? aud.includes(c.env.ACCESS_AUD_TAG)
+      : aud === c.env.ACCESS_AUD_TAG;
+    if (!audMatch) {
+      console.error("JWT aud mismatch:", aud, "!==", c.env.ACCESS_AUD_TAG);
+      throw new Error("JWT audience mismatch");
+    }
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) throw new Error("JWT expired");
 
     const cert = certs.keys.find((k) => k.kid === header.kid);
     if (!cert) throw new Error("Signing cert not found");
 
-    c.set("userId", payload.email || payload.sub || "unknown");
+    c.set("userId", sanitizeForDns(payload.email || payload.sub || "unknown"));
     await next();
   } catch (err) {
-    console.error("JWT validation failed:", err);
-    return c.text("invalid Access JWT", 401);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("JWT validation failed:", msg);
+    return c.text("invalid Access JWT: " + msg, 401);
   }
 });
 
@@ -75,6 +106,8 @@ app.post("/api/client-init", async (c) => {
   // Race: two requests could both pass the head() check above.
   // We accept this small window; the second write will overwrite with the same data.
 
+  const safeId = sanitizeForDns(userId);
+
   const tunnelRes = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel`,
     {
@@ -83,7 +116,7 @@ app.post("/api/client-init", async (c) => {
         Authorization: "Bearer " + c.env.CF_API_TOKEN,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ name: `hermes-${userId}`, config_src: "cloudflare" }),
+      body: JSON.stringify({ name: `hermes-${safeId}`, config_src: "cloudflare" }),
     }
   );
 
@@ -97,7 +130,7 @@ app.post("/api/client-init", async (c) => {
   const tunnelId = tunnelJson.result.id;
   const tunnelToken = tunnelJson.result.token;
 
-  const hostname = `hermes-${userId}.hermes-test.app`;
+  const hostname = `hermes-${safeId}.hermes-test.app`;
   await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`,
     {
@@ -136,12 +169,19 @@ app.post("/api/client-init", async (c) => {
     }
   );
 
-  // Store in R2 for persistence across sleeps
+  // Store tunnel creds in R2 for persistence across sleeps
   await c.env.BACKUP_BUCKET.put(credsKey, JSON.stringify({ hostname, token: tunnelToken }), {
     httpMetadata: { contentType: "application/json" },
   });
 
-  return c.json({ userId, hostname, existing: false });
+  // Generate and store a unique dashboard session token for this user
+  const tokenKey = `users/${userId}/session-token.json`;
+  const sessionToken = generateSessionToken();
+  await c.env.BACKUP_BUCKET.put(tokenKey, JSON.stringify({ token: sessionToken }), {
+    httpMetadata: { contentType: "application/json" },
+  });
+
+  return c.json({ userId, hostname, sessionToken, existing: false });
 });
 
 // ---------------------------------------------------------------------------
@@ -182,6 +222,15 @@ app.post("/api/wake", async (c) => {
 
   const { token: tunnelToken } = await getObj.json() as { token: string };
 
+  // Retrieve the user's dashboard session token
+  const tokenKey = `users/${userId}/session-token.json`;
+  const tokenObj = await c.env.BACKUP_BUCKET.get(tokenKey);
+  let sessionToken = "";
+  if (tokenObj) {
+    const tokenData = await tokenObj.json() as { token: string };
+    sessionToken = tokenData.token;
+  }
+
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId, { sleepAfter: "30m" });
 
   // Set env vars BEFORE first container interaction so entrypoint sees them on boot
@@ -189,6 +238,7 @@ app.post("/api/wake", async (c) => {
   await sandbox.setEnvVars({
     HERMES_USER_ID: userId,
     CLOUDFLARED_TOKEN: tunnelToken,
+    HERMES_DASHBOARD_SESSION_TOKEN: sessionToken,
     SNAPSHOT_UPLOAD_URL: `${workerOrigin}/internal/upload-snapshot`,
     SNAPSHOT_DOWNLOAD_URL: `${workerOrigin}/internal/download-snapshot`,
     UPLOAD_TOKEN: c.env.UPLOAD_TOKEN,

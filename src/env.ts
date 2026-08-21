@@ -10,4 +10,5 @@ export interface Env {
   CF_ZONE_ID: string;
   CF_API_TOKEN: string;
   UPLOAD_TOKEN: string;
+  HERMES_DASHBOARD_SESSION_TOKEN: string;
 }
