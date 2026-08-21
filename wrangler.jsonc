@@ -6,8 +6,8 @@
   "compatibility_flags": ["nodejs_compat"],
   "containers": [
     {
-      "class_name": "Sandbox",
-      "image": "./Dockerfile",
+      "class_name": "HermesSandbox",
+      "image": "ghcr.io/nousresearch/hermes-agent:latest",
       "instance_type": "lite",
       "max_instances": 1
     }

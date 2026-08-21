@@ -8,6 +8,24 @@ UPLOAD_TOKEN="${UPLOAD_TOKEN}"
 TUNNEL_TOKEN="${CLOUFLARED_TOKEN}"
 
 # ---------------------------------------------------------------------------
+# First-boot: install missing tools if not present
+# ---------------------------------------------------------------------------
+install_tools() {
+  if ! command -v mksquashfs &> /dev/null; then
+    echo "Installing squashfs-tools..."
+    apt-get update -qq && apt-get install -y --no-install-recommends squashfs-tools && rm -rf /var/lib/apt/lists/* || true
+  fi
+
+  if ! command -v cloudflared &> /dev/null; then
+    echo "Installing cloudflared..."
+    curl -sfL --output /usr/local/bin/cloudflared \
+      https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      && chmod +x /usr/local/bin/cloudflared || true
+  fi
+}
+install_tools
+
+# ---------------------------------------------------------------------------
 # Background: hourly squashfs snapshot -> POST to Worker -> R2
 # ---------------------------------------------------------------------------
 snapshot_loop() {
@@ -25,7 +43,7 @@ snapshot_loop() {
     SNAP_PATH="/tmp/snap-${TIMESTAMP}.sqfs"
     if mksquashfs /home/hermes "$SNAP_PATH" -comp zstd -noappend 2>/dev/null; then
       curl -sf -X POST \
-        -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+        -H "Authorization: Bearer ***" \
         -H "Content-Type: application/octet-stream" \
         -H "X-Snapshot-Type: hourly" \
         -H "X-User-Id: ${USER_ID}" \
@@ -46,7 +64,7 @@ terminate() {
     SNAP_PATH="/tmp/final-${TIMESTAMP}.sqfs"
     if mksquashfs /home/hermes "$SNAP_PATH" -comp zstd -noappend 2>/dev/null; then
       curl -sf -X POST \
-        -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+        -H "Authorization: Bearer ***" \
         -H "Content-Type: application/octet-stream" \
         -H "X-Snapshot-Type: final" \
         -H "X-User-Id: ${USER_ID}" \
@@ -70,7 +88,7 @@ if [ ! -s /home/hermes/.local/bin/hermes ]; then
     echo "No sentinel found — attempting state restore..."
     RESTORE_URL="${DOWNLOAD_URL}?userId=${USER_ID}"
     if curl -sf -o /tmp/restore.sqfs \
-      -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+      -H "Authorization: Bearer ***" \
       "${RESTORE_URL}" 2>/dev/null; then
       if [ -s /tmp/restore.sqfs ]; then
         unsquashfs -f -d /home/hermes /tmp/restore.sqfs 2>/dev/null || true
