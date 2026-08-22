@@ -117,57 +117,51 @@ try {
 # ---------------------------------------------------------------------------
 # 5. Poll container until it's actually running (provisioning can take 2-5 min)
 # ---------------------------------------------------------------------------
-$maxWaitSeconds = 300  # 5 minutes
+Write-Host "`nSandbox status: $($wakeRes.status)"
+Write-Host "Container is waking - this may take 2-5 minutes on first boot..."
+
+$maxWaitSeconds = 300
 $pollIntervalSeconds = 10
 $elapsed = 0
 $isReady = $false
 $state = $null
 
-# If wake returned pingOk=true, container is already running
-if ($wakeRes.pingOk -eq $true) {
-    Write-Host "Sandbox status: running (ready immediately)"
-    $isReady = $true
-} else {
-    Write-Host "Sandbox status: $($wakeRes.status)"
-    Write-Host "Container is provisioning - this may take 2-5 minutes on first boot..."
+while ($elapsed -lt $maxWaitSeconds) {
+    Start-Sleep -Seconds $pollIntervalSeconds
+    $elapsed += $pollIntervalSeconds
 
-    while ($elapsed -lt $maxWaitSeconds) {
-        Start-Sleep -Seconds $pollIntervalSeconds
-        $elapsed += $pollIntervalSeconds
+    $pollProc = Start-Process -FilePath $CloudflaredPath `
+        -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/status?userId=$userId", "-s") `
+        -RedirectStandardOutput "status-out.txt" `
+        -RedirectStandardError  "status-err.txt" `
+        -Wait -PassThru -NoNewWindow
 
-        $pollProc = Start-Process -FilePath $CloudflaredPath `
-            -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/status?userId=$userId", "-s") `
-            -RedirectStandardOutput "status-out.txt" `
-            -RedirectStandardError  "status-err.txt" `
-            -Wait -PassThru -NoNewWindow
+    $pollJson = Get-Content "status-out.txt" -Raw -ErrorAction SilentlyContinue
+    $pollErr  = Get-Content "status-err.txt"  -Raw -ErrorAction SilentlyContinue
+    Remove-Item "status-out.txt", "status-err.txt" -ErrorAction SilentlyContinue
 
-        $pollJson = Get-Content "status-out.txt" -Raw -ErrorAction SilentlyContinue
-        $pollErr  = Get-Content "status-err.txt"  -Raw -ErrorAction SilentlyContinue
-        Remove-Item "status-out.txt", "status-err.txt" -ErrorAction SilentlyContinue
+    if ($pollProc.ExitCode -eq 0 -and $pollJson) {
+        try {
+            $pollRes = $pollJson | ConvertFrom-Json
+            $state = $pollRes.state
+            $status = if ($state.status) { $state.status } else { "unknown" }
 
-        if ($pollProc.ExitCode -eq 0 -and $pollJson) {
-            try {
-                $pollRes = $pollJson | ConvertFrom-Json
-                $state = $pollRes.state
-                $status = if ($state.status) { $state.status } else { "unknown" }
-
-                if ($status -eq "running" -or $status -eq "healthy") {
-                    Write-Host "Sandbox status: $status (ready!)"
-                    $isReady = $true
-                    break
-                } elseif ($status -eq "stopped_with_code") {
-                    Write-Host "Sandbox status: stopped_with_code (exit code $($state.exitCode)) - provisioning may have failed."
-                    Write-Host "Response: $pollJson"
-                    exit 1
-                } else {
-                    Write-Host "Sandbox status: $status (${elapsed}s elapsed)..."
-                }
-            } catch {
-                Write-Host "Waiting... (${elapsed}s elapsed, could not parse status)"
+            if ($status -eq "running" -or $status -eq "healthy") {
+                Write-Host "Sandbox status: $status (ready!)"
+                $isReady = $true
+                break
+            } elseif ($status -eq "stopped_with_code") {
+                Write-Host "Sandbox status: stopped_with_code (exit code $($state.exitCode)) - provisioning may have failed."
+                Write-Host "Response: $pollJson"
+                exit 1
+            } else {
+                Write-Host "Sandbox status: $status (${elapsed}s elapsed)..."
             }
-        } else {
-            Write-Host "Waiting... (${elapsed}s elapsed, status check failed)"
+        } catch {
+            Write-Host "Waiting... (${elapsed}s elapsed, could not parse status)"
         }
+    } else {
+        Write-Host "Waiting... (${elapsed}s elapsed, status check failed)"
     }
 }
 
