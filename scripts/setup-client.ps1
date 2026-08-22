@@ -129,7 +129,7 @@ if ($wakeRes.pingOk -eq $true) {
     $isReady = $true
 } else {
     Write-Host "Sandbox status: $($wakeRes.status)"
-    Write-Host "Container is provisioning — this may take 2-5 minutes on first boot..."
+    Write-Host "Container is provisioning - this may take 2-5 minutes on first boot..."
 
     while ($elapsed -lt $maxWaitSeconds) {
         Start-Sleep -Seconds $pollIntervalSeconds
@@ -156,7 +156,7 @@ if ($wakeRes.pingOk -eq $true) {
                     $isReady = $true
                     break
                 } elseif ($status -eq "stopped_with_code") {
-                    Write-Host "Sandbox status: stopped_with_code (exit code $($state.exitCode)) — provisioning may have failed."
+                    Write-Host "Sandbox status: stopped_with_code (exit code $($state.exitCode)) - provisioning may have failed."
                     Write-Host "Response: $pollJson"
                     exit 1
                 } else {
