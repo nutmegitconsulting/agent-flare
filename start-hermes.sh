@@ -2,11 +2,11 @@
 set -e
 
 # Runtime env vars injected by Worker via setEnvVars:
-#   CLOUDFLARED_TOKEN   — cloudflared tunnel credential
-#   UPLOAD_TOKEN        — R2 snapshot auth token
-#   SNAPSHOT_UPLOAD_URL — Worker URL to POST snapshots
-#   SNAPSHOT_DOWNLOAD_URL — Worker URL to GET latest snapshot
-#   HERMES_USER_ID      — per-user path prefix in R2
+#   CLOUDFLARED_TOKEN   - cloudflared tunnel credential
+#   UPLOAD_TOKEN        - R2 snapshot auth token
+#   SNAPSHOT_UPLOAD_URL - Worker URL to POST snapshots
+#   SNAPSHOT_DOWNLOAD_URL - Worker URL to GET latest snapshot
+#   HERMES_USER_ID      - per-user path prefix in R2
 
 export HERMES_HOME=/home/hermes/.hermes
 export PATH="/usr/local/bin:$PATH"
@@ -102,6 +102,6 @@ _term() {
 trap _term SIGTERM
 
 # ---------------------------------------------------------------------------
-# Start Hermes (foreground — script blocks here, but container still sleeps after idle timeout)
+# Start Hermes (foreground - script blocks here, but container still sleeps after idle timeout)
 # ---------------------------------------------------------------------------
 exec hermes serve
