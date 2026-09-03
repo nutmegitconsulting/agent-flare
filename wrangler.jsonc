@@ -14,7 +14,13 @@
       "max_instances": 3,
       "ssh": {
         "enabled": true
-      }
+      },
+      "authorized_keys": [
+        {
+          "name": "redacted",
+          "public_key": "ssh-ed25519 REDACTED-PUBLIC-KEY"
+        }
+      ]
     }
   ],
   "durable_objects": {
