@@ -248,6 +248,10 @@ app.post("/api/wake", async (c) => {
 
   // Set env vars BEFORE first container interaction so entrypoint sees them on boot
   const workerOrigin = new URL(c.req.url).origin;
+
+  // Forward Access JWT from client for internal endpoint auth inside container
+  const accessJwt = c.req.header("CF-Access-Jwt-Assertion") || "";
+
   await sandbox.setEnvVars({
     HERMES_USER_ID: userId,
     CLOUDFLARED_TOKEN: tunnelToken,
@@ -255,6 +259,7 @@ app.post("/api/wake", async (c) => {
     SNAPSHOT_UPLOAD_URL: `${workerOrigin}/internal/upload-snapshot`,
     SNAPSHOT_DOWNLOAD_URL: `${workerOrigin}/internal/download-snapshot`,
     UPLOAD_TOKEN: c.env.UPLOAD_TOKEN,
+    CF_ACCESS_JWT: accessJwt,
   });
 
   // Warmup ping to force container creation if sleeping
