@@ -171,7 +171,61 @@ if (-not $isReady) {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Save connection profile for daily use
+# 6. Poll startup script until it completes
+# ---------------------------------------------------------------------------
+$startupMaxWaitSeconds = 300
+$startupPollIntervalSeconds = 2
+$startupElapsed = 0
+$startupComplete = $false
+$lastStatus = ""
+
+Write-Host "`nWaiting for startup to complete..."
+
+while ($startupElapsed -lt $startupMaxWaitSeconds) {
+    Start-Sleep -Seconds $startupPollIntervalSeconds
+    $startupElapsed += $startupPollIntervalSeconds
+
+    $statusProc = Start-Process -FilePath $CloudflaredPath `
+        -ArgumentList @("access", "curl", "$WorkerUrl/api/debug/exec?userId=$userId&cmd=cat%20/home/hermes/.hermes/.startup-status%202%3E%261%20%7C%7C%20echo%20NOT_STARTED", "-s") `
+        -RedirectStandardOutput "startup-out.txt" `
+        -RedirectStandardError  "startup-err.txt" `
+        -Wait -PassThru -NoNewWindow
+
+    $statusText = Get-Content "startup-out.txt" -Raw -ErrorAction SilentlyContinue
+    Remove-Item "startup-out.txt", "startup-err.txt" -ErrorAction SilentlyContinue
+
+    if ($statusProc.ExitCode -eq 0 -and $statusText) {
+        # Extract just the status text from the JSON response
+        if ($statusText -match '"stdout"\s*:\s*"([^"]*)"') {
+            $currentStatus = $Matches[1]
+            # Remove literal newlines from the matched text
+            $currentStatus = $currentStatus -replace '\\n', ''
+        } else {
+            $currentStatus = $statusText.Trim()
+        }
+
+        if ($currentStatus -ne $lastStatus) {
+            # Overwrite the same line on console
+            Write-Host "`r  [Startup] $currentStatus" -NoNewline
+            $lastStatus = $currentStatus
+        }
+
+        if ($currentStatus -eq "Startup complete.") {
+            $startupComplete = $true
+            Write-Host ""  # newline after the final status
+            break
+        }
+    }
+}
+
+if (-not $startupComplete) {
+    Write-Warning "`nStartup did not complete after $startupMaxWaitSeconds seconds. Container may be in an inconsistent state."
+} else {
+    Write-Host "Container is ready!"
+}
+
+# ---------------------------------------------------------------------------
+# 7. Save connection profile for daily use
 # ---------------------------------------------------------------------------
 $profileDir = Join-Path $env:USERPROFILE ".hermes-cloudflare-v6"
 New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
@@ -189,10 +243,10 @@ $profile = @{
 $profilePath = Join-Path $profileDir "profile.json"
 Set-Content -Path $profilePath -Value $profile
 
-Write-Host "`nProfile saved to: $profilePath"
+Write-Host "Profile saved to: $profilePath"
 
 # ---------------------------------------------------------------------------
-# 7. Start local TCP proxy
+# 8. Start local TCP proxy
 # ---------------------------------------------------------------------------
 Write-Host "`nStarting cloudflared access tcp proxy..."
 Write-Host "  Remote:  $hostname"
