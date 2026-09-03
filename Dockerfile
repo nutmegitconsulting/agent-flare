@@ -14,8 +14,16 @@ USER root
 # --- System tools ---
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         curl ca-certificates git squashfs-tools build-essential \
+         curl ca-certificates git squashfs-tools build-essential openssh-server \
     && rm -rf /var/lib/apt/lists/*
+
+# --- SSH setup for Cloudflare Containers debug access ---
+RUN mkdir -p /run/sshd \
+    && echo 'root:*:19694:0:99999:7:::' > /etc/shadow \
+    && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+    && ssh-keygen -A
 
 # --- cloudflared ---
 RUN curl -sfL --output /usr/local/bin/cloudflared \
