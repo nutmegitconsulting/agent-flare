@@ -115,76 +115,25 @@ try {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Poll container until it's actually running (provisioning can take 2-5 min)
+# 5. Poll container platform status AND startup script progress in real-time
 # ---------------------------------------------------------------------------
 Write-Host "`nSandbox status: $($wakeRes.status)"
 Write-Host "Container is waking - this may take 2-5 minutes on first boot..."
 
 $maxWaitSeconds = 300
-$pollIntervalSeconds = 10
+$pollIntervalSeconds = 2
 $elapsed = 0
 $isReady = $false
-$state = $null
+$startupComplete = $false
+$lastStartupStatus = ""
+$platformStatus = "unknown"
+$lastPlatformStatus = ""
 
 while ($elapsed -lt $maxWaitSeconds) {
     Start-Sleep -Seconds $pollIntervalSeconds
     $elapsed += $pollIntervalSeconds
 
-    $pollProc = Start-Process -FilePath $CloudflaredPath `
-        -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/status?userId=$userId", "-s") `
-        -RedirectStandardOutput "status-out.txt" `
-        -RedirectStandardError  "status-err.txt" `
-        -Wait -PassThru -NoNewWindow
-
-    $pollJson = Get-Content "status-out.txt" -Raw -ErrorAction SilentlyContinue
-    $pollErr  = Get-Content "status-err.txt"  -Raw -ErrorAction SilentlyContinue
-    Remove-Item "status-out.txt", "status-err.txt" -ErrorAction SilentlyContinue
-
-    if ($pollProc.ExitCode -eq 0 -and $pollJson) {
-        try {
-            $pollRes = $pollJson | ConvertFrom-Json
-            $state = $pollRes.state
-            $status = if ($state.status) { $state.status } else { "unknown" }
-
-            if ($status -eq "running" -or $status -eq "healthy") {
-                Write-Host "Sandbox status: $status (ready!)"
-                $isReady = $true
-                break
-            } elseif ($status -eq "stopped_with_code") {
-                Write-Host "Sandbox status: stopped_with_code (exit code $($state.exitCode)) - provisioning may have failed."
-                Write-Host "Response: $pollJson"
-                exit 1
-            } else {
-                Write-Host "Sandbox status: $status (${elapsed}s elapsed)..."
-            }
-        } catch {
-            Write-Host "Waiting... (${elapsed}s elapsed, could not parse status)"
-        }
-    } else {
-        Write-Host "Waiting... (${elapsed}s elapsed, status check failed)"
-    }
-}
-
-if (-not $isReady) {
-    Write-Error "Timed out waiting for container to be ready after $maxWaitSeconds seconds.`nLast state: $($state | ConvertTo-Json -Compress)"
-    exit 1
-}
-
-# ---------------------------------------------------------------------------
-# 6. Poll startup script until it completes
-# ---------------------------------------------------------------------------
-$startupMaxWaitSeconds = 300
-$startupPollIntervalSeconds = 2
-$startupElapsed = 0
-$startupComplete = $false
-$lastStatus = ""
-
-Write-Host "`nWaiting for startup to complete..."
-
-while ($startupElapsed -lt $startupMaxWaitSeconds) {
-    Start-Sleep -Seconds $startupPollIntervalSeconds
-    $startupElapsed += $startupPollIntervalSeconds
-
+    # --- A. Poll startup script status ---
     $statusProc = Start-Process -FilePath $CloudflaredPath `
         -ArgumentList @("access", "curl", "$WorkerUrl/api/debug/exec?userId=$userId&cmd=cat%20/home/hermes/.hermes/.startup-status%202%3E%261%20%7C%7C%20echo%20NOT_STARTED", "-s") `
         -RedirectStandardOutput "startup-out.txt" `
@@ -194,35 +143,72 @@ while ($startupElapsed -lt $startupMaxWaitSeconds) {
     $statusText = Get-Content "startup-out.txt" -Raw -ErrorAction SilentlyContinue
     Remove-Item "startup-out.txt", "startup-err.txt" -ErrorAction SilentlyContinue
 
+    $currentStartupStatus = ""
     if ($statusProc.ExitCode -eq 0 -and $statusText) {
-        # Extract just the status text from the JSON response
         if ($statusText -match '"stdout"\s*:\s*"([^"]*)"') {
-            $currentStatus = $Matches[1]
-            # Remove literal newlines from the matched text
-            $currentStatus = $currentStatus -replace '\\n', ''
+            $currentStartupStatus = $Matches[1] -replace '\\n', ''
         } else {
-            $currentStatus = $statusText.Trim()
+            $currentStartupStatus = $statusText.Trim()
         }
+    }
 
-        if ($currentStatus -ne $lastStatus) {
-            # Overwrite the same line on console
-            Write-Host "`r  [Startup] $currentStatus" -NoNewline
-            $lastStatus = $currentStatus
-        }
+    # Update startup status display if it changed
+    if ($currentStartupStatus -and $currentStartupStatus -ne $lastStartupStatus) {
+        $lastStartupStatus = $currentStartupStatus
+    }
 
-        if ($currentStatus -eq "Startup complete.") {
-            $startupComplete = $true
-            Write-Host ""  # newline after the final status
-            break
+    if ($currentStartupStatus -eq "Startup complete.") {
+        $startupComplete = $true
+    }
+
+    # --- B. Poll platform status every ~10 seconds (every 5th iteration) ---
+    if ($elapsed % 10 -eq 0 -or -not $lastPlatformStatus) {
+        $pollProc = Start-Process -FilePath $CloudflaredPath `
+            -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/status?userId=$userId", "-s") `
+            -RedirectStandardOutput "status-out.txt" `
+            -RedirectStandardError  "status-err.txt" `
+            -Wait -PassThru -NoNewWindow
+
+        $pollJson = Get-Content "status-out.txt" -Raw -ErrorAction SilentlyContinue
+        Remove-Item "status-out.txt", "status-err.txt" -ErrorAction SilentlyContinue
+
+        if ($pollProc.ExitCode -eq 0 -and $pollJson) {
+            try {
+                $pollRes = $pollJson | ConvertFrom-Json
+                $state = $pollRes.state
+                $platformStatus = if ($state.status) { $state.status } else { "unknown" }
+
+                if ($platformStatus -eq "stopped_with_code") {
+                    Write-Host "`nSandbox status: stopped_with_code (exit code $($state.exitCode)) - provisioning may have failed."
+                    Write-Host "Response: $pollJson"
+                    exit 1
+                }
+
+                $lastPlatformStatus = $platformStatus
+            } catch {
+                $lastPlatformStatus = "unknown"
+            }
         }
+    }
+
+    # --- C. Show single overwritten line ---
+    $displayStatus = if ($lastStartupStatus) { $lastStartupStatus } else { "Container booting..." }
+    Write-Host "`r  [Startup] $displayStatus (platform: $lastPlatformStatus, ${elapsed}s)" -NoNewline
+
+    # Exit when both startup is complete and platform is running/healthy
+    if ($startupComplete -and ($lastPlatformStatus -eq "running" -or $lastPlatformStatus -eq "healthy")) {
+        Write-Host ""  # newline
+        $isReady = $true
+        break
     }
 }
 
-if (-not $startupComplete) {
-    Write-Warning "`nStartup did not complete after $startupMaxWaitSeconds seconds. Container may be in an inconsistent state."
-} else {
-    Write-Host "Container is ready!"
+if (-not $isReady) {
+    Write-Error "`nTimed out waiting for container after $maxWaitSeconds seconds.`nPlatform: $lastPlatformStatus | Startup: $lastStartupStatus"
+    exit 1
 }
+
+Write-Host "Container is ready!"
 
 # ---------------------------------------------------------------------------
 # 7. Save connection profile for daily use
