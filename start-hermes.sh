@@ -96,6 +96,13 @@ fi
 chown -R hermes:hermes "$HERMES_HOME" 2>/dev/null || true
 chmod -R a+rX "$HERMES_HOME" 2>/dev/null || true
 
+# ---------------------------------------------------------------------------
+# Start SSH daemon (for Cloudflare Containers debug access)
+# ---------------------------------------------------------------------------
+if [ -d /run/sshd ]; then
+    /usr/sbin/sshd -D &
+fi
+
 # Write dashboard session token to Hermes .env file (for Desktop GUI auth)
 if [ -n "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ]; then
     echo "HERMES_DASHBOARD_SESSION_TOKEN=${HERMES_DASHBOARD_SESSION_TOKEN}" >> "$HERMES_HOME/.env"
