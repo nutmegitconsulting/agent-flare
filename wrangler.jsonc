@@ -11,7 +11,10 @@
       "class_name": "HermesSandbox",
       "image": "./Dockerfile",
       "instance_type": "standard-2",
-      "max_instances": 3
+      "max_instances": 3,
+      "ssh": {
+        "enabled": true
+      }
     }
   ],
   "durable_objects": {
