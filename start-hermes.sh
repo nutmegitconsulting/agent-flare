@@ -54,7 +54,7 @@ if [ -n "${UPLOAD_TOKEN:-}" ] && [ -n "${SNAPSHOT_DOWNLOAD_URL:-}" ] && [ -n "${
     log "Checking for existing snapshot..."
     TMP_SNAP="/tmp/snapshot-download.$$.sqsh"
     HTTP_CODE=$(curl -sSL -o "$TMP_SNAP" -w "%{http_code}" \
-        -H "Authorization: Bearer ***" \
+        -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
         -H "CF-Access-Jwt-Assertion: ${CF_ACCESS_JWT:-}" \
         "${SNAPSHOT_DOWNLOAD_URL}?userId=${HERMES_USER_ID}" 2>/dev/null || true)
     log "Download HTTP_CODE=$HTTP_CODE"
@@ -131,7 +131,7 @@ fi
         (cd "$HERMES_HOME" && mksquashfs . "$SNAP" -comp xz -noappend > /dev/null 2>&1) || continue
 
         curl -sSL -X POST \
-            -H "Authorization: Bearer ***" \
+            -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
             -H "CF-Access-Jwt-Assertion: ${CF_ACCESS_JWT:-}" \
             -H "X-User-Id: ${HERMES_USER_ID}" \
             -H "X-Snapshot-Type: hourly" \
@@ -153,7 +153,7 @@ _term() {
         SNAP="/tmp/snapshot-final-${TIMESTAMP}.sqsh"
         (cd "$HERMES_HOME" && mksquashfs . "$SNAP" -comp xz -noappend > /dev/null 2>&1) || true
         curl -sSL -X POST \
-            -H "Authorization: Bearer ***" \
+            -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
             -H "CF-Access-Jwt-Assertion: ${CF_ACCESS_JWT:-}" \
             -H "X-User-Id: ${HERMES_USER_ID}" \
             -H "X-Snapshot-Type: final" \
