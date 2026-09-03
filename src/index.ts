@@ -446,28 +446,34 @@ app.get("/internal/download-snapshot", async (c) => {
   const userId = c.req.query("userId");
   if (!userId) return c.text("missing userId", 400);
 
-  // Try final first, then latest hourly
+  // Fetch metadata for both candidates
   const finalKey = `backups/${userId}/final.sqfs`;
-  const finalObj = await c.env.BACKUP_BUCKET.head(finalKey);
-  if (finalObj) {
-    const obj = await c.env.BACKUP_BUCKET.get(finalKey);
-    if (obj && obj.body) {
-      return new Response(obj.body, {
-        headers: { "Content-Type": "application/octet-stream" },
-      });
-    }
-  }
+  const finalHead = await c.env.BACKUP_BUCKET.head(finalKey);
 
   const list = await c.env.BACKUP_BUCKET.list({ prefix: `backups/${userId}/hourly/` });
-  if (!list.objects.length) {
+  const latestHourly = list.objects.length
+    ? list.objects.sort(
+        (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+      )[0]
+    : null;
+
+  // Determine which snapshot is newest
+  let selectedKey: string | null = null;
+  if (finalHead && latestHourly) {
+    const finalTime = new Date(finalHead.uploaded).getTime();
+    const hourlyTime = new Date(latestHourly.uploaded).getTime();
+    selectedKey = finalTime >= hourlyTime ? finalKey : latestHourly.key;
+  } else if (finalHead) {
+    selectedKey = finalKey;
+  } else if (latestHourly) {
+    selectedKey = latestHourly.key;
+  }
+
+  if (!selectedKey) {
     return c.text("no snapshot found", 404);
   }
 
-  const latest = list.objects.sort(
-    (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
-  )[0];
-
-  const obj = await c.env.BACKUP_BUCKET.get(latest.key);
+  const obj = await c.env.BACKUP_BUCKET.get(selectedKey);
   if (!obj || !obj.body) {
     return c.text("snapshot not found", 404);
   }

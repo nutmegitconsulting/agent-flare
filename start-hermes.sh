@@ -14,18 +14,35 @@ export PATH="/usr/local/bin:$PATH"
 mkdir -p "$HERMES_HOME"
 
 # ---------------------------------------------------------------------------
+# Ensure required tools are present
+# ---------------------------------------------------------------------------
+install_tools() {
+    if ! command -v mksquashfs &> /dev/null; then
+        echo "Installing squashfs-tools..."
+        apt-get update -qq && apt-get install -y --no-install-recommends squashfs-tools && rm -rf /var/lib/apt/lists/* || true
+    fi
+    if ! command -v cloudflared &> /dev/null; then
+        echo "Installing cloudflared..."
+        curl -sfL --output /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            && chmod +x /usr/local/bin/cloudflared || true
+    fi
+}
+install_tools
+
+# ---------------------------------------------------------------------------
 # Pre-boot: restore latest snapshot from R2 (if any)
 # ---------------------------------------------------------------------------
 if [ -n "${UPLOAD_TOKEN:-}" ] && [ -n "${SNAPSHOT_DOWNLOAD_URL:-}" ] && [ -n "${HERMES_USER_ID:-}" ]; then
     echo "Checking for existing snapshot..."
     TMP_SNAP="/tmp/snapshot-download.$$.sqsh"
-    HTTP_CODE=$(curl -fsSL -o "$TMP_SNAP" -w "%{http_code}" \
-        -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+    HTTP_CODE=$(curl -sSL -o "$TMP_SNAP" -w "%{http_code}" \
+        -H "Authorization: Bearer ***" \
         "${SNAPSHOT_DOWNLOAD_URL}?userId=${HERMES_USER_ID}" 2>/dev/null || true)
     if [ "${HTTP_CODE:-}" = "200" ] && [ -s "$TMP_SNAP" ]; then
         echo "Restoring snapshot..."
         rm -rf "$HERMES_HOME"/*
-        unsquashfs -d "$HERMES_HOME" "$TMP_SNAP" >/dev/null 2>&1 || true
+        unsquashfs -f -d "$HERMES_HOME" "$TMP_SNAP" >/dev/null 2>&1 || true
         echo "Snapshot restored."
     else
         echo "No snapshot found (HTTP ${HTTP_CODE:-error}). Starting fresh."
@@ -63,10 +80,10 @@ fi
         TIMESTAMP=$(date +%s)
         SNAP="/tmp/snapshot-${TIMESTAMP}.sqsh"
 
-        mksquashfs "$HERMES_HOME" "$SNAP" -comp xz -noappend > /dev/null 2>&1 || continue
+        (cd "$HERMES_HOME" && mksquashfs . "$SNAP" -comp xz -noappend > /dev/null 2>&1) || continue
 
-        curl -fsSL -X POST \
-            -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
+        curl -sSL -X POST \
+            -H "Authorization: Bearer ***" \
             -H "X-User-Id: ${HERMES_USER_ID}" \
             -H "X-Snapshot-Type: hourly" \
             --data-binary "@${SNAP}" \
@@ -85,8 +102,8 @@ _term() {
     if [ -n "${UPLOAD_TOKEN:-}" ] && [ -n "${SNAPSHOT_UPLOAD_URL:-}" ] && [ -n "${HERMES_USER_ID:-}" ]; then
         TIMESTAMP=$(date +%s)
         SNAP="/tmp/snapshot-final-${TIMESTAMP}.sqsh"
-        mksquashfs "$HERMES_HOME" "$SNAP" -comp xz -noappend > /dev/null 2>&1 || true
-        curl -fsSL -X POST \
+        (cd "$HERMES_HOME" && mksquashfs . "$SNAP" -comp xz -noappend > /dev/null 2>&1) || true
+        curl -sSL -X POST \
             -H "Authorization: Bearer ${UPLOAD_TOKEN}" \
             -H "X-User-Id: ${HERMES_USER_ID}" \
             -H "X-Snapshot-Type: final" \
