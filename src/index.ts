@@ -23,6 +23,34 @@ function generateSessionToken(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// Pick the newest snapshot for a user: final.sqfs vs. latest hourly.
+// Returns the R2 object body (stream) or null if none exist.
+async function findLatestSnapshot(bucket: R2Bucket, userId: string): Promise<R2ObjectBody | null> {
+  const finalKey = `backups/${userId}/final.sqfs`;
+  const finalHead = await bucket.head(finalKey);
+
+  const list = await bucket.list({ prefix: `backups/${userId}/hourly/` });
+  const latestHourly = list.objects.length
+    ? list.objects.sort(
+        (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+      )[0]
+    : null;
+
+  let selectedKey: string | null = null;
+  if (finalHead && latestHourly) {
+    const finalTime = new Date(finalHead.uploaded).getTime();
+    const hourlyTime = new Date(latestHourly.uploaded).getTime();
+    selectedKey = finalTime >= hourlyTime ? finalKey : latestHourly.key;
+  } else if (finalHead) {
+    selectedKey = finalKey;
+  } else if (latestHourly) {
+    selectedKey = latestHourly.key;
+  }
+
+  if (!selectedKey) return null;
+  return await bucket.get(selectedKey);
+}
+
 // ---------------------------------------------------------------------------
 // Middleware: Cloudflare Access JWT validation (skip for /internal/*)
 // ---------------------------------------------------------------------------
@@ -262,6 +290,42 @@ app.post("/api/wake", async (c) => {
     CF_ACCESS_JWT: accessJwt,
   });
 
+  // Option A (restore): Worker owns R2 + token, so push the newest snapshot
+  // into the container directly. start-hermes.sh polls /tmp/restore.sqfs —
+  // no curl, no UPLOAD_TOKEN/CF_ACCESS_JWT needed on the boot path.
+  let snapshotPushed = false;
+  try {
+    const snap = await findLatestSnapshot(c.env.BACKUP_BUCKET, userId);
+    if (snap?.body) {
+      await sandbox.writeFile("/tmp/restore.sqfs", snap.body);
+      snapshotPushed = true;
+    } else {
+      // No snapshot exists: tell the boot script immediately so it doesn't
+      // wait out its poll window (fresh users otherwise stall ~120s).
+      await sandbox.writeFile("/tmp/restore-none", "no snapshot");
+    }
+  } catch (e: any) {
+    // Container may still be booting; boot script treats missing file as fresh start
+    console.error(`[wake] snapshot push failed for ${userId}: ${e?.message || e}`);
+  }
+
+  // Option B (upload): the CMD boot process can't see setEnvVars, so deliver
+  // the upload token via a bootstrap file. Written on EVERY wake — a rotated
+  // token or refreshed Access JWT is picked up on the next loop iteration.
+  try {
+    const bootstrap = JSON.stringify({
+      userId,
+      uploadToken: c.env.UPLOAD_TOKEN,
+      accessJwt,
+      snapshotUploadUrl: `${workerOrigin}/internal/upload-snapshot`,
+      cloudflaredToken: tunnelToken,
+      dashboardSessionToken: sessionToken,
+    });
+    await sandbox.writeFile("/run/hermes-bootstrap.json", bootstrap);
+  } catch (e: any) {
+    console.error(`[wake] bootstrap write failed for ${userId}: ${e?.message || e}`);
+  }
+
   // Warmup ping to force container creation if sleeping
   let pingOk = false;
   try {
@@ -279,7 +343,7 @@ app.post("/api/wake", async (c) => {
     // DO may be new, no state yet
   }
 
-  return c.json({ userId, status: "awake", pingOk, state });
+  return c.json({ userId, status: "awake", pingOk, snapshotPushed, state });
 });
 
 // ---------------------------------------------------------------------------
@@ -451,39 +515,12 @@ app.get("/internal/download-snapshot", async (c) => {
   const userId = c.req.query("userId");
   if (!userId) return c.text("missing userId", 400);
 
-  // Fetch metadata for both candidates
-  const finalKey = `backups/${userId}/final.sqfs`;
-  const finalHead = await c.env.BACKUP_BUCKET.head(finalKey);
-
-  const list = await c.env.BACKUP_BUCKET.list({ prefix: `backups/${userId}/hourly/` });
-  const latestHourly = list.objects.length
-    ? list.objects.sort(
-        (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
-      )[0]
-    : null;
-
-  // Determine which snapshot is newest
-  let selectedKey: string | null = null;
-  if (finalHead && latestHourly) {
-    const finalTime = new Date(finalHead.uploaded).getTime();
-    const hourlyTime = new Date(latestHourly.uploaded).getTime();
-    selectedKey = finalTime >= hourlyTime ? finalKey : latestHourly.key;
-  } else if (finalHead) {
-    selectedKey = finalKey;
-  } else if (latestHourly) {
-    selectedKey = latestHourly.key;
-  }
-
-  if (!selectedKey) {
+  const snap = await findLatestSnapshot(c.env.BACKUP_BUCKET, userId);
+  if (!snap || !snap.body) {
     return c.text("no snapshot found", 404);
   }
 
-  const obj = await c.env.BACKUP_BUCKET.get(selectedKey);
-  if (!obj || !obj.body) {
-    return c.text("snapshot not found", 404);
-  }
-
-  return new Response(obj.body, {
+  return new Response(snap.body, {
     headers: { "Content-Type": "application/octet-stream" },
   });
 });
