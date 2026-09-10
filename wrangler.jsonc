@@ -35,5 +35,11 @@
   "r2_buckets": [
     { "binding": "BACKUP_BUCKET", "bucket_name": "hermes-agent-state" }
   ],
-  "ai": { "binding": "AI" }
+  "ai": { "binding": "AI" },
+  "vars": {
+    "SNAPSHOT_INTERVAL_MINUTES": "60"
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
 }

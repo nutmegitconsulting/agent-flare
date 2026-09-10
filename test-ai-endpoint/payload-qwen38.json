@@ -1,0 +1,10 @@
+{
+  "model": "@cf/qwen/qwen3.8-27b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain serverless AI in two sentences."
+    }
+  ],
+  "max_tokens": 1024
+}

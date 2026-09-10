@@ -56,25 +56,6 @@ cd /home/user/projects/hermes-cloudflare-v6
 # Set Worker-level secrets
 npx wrangler secret put CF_API_TOKEN
 # Paste the token from Step 2
-
-npx wrangler secret put UPLOAD_TOKEN
-# Generate one: openssl rand -hex 32
-```
-
-**What UPLOAD_TOKEN is:**
-- A global bearer token shared between the Worker and all containers.
-- The container sends it in the `Authorization` header when POSTing squashfs snapshots to the Worker's `/internal/upload-snapshot` endpoint.
-- The Worker validates it, then writes the snapshot to R2 using its own `BACKUP_BUCKET` binding.
-- The container **never** talks to R2 directly and has no R2 credentials.
-
-**Set secrets (encrypted, hidden in dashboard):**
-
-```bash
-npx wrangler secret put CF_API_TOKEN
-# Paste the token from Step 2
-
-npx wrangler secret put UPLOAD_TOKEN
-# Generate one: openssl rand -hex 32
 ```
 
 **Set public vars via the Cloudflare dashboard** (not in the repo):
@@ -258,6 +239,65 @@ Run:
 
 ---
 
+## Phase 5 — AI Gateway Custom Providers (Optional, V8)
+
+Route the agent's model calls through your Cloudflare AI Gateway. The
+worker injects a `custom_providers:` section into the container's
+`config.yaml` on wake (worker-owned, bannered — do not hand-edit it in the
+container; it is re-rendered from R2 every wake).
+
+### One-time: gateway setup (Cloudflare dashboard)
+
+1. AI > AI Gateway → select/create your gateway.
+2. **Custom domains** tab: assign a custom domain (e.g. `ai-gw.yourdomain.com`).
+3. **Access** tab: enable Cloudflare Access for the gateway (auto-creates the
+   Access app) and add an email policy for the user.
+
+### Per-user: deliver the provider config
+
+1. Edit `scripts/reference-providers.json` for your gateway:
+   - **`mode: "jwt"`** (custom domain + Access, per-user identity,
+     `cf.user_id` attribution): set `base_url` to
+     `https://<gateway-custom-domain>/openai/v1`. No `gateway_id`, no
+     `extra_headers` — the Access JWT *is* the credential
+     (`Authorization: Bearer <JWT>`, verified at the Access edge) and the
+     gateway selects itself via the domain.
+   - **`mode: "api_token"`** (account-scoped endpoint, shared token): set
+     `base_url` to
+     `https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1`,
+     set `gateway_id` to the gateway slug (the worker adds the
+     `cf-aig-gateway-id` header automatically). The worker secret
+     `CLOUDFLARE_AI_API_TOKEN` (a CF API token with **Workers AI:Read**)
+     supplies the credential — set it with
+     `echo <token> | npx wrangler secret put CLOUDFLARE_AI_API_TOKEN`.
+2. Run the client with the gateway domain:
+
+   ```powershell
+   .\scripts\setup-client.ps1 -GatewayDomain https://ai-gw.yourdomain.com
+   ```
+
+   First run opens a second browser login (the gateway's Access app). The
+   script stores the providers JSON + your gateway Access JWT in the worker
+   (R2, per-user) and the following wake injects them. Re-run the script any
+   time to refresh the JWT (session-scoped; this project's containers don't
+   outlive a session, so no refresh machinery is needed).
+
+### Verify
+
+```powershell
+# providers stored?
+cloudflared access curl "$WorkerUrl/api/admin/providers?userId=<you>" -s
+# wake, then check the rendered section
+cloudflared access curl "$WorkerUrl/api/wake" -s -X POST   # look for providersWritten: 1
+cloudflared access curl "$WorkerUrl/api/debug/exec?userId=<you>&cmd=cat%20/home/hermes/.hermes/config.yaml" -s
+```
+
+In the GUI, switch models to one of the injected ids (e.g.
+`@cf/openai/gpt-oss-20b`). In the gateway dashboard, the request should show
+`cf.user_id` = your Access subject (jwt mode).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -268,6 +308,10 @@ Run:
 | Hermes GUI can't connect | Verify `netstat` shows `127.0.0.1:9119` listening |
 | Cold start > 10s | Normal for first wake after sleep; subsequent requests are fast |
 | Container sleeps mid-session | Internal bash loop may not count as activity. If this happens, call `/api/wake` from a background script or accept the cold start. |
+| Wake shows `providersError` | Provider injection failed — the container still boots (no custom providers). Check `wrangler tail` logs, fix `reference-providers.json`, re-run the client. |
+| Provider entry skipped (`no Access JWT on file`) | The gateway JWT wasn't delivered. Finish the gateway Access browser login and re-run `setup-client.ps1 -GatewayDomain ...`. |
+| Model calls 401/403 via gateway (jwt mode) | Gateway JWT expired or Access policy doesn't allow the user. Re-run the client script; check the gateway Access tab policies. |
+| Model calls 401 (api_token mode) | `CLOUDFLARE_AI_API_TOKEN` secret missing or lacks Workers AI:Read permission. |
 
 ---
 
@@ -284,7 +328,10 @@ Run:
 
 ## Files Reference
 
-- `wrangler.jsonc` — Worker config (containers, DOs, R2 bucket)
-- `src/index.ts` — Worker routes (`/api/client-init`, `/api/wake`, `/internal/upload-snapshot`, etc.)
-- `entrypoint.sh` — Container boot script (restores state, starts cloudflared + hermes, hourly snapshots)
+- `wrangler.jsonc` — Worker config (containers, DOs, R2 bucket, cron)
+- `src/index.ts` — Worker routes (`/api/client-init`, `/api/wake`, `/api/admin/*`, etc.)
+- `src/persistence.ts` — SDK-native state persistence (`createBackup` / `restoreBackup` to R2)
+- `src/providers.ts` — V8 per-user AI Gateway custom providers (R2 → config.yaml/.env injection on wake)
+- `scripts/reference-providers.json` — V8 reference provider config (edit per gateway, then delivered by the client)
+- `start-hermes.sh` — Container boot script (restore gate, starts cloudflared + hermes)
 - `Dockerfile` — Container image (cloudflared + squashfs-tools + hermes)

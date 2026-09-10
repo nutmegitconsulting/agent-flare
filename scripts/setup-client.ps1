@@ -6,7 +6,12 @@ param(
     [string]$WorkerUrl    = "https://hermes-agent.hermes-test.app",
     [string]$AccessAppUrl = "https://hermes-agent.hermes-test.app",
     [string]$LocalPort    = "9119",
-    [string]$CloudflaredPath = (Get-Command cloudflared -ErrorAction SilentlyContinue).Source
+    [string]$CloudflaredPath = (Get-Command cloudflared -ErrorAction SilentlyContinue).Source,
+    # V8 (optional): custom domain of your Cloudflare AI Gateway (Access-protected).
+    # When set, the script does a second Access login for the gateway, then
+    # delivers scripts/reference-providers.json + the gateway Access JWT to the
+    # worker, which injects the custom_providers section on wake.
+    [string]$GatewayDomain = ""
 )
 
 # ---------------------------------------------------------------------------
@@ -88,6 +93,67 @@ if ($sessionToken) {
 }
 
 # ---------------------------------------------------------------------------
+# 3b. AI Gateway providers (V8, optional)
+#     If -GatewayDomain is set: second Access login for the gateway's custom
+#     domain, then deliver the provider config (reference-providers.json,
+#     edited for your gateway) + the Access JWT to the worker. The worker
+#     injects the custom_providers section into config.yaml on the next wake.
+# ---------------------------------------------------------------------------
+$providersDelivered = $false
+if ($GatewayDomain) {
+    $gatewayBase = $GatewayDomain.TrimEnd("/")
+    Write-Host "`nAuthenticating with AI Gateway Access..."
+    Write-Host "  Gateway domain: $gatewayBase"
+    $gwLogin = Start-Process -FilePath $CloudflaredPath `
+        -ArgumentList @("access", "login", $gatewayBase) `
+        -RedirectStandardOutput "gw-login-out.txt" `
+        -RedirectStandardError  "gw-login-err.txt" `
+        -Wait -PassThru -NoNewWindow
+    $gwToken = (Get-Content "gw-login-out.txt" -Raw -ErrorAction SilentlyContinue).Trim()
+    Remove-Item "gw-login-out.txt", "gw-login-err.txt" -ErrorAction SilentlyContinue
+
+    if ($gwLogin.ExitCode -ne 0 -or -not $gwToken -or $gwToken -match "^(https?://|Error|error)") {
+        Write-Host "Gateway Access login did not return a token. Skipping provider setup."
+        Write-Host "  (Finish the browser login and re-run this script.)"
+    } else {
+        $providersFile = Join-Path $PSScriptRoot "reference-providers.json"
+        if (-not (Test-Path $providersFile)) {
+            Write-Error "Providers file not found: $providersFile. Edit scripts/reference-providers.json for your gateway first."
+            exit 1
+        }
+        $providersJson = Get-Content $providersFile -Raw
+
+        Write-Host "Delivering provider config to worker..."
+        $putProc = Start-Process -FilePath $CloudflaredPath `
+            -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/providers?userId=$userId", "-s", "-X", "PUT", "-H", "Content-Type: application/json", "-d", $providersJson) `
+            -RedirectStandardOutput "providers-out.txt" `
+            -RedirectStandardError  "providers-err.txt" `
+            -Wait -PassThru -NoNewWindow
+        $putOut = (Get-Content "providers-out.txt" -Raw -ErrorAction SilentlyContinue).Trim()
+        Remove-Item "providers-out.txt", "providers-err.txt" -ErrorAction SilentlyContinue
+        if ($putProc.ExitCode -ne 0 -or -not $putOut) {
+            Write-Warning "Failed to PUT providers (will retry next run): $putOut"
+        } else {
+            Write-Host "  Providers stored: $putOut"
+            $jwtBody = ('{{"jwt":"{0}"}}' -f $gwToken.Replace('\', '\\').Replace('"', '\"'))
+            $jwtProc = Start-Process -FilePath $CloudflaredPath `
+                -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/gateway-jwt?userId=$userId", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", $jwtBody) `
+                -RedirectStandardOutput "jwt-out.txt" `
+                -RedirectStandardError  "jwt-err.txt" `
+                -Wait -PassThru -NoNewWindow
+            $jwtOut = (Get-Content "jwt-out.txt" -Raw -ErrorAction SilentlyContinue).Trim()
+            Remove-Item "jwt-out.txt", "jwt-err.txt" -ErrorAction SilentlyContinue
+            if ($jwtProc.ExitCode -ne 0 -or -not $jwtOut) {
+                Write-Warning "Failed to POST gateway JWT (will retry next run): $jwtOut"
+            } else {
+                Write-Host "  Gateway JWT stored: $jwtOut"
+                $providersDelivered = $true
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 4. Wake sandbox container
 # ---------------------------------------------------------------------------
 Write-Host "`nWaking sandbox container..."
@@ -157,7 +223,9 @@ while ($elapsed -lt $maxWaitSeconds) {
         $lastStartupStatus = $currentStartupStatus
     }
 
-    if ($currentStartupStatus -eq "Startup complete.") {
+    # V6 wrote "Startup complete."; V7's final status (same point in boot,
+    # immediately before `exec hermes serve`) is "Starting hermes serve...".
+    if ($currentStartupStatus -eq "Startup complete." -or $currentStartupStatus -eq "Starting hermes serve...") {
         $startupComplete = $true
     }
 

@@ -1,0 +1,18 @@
+[
+  {
+    "name": "Hermes-test CloudFlare AI Gateway",
+    "mode": "jwt",
+    "base_url": "https://aigw.hermes-test.app/openai/v1",
+    "key_env": "CLOUDFLARE_GATEWAY_AI_API_KEY",
+    "api_mode": "chat_completions",
+    "discover_models": false,
+    "models": {
+      "@cf/qwen/qwen3-30b-a3b-fp8": { "context_length": 32768, "max_length": 2048 },
+      "@cf/openai/gpt-oss-20b": { "context_length": 128000, "max_length": 4096 },
+      "@cf/meta/llama-4-scout-17b-16e-instruct": { "context_length": 131000, "max_length": 4096 },
+      "@cf/meta/llama-3.2-1b-instruct": { "context_length": 60000, "max_length": 4096 },
+      "@cf/meta/llama-3.1-8b-instruct-fp8": { "context_length": 32000, "max_length": 2048 }
+    },
+    "model": "@cf/openai/gpt-oss-20b"
+  }
+]

@@ -56,25 +56,6 @@ cd /home/user/projects/hermes-cloudflare-v6
 # Set Worker-level secrets
 npx wrangler secret put CF_API_TOKEN
 # Paste the token from Step 2
-
-npx wrangler secret put UPLOAD_TOKEN
-# Generate one: openssl rand -hex 32
-```
-
-**What UPLOAD_TOKEN is:**
-- A global bearer token shared between the Worker and all containers.
-- The container sends it in the `Authorization` header when POSTing squashfs snapshots to the Worker's `/internal/upload-snapshot` endpoint.
-- The Worker validates it, then writes the snapshot to R2 using its own `BACKUP_BUCKET` binding.
-- The container **never** talks to R2 directly and has no R2 credentials.
-
-**Set secrets (encrypted, hidden in dashboard):**
-
-```bash
-npx wrangler secret put CF_API_TOKEN
-# Paste the token from Step 2
-
-npx wrangler secret put UPLOAD_TOKEN
-# Generate one: openssl rand -hex 32
 ```
 
 **Set public vars via the Cloudflare dashboard** (not in the repo):
@@ -284,7 +265,8 @@ Run:
 
 ## Files Reference
 
-- `wrangler.jsonc` — Worker config (containers, DOs, R2 bucket)
-- `src/index.ts` — Worker routes (`/api/client-init`, `/api/wake`, `/internal/upload-snapshot`, etc.)
-- `entrypoint.sh` — Container boot script (restores state, starts cloudflared + hermes, hourly snapshots)
+- `wrangler.jsonc` — Worker config (containers, DOs, R2 bucket, cron)
+- `src/index.ts` — Worker routes (`/api/client-init`, `/api/wake`, `/api/admin/*`, etc.)
+- `src/persistence.ts` — SDK-native state persistence (`createBackup` / `restoreBackup` to R2)
+- `start-hermes.sh` — Container boot script (restore gate, starts cloudflared + hermes)
 - `Dockerfile` — Container image (cloudflared + squashfs-tools + hermes)

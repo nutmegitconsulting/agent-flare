@@ -3,6 +3,14 @@ import { getSandbox } from "@cloudflare/sandbox";
 import { HermesSandbox } from "./sandbox";
 export { HermesSandbox };
 import type { Env } from "./env";
+import { createSnapshot, restoreLatest, snapshotIfDue } from "./persistence";
+import {
+  injectProviders,
+  loadProviders,
+  saveProviders,
+  storeGatewayJwt,
+  validateProviders,
+} from "./providers";
 
 // Helper to avoid deep type instantiation
 function getSandboxAny(ns: any, id: string, options?: any): any {
@@ -10,6 +18,64 @@ function getSandboxAny(ns: any, id: string, options?: any): any {
 }
 
 const app = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
+
+// Minimum age of the latest backup before the cron takes a fresh snapshot.
+// Cadence set by SNAPSHOT_INTERVAL_MINUTES (wrangler var), default 60 (hourly).
+const DEFAULT_SNAPSHOT_INTERVAL_MINUTES = 60;
+function snapshotIntervalMs(env: Env): number {
+  const minutes = Number(env.SNAPSHOT_INTERVAL_MINUTES);
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : DEFAULT_SNAPSHOT_INTERVAL_MINUTES) * 60_000;
+}
+
+// ---------------------------------------------------------------------------
+// Cron user registry (R2 json): the scheduled() handler snapshots only users
+// whose containers are currently running. A sleeping container has no live
+// data change, so skipping it is safe. Written on wake, cleared on stop/destroy.
+// ---------------------------------------------------------------------------
+const ACTIVE_USERS_KEY = "active-users.json";
+
+async function readActiveUsers(bucket: R2Bucket): Promise<string[]> {
+  const obj = await bucket.get(ACTIVE_USERS_KEY);
+  if (!obj) return [];
+  try {
+    return await obj.json();
+  } catch {
+    return [];
+  }
+}
+
+async function addActiveUser(bucket: R2Bucket, userId: string): Promise<void> {
+  const users = await readActiveUsers(bucket);
+  if (!users.includes(userId)) {
+    users.push(userId);
+    await bucket.put(ACTIVE_USERS_KEY, JSON.stringify(users));
+  }
+}
+
+async function removeActiveUser(bucket: R2Bucket, userId: string): Promise<void> {
+  const users = await readActiveUsers(bucket);
+  if (users.includes(userId)) {
+    await bucket.put(ACTIVE_USERS_KEY, JSON.stringify(users.filter((u) => u !== userId)));
+  }
+}
+
+/** Cron tick: snapshot every running active user whose latest backup is older
+ *  than the interval. Never starts cold containers (getState gate). Per-user
+ *  try/caught so one bad user can't fail the tick. */
+async function runCronSnapshots(env: Env): Promise<void> {
+  const users = await readActiveUsers(env.BACKUP_BUCKET);
+  if (!users.length) return;
+  for (const userId of users) {
+    try {
+      const sandbox: any = getSandboxAny(env.Sandbox, userId);
+      const state = await sandbox.getState();
+      if (state !== "running") continue; // sleeping: skip, no live data change
+      await snapshotIfDue(sandbox, env.BACKUP_BUCKET, userId, snapshotIntervalMs(env));
+    } catch (e: any) {
+      console.error(`[cron] snapshot failed for ${userId}: ${e?.message || e}`);
+    }
+  }
+}
 
 // Sanitize userId for use in DNS hostnames (strip @domain.com, keep local part)
 function sanitizeForDns(userId: string): string {
@@ -21,34 +87,6 @@ function generateSessionToken(): string {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-// Pick the newest snapshot for a user: final.sqfs vs. latest hourly.
-// Returns the R2 object body (stream) or null if none exist.
-async function findLatestSnapshot(bucket: R2Bucket, userId: string): Promise<R2ObjectBody | null> {
-  const finalKey = `backups/${userId}/final.sqfs`;
-  const finalHead = await bucket.head(finalKey);
-
-  const list = await bucket.list({ prefix: `backups/${userId}/hourly/` });
-  const latestHourly = list.objects.length
-    ? list.objects.sort(
-        (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
-      )[0]
-    : null;
-
-  let selectedKey: string | null = null;
-  if (finalHead && latestHourly) {
-    const finalTime = new Date(finalHead.uploaded).getTime();
-    const hourlyTime = new Date(latestHourly.uploaded).getTime();
-    selectedKey = finalTime >= hourlyTime ? finalKey : latestHourly.key;
-  } else if (finalHead) {
-    selectedKey = finalKey;
-  } else if (latestHourly) {
-    selectedKey = latestHourly.key;
-  }
-
-  if (!selectedKey) return null;
-  return await bucket.get(selectedKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,50 +312,70 @@ app.post("/api/wake", async (c) => {
 
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId, { sleepAfter: "30m" });
 
-  // Set env vars BEFORE first container interaction so entrypoint sees them on boot
-  const workerOrigin = new URL(c.req.url).origin;
-
-  // Forward Access JWT from client for internal endpoint auth inside container
-  const accessJwt = c.req.header("CF-Access-Jwt-Assertion") || "";
-
+  // Set env vars BEFORE first container interaction so the defaultSession
+  // tree sees them on boot. (The CMD child can NEVER see these — different
+  // process tree; anything reaching the CMD goes via the bootstrap file below.)
   await sandbox.setEnvVars({
     HERMES_USER_ID: userId,
     CLOUDFLARED_TOKEN: tunnelToken,
     HERMES_DASHBOARD_SESSION_TOKEN: sessionToken,
-    SNAPSHOT_UPLOAD_URL: `${workerOrigin}/internal/upload-snapshot`,
-    SNAPSHOT_DOWNLOAD_URL: `${workerOrigin}/internal/download-snapshot`,
-    UPLOAD_TOKEN: c.env.UPLOAD_TOKEN,
-    CF_ACCESS_JWT: accessJwt,
   });
 
-  // Option A (restore): Worker owns R2 + token, so push the newest snapshot
-  // into the container directly. start-hermes.sh polls /tmp/restore.sqfs —
-  // no curl, no UPLOAD_TOKEN/CF_ACCESS_JWT needed on the boot path.
-  let snapshotPushed = false;
+  // Register this user as active for the cron snapshot loop (see runCronSnapshots).
   try {
-    const snap = await findLatestSnapshot(c.env.BACKUP_BUCKET, userId);
-    if (snap?.body) {
-      await sandbox.writeFile("/tmp/restore.sqfs", snap.body);
-      snapshotPushed = true;
-    } else {
-      // No snapshot exists: tell the boot script immediately so it doesn't
-      // wait out its poll window (fresh users otherwise stall ~120s).
-      await sandbox.writeFile("/tmp/restore-none", "no snapshot");
-    }
+    await addActiveUser(c.env.BACKUP_BUCKET, userId);
   } catch (e: any) {
-    // Container may still be booting; boot script treats missing file as fresh start
-    console.error(`[wake] snapshot push failed for ${userId}: ${e?.message || e}`);
+    console.error(`[wake] active-user registry write failed for ${userId}: ${e?.message || e}`);
   }
 
-  // Option B (upload): the CMD boot process can't see setEnvVars, so deliver
-  // the upload token via a bootstrap file. Written on EVERY wake — a rotated
-  // token or refreshed Access JWT is picked up on the next loop iteration.
+  // SDK-native restore: extract the newest backup into /home/hermes before the
+  // boot script unblocks. restoreLatest no-ops (returns false) when no backup
+  // exists, and clears a stale handle when the backup has expired/been pruned.
+  // A failed restore must NOT fail the wake — surface it in the response and
+  // let the container come up on whatever is on disk.
+  let restored = false;
+  let restoreError: string | undefined;
+  try {
+    restored = await restoreLatest(sandbox, c.env.BACKUP_BUCKET, userId);
+  } catch (e: any) {
+    restoreError = e?.message || String(e);
+    console.error(`[wake] restore failed for ${userId} (continuing): ${restoreError}`);
+  }
+
+  // V8 provider injection — must complete BEFORE the boot script unblocks,
+  // so the first `hermes serve` reads config.yaml with its custom_providers
+  // section and .env with the key_env credentials. Same failure policy as
+  // restore: never fail the wake; the container boots without custom
+  // providers (today's behavior) and the error surfaces in the response.
+  let providersWritten = 0;
+  let providersError: string | undefined;
+  try {
+    const result = await injectProviders(sandbox, c.env.BACKUP_BUCKET, userId, c.env.CLOUDFLARE_AI_API_TOKEN || "");
+    providersWritten = result.providersWritten;
+    if (result.errors.length) {
+      console.warn(`[wake:${userId}] provider warnings: ${result.errors.join("; ")}`);
+    }
+  } catch (e: any) {
+    providersError = e?.message || String(e);
+    console.error(`[wake] provider injection failed for ${userId} (continuing): ${providersError}`);
+  }
+
+  // Unblock the boot poll. start-hermes.sh gates on /tmp/restore-done — written
+  // after restoreBackup succeeds (or immediately when no backup exists) so the
+  // first `hermes serve` reads the restored tree.
+  try {
+    await sandbox.writeFile("/tmp/restore-done", "restored:" + restored);
+  } catch (e: any) {
+    console.error(`[wake] restore-done marker write failed for ${userId}: ${e?.message || e}`);
+  }
+
+  // Bootstrap file — SHRUNK to what the CMD genuinely needs. No upload token,
+  // Access JWT, or URLs: the container performs no uploads anymore (the SDK
+  // uploads backups through the bound R2). Written on every wake so a rotated
+  // token / refreshed dashboard session token is picked up live.
   try {
     const bootstrap = JSON.stringify({
       userId,
-      uploadToken: c.env.UPLOAD_TOKEN,
-      accessJwt,
-      snapshotUploadUrl: `${workerOrigin}/internal/upload-snapshot`,
       cloudflaredToken: tunnelToken,
       dashboardSessionToken: sessionToken,
     });
@@ -343,7 +401,16 @@ app.post("/api/wake", async (c) => {
     // DO may be new, no state yet
   }
 
-  return c.json({ userId, status: "awake", pingOk, snapshotPushed, state });
+  return c.json({
+    userId,
+    status: "awake",
+    pingOk,
+    restored,
+    ...(restoreError ? { restoreError } : {}),
+    providersWritten,
+    ...(providersError ? { providersError } : {}),
+    state,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -371,6 +438,18 @@ app.post("/api/admin/destroy", async (c) => {
     return c.json({ error: "Missing userId query param" }, 400);
   }
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  // Best-effort final backup before the container is gone. Short timeout —
+  // destroy must not hang. Never blocks the destroy itself.
+  try {
+    if (await sandbox.getState() === "running") {
+      await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
+    }
+  } catch (e: any) {
+    console.error(`[admin/destroy] final backup failed for ${userId} (continuing): ${e?.message || e}`);
+  }
+  try {
+    await removeActiveUser(c.env.BACKUP_BUCKET, userId);
+  } catch { /* best-effort */ }
   try {
     await sandbox.destroy();
     return c.json({ userId, status: "destroyed" });
@@ -379,13 +458,26 @@ app.post("/api/admin/destroy", async (c) => {
   }
 });
 
-// Admin: graceful stop by userId (SIGTERM, triggers onStop + backup)
+// Admin: graceful stop by userId (SIGTERM, then final backup, then stop)
 app.post("/api/admin/stop", async (c) => {
   const userId = c.req.query("userId");
   if (!userId) {
     return c.json({ error: "Missing userId query param" }, 400);
   }
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  // Final backup before stop: captures the live tree so the next wake
+  // restores to exactly this point. Best-effort — a snapshot hiccup must not
+  // block the stop.
+  try {
+    if (await sandbox.getState() === "running") {
+      await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
+    }
+  } catch (e: any) {
+    console.error(`[admin/stop] final backup failed for ${userId} (continuing): ${e?.message || e}`);
+  }
+  try {
+    await removeActiveUser(c.env.BACKUP_BUCKET, userId);
+  } catch { /* best-effort */ }
   try {
     await sandbox.stop();
     return c.json({ userId, status: "stopped" });
@@ -409,120 +501,105 @@ app.get("/api/admin/status", async (c) => {
   }
 });
 
-// Admin: upload existing snapshot from container filesystem to R2
-app.post("/api/admin/upload-snapshot-from-container", async (c) => {
+// Admin: force a snapshot of a running user's /home/hermes to R2 now.
+// Useful for ops + validating the createBackup path (and for round-trip tests).
+app.post("/api/admin/snapshot", async (c) => {
   const userId = c.req.query("userId");
-  const snapPath = c.req.query("path") || "/tmp/snapshot-1787348514.sqsh";
   if (!userId) {
     return c.json({ error: "Missing userId query param" }, 400);
   }
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  const t0 = Date.now();
   try {
-    const stream = await sandbox.readFileStream(snapPath);
-    const reader = stream.getReader();
-    const chunks: Uint8Array[] = [];
-    let totalLen = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalLen += value.length;
-    }
-    const combined = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const chunk of chunks) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
-    }
-    const key = `backups/${userId}/final.sqfs`;
-    await c.env.BACKUP_BUCKET.put(key, combined);
-    return c.json({ userId, path: snapPath, r2Key: key, bytes: totalLen, status: "uploaded" });
+    const handle = await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
+    return c.json({ userId, ok: true, handle, duration_ms: Date.now() - t0 });
   } catch (e: any) {
-    return c.json({ userId, path: snapPath, error: e.message || String(e) }, 500);
+    return c.json({ userId, ok: false, error: e?.message || String(e), duration_ms: Date.now() - t0 }, 500);
   }
 });
 
-// Internal admin: destroy by userId (token-auth, for scripts)
-app.post("/internal/destroy", async (c) => {
-  const auth = c.req.header("Authorization");
-  if (!auth || auth !== `Bearer ${c.env.UPLOAD_TOKEN}`) {
-    return c.text("unauthorized", 401);
-  }
+// Admin: force-restore the latest R2 backup into a user's /home/hermes.
+// For round-trip tests — kill/stop the running serve first so the restore
+// doesn't fight live writes.
+app.post("/api/admin/restore", async (c) => {
   const userId = c.req.query("userId");
   if (!userId) {
-    return c.text("missing userId", 400);
+    return c.json({ error: "Missing userId query param" }, 400);
   }
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId);
+  const t0 = Date.now();
   try {
-    await sandbox.destroy();
-    return c.json({ userId, status: "destroyed" });
+    const restored = await restoreLatest(sandbox, c.env.BACKUP_BUCKET, userId);
+    return c.json({ userId, ok: true, restored, duration_ms: Date.now() - t0 });
   } catch (e: any) {
-    return c.json({ userId, error: e.message || String(e) }, 500);
+    return c.json({ userId, ok: false, error: e?.message || String(e), duration_ms: Date.now() - t0 }, 500);
   }
 });
 
 // ---------------------------------------------------------------------------
-// Internal: container -> Worker -> R2 snapshot upload
+// V8: per-user AI Gateway providers (see src/providers.ts)
+//   PUT  /api/admin/providers?userId=  body = providers array (no secrets)
+//   GET  /api/admin/providers?userId=  current stored file
+//   POST /api/admin/gateway-jwt?userId=  body = { jwt }  (session credential
+//        for mode=jwt entries; client re-sends it on each setup run)
+// JWT-authed like the rest of the API (Access). The caller's JWT is the
+// credential for their own jwt-mode provider — no extra identity plumbing.
 // ---------------------------------------------------------------------------
 
-app.post("/internal/upload-snapshot", async (c) => {
-  const auth = c.req.header("Authorization");
-  if (!auth || auth !== `Bearer ${c.env.UPLOAD_TOKEN}`) {
-    return c.text("unauthorized", 401);
+app.put("/api/admin/providers", async (c) => {
+  const userId = c.req.query("userId") || c.get("userId");
+  if (!userId) return c.json({ error: "Missing userId" }, 400);
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Body must be a JSON array of provider entries" }, 400);
   }
+  const parsed = validateProviders(body);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  await saveProviders(c.env.BACKUP_BUCKET, userId, parsed.entries);
+  return c.json({ userId, ok: true, count: parsed.entries.length });
+});
 
-  const userId = c.req.header("X-User-Id");
-  const type = c.req.header("X-Snapshot-Type") || "hourly";
-  if (!userId) return c.text("missing X-User-Id", 400);
+app.get("/api/admin/providers", async (c) => {
+  const userId = c.req.query("userId") || c.get("userId");
+  if (!userId) return c.json({ error: "Missing userId" }, 400);
+  const entries = await loadProviders(c.env.BACKUP_BUCKET, userId);
+  return c.json({ userId, providers: entries ?? [] });
+});
 
-  const body = await c.req.arrayBuffer();
-  if (!body || body.byteLength === 0) {
-    return c.text("empty body", 400);
+app.post("/api/admin/gateway-jwt", async (c) => {
+  const userId = c.req.query("userId") || c.get("userId");
+  if (!userId) return c.json({ error: "Missing userId" }, 400);
+  let body: { jwt?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Body must be { \"jwt\": \"...\" }" }, 400);
   }
+  if (!body.jwt || typeof body.jwt !== "string" || body.jwt.length < 20) {
+    return c.json({ error: "Missing or implausibly short jwt" }, 400);
+  }
+  await storeGatewayJwt(c.env.BACKUP_BUCKET, userId, body.jwt);
+  return c.json({ userId, ok: true });
+});
 
-  const key = type === "final"
-    ? `backups/${userId}/final.sqfs`
-    : `backups/${userId}/hourly/${Date.now()}.sqfs`;
-
-  await c.env.BACKUP_BUCKET.put(key, body, {
-    httpMetadata: { contentType: "application/octet-stream" },
-  });
-
-  // Prune old hourly snapshots (keep last 24)
-  if (type === "hourly") {
-    const list = await c.env.BACKUP_BUCKET.list({ prefix: `backups/${userId}/hourly/` });
-    const objects = list.objects.sort(
-      (a: any, b: any) => new Date(b.uploaded).getTime() - new Date(a.uploaded).getTime()
+// ---------------------------------------------------------------------------
+// Scheduled: hourly cron. Snapshot every running active user whose latest
+// backup is older than SNAPSHOT_INTERVAL_MINUTES. Never starts cold
+// containers (getState gate); sleeping users are skipped safely.
+// ---------------------------------------------------------------------------
+export default {
+  fetch: app.fetch,
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await runCronSnapshots(env);
+        } catch (err) {
+          console.error("[scheduled] cron snapshot pass failed:", err);
+        }
+      })(),
     );
-    for (let i = 24; i < objects.length; i++) {
-      await c.env.BACKUP_BUCKET.delete(objects[i].key);
-    }
-  }
-
-  return c.json({ success: true, key });
-});
-
-// ---------------------------------------------------------------------------
-// Internal: container -> Worker -> R2 snapshot download (for restore)
-// ---------------------------------------------------------------------------
-
-app.get("/internal/download-snapshot", async (c) => {
-  const auth = c.req.header("Authorization");
-  if (!auth || auth !== `Bearer ${c.env.UPLOAD_TOKEN}`) {
-    return c.text("unauthorized", 401);
-  }
-
-  const userId = c.req.query("userId");
-  if (!userId) return c.text("missing userId", 400);
-
-  const snap = await findLatestSnapshot(c.env.BACKUP_BUCKET, userId);
-  if (!snap || !snap.body) {
-    return c.text("no snapshot found", 404);
-  }
-
-  return new Response(snap.body, {
-    headers: { "Content-Type": "application/octet-stream" },
-  });
-});
-
-export default app;
+  },
+} satisfies ExportedHandler<Env>;
