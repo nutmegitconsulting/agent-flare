@@ -1,0 +1,10 @@
+{
+  "model": "workers-ai/@cf/google/gemma-4-26b-a4b-it",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain serverless AI in two sentences."
+    }
+  ],
+  "max_tokens": 1024
+}

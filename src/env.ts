@@ -9,6 +9,10 @@ export interface Env {
   CF_ACCOUNT_ID: string;
   CF_ZONE_ID: string;
   CF_API_TOKEN: string;
-  UPLOAD_TOKEN: string;
-  HERMES_DASHBOARD_SESSION_TOKEN: string;
+  SNAPSHOT_INTERVAL_MINUTES: string;
+  /** V8: CF API token with Workers AI:Read — credential for mode=api_token
+   *  provider entries (account-scoped AI Gateway REST endpoint). Optional at
+   *  type level so jwt-only setups don't need it; unset entries are skipped
+   *  with a logged error. */
+  CLOUDFLARE_AI_API_TOKEN?: string;
 }
