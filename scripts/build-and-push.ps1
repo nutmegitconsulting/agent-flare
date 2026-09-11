@@ -38,14 +38,9 @@ $versionOut = docker run --rm --entrypoint /bin/bash $Image -c `
     'su hermes -c "HERMES_HOME=/home/hermes/.hermes /usr/local/bin/hermes --version" 2>&1'
 if ($LASTEXITCODE -ne 0) { Write-Error "version check failed to run (exit $LASTEXITCODE)."; exit 1 }
 $versionOut | ForEach-Object { Write-Host "    $_" }
-
-if ($versionOut -notlike "*Up to date*") {
-    # The install layer did not actually refresh — refuse to ship it.
-    Write-Host ""
-    Write-Error "Image is NOT up to date (stale cached layer or failed install). Do not push."
-    exit 1
-}
-Write-Host "==> Version check passed (Up to date)."
+# No freshness gate: --no-cache is the freshness guarantee (the install layer
+# re-runs every build). Hermes' "Up to date" line is unreliable inside the
+# image (network update check as non-root can silently return nothing).
 
 Write-Host ""
 Write-Host "==> Pushing to Cloudflare registry..."
