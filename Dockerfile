@@ -64,6 +64,12 @@ RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
     && ls -la /usr/local/lib/hermes-agent \
     && chown -R hermes:hermes /home/hermes
 
+# The install is a root-owned git clone. Mark it safe system-wide so non-root
+# users (the hermes user — used by build-and-push's version probe) can run
+# git-based update checks against it; without this, `hermes --version` as
+# hermes silently skips the "Up to date" freshness line (dubious ownership).
+RUN git config --system --add safe.directory /usr/local/lib/hermes-agent
+
 # --- Wipe build-time user state (Pitfall 12) ---------------------------------
 # install.sh's copy_config_templates seeded $HERMES_HOME at build time with
 # template config.yaml / .env / SOUL.md, install_id, bundled skills, empty data

@@ -51,6 +51,13 @@ SDK source (`node_modules/@cloudflare/sandbox/dist/sandbox-D0rNqxlr.js`):
    is too old) lands in `$HERMES_HOME/node/` — both INSIDE the snapshot tree,
    which is fine and desirable (a restore re-materializes them; a fresh user gets
    them baked in the image).
+   CORRECTION (verified in-image 2026-09-10, build `hermes-vanilla-check`):
+   current install.sh puts uv-managed CPython at `/usr/local/python/`
+   (venv -> /usr/local/python/bin/python3.11) and uv tools (browser-use) at
+   `/root/.local/share/uv/tools` — NOT `/usr/local/share/uv`. Same invariant
+   (baked image, outside the snapshot tree); nothing references the path.
+   The 0.12.7-python base ships Node new enough that `$HERMES_HOME/node/`
+   is NOT created — PATH entry for it is a harmless no-op.
 3. `copy_config_templates()` seeds `$HERMES_HOME/` at build time with: `.env`
    (template), `config.yaml` (template), `SOUL.md`, empty data dirs
    (`cron sessions logs pairing hooks image_cache audio_cache memories skills`),
