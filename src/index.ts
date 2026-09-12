@@ -4,6 +4,7 @@ import { HermesSandbox } from "./sandbox";
 export { HermesSandbox };
 import type { Env } from "./env";
 import { createSnapshot, restoreLatest, snapshotIfDue } from "./persistence";
+import { pruneSnapshots } from "./prune";
 import {
   injectProviders,
   loadProviders,
@@ -441,9 +442,7 @@ app.post("/api/admin/destroy", async (c) => {
   // Best-effort final backup before the container is gone. Short timeout —
   // destroy must not hang. Never blocks the destroy itself.
   try {
-    if (await sandbox.getState() === "running") {
-      await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
-    }
+    await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
   } catch (e: any) {
     console.error(`[admin/destroy] final backup failed for ${userId} (continuing): ${e?.message || e}`);
   }
@@ -469,9 +468,7 @@ app.post("/api/admin/stop", async (c) => {
   // restores to exactly this point. Best-effort — a snapshot hiccup must not
   // block the stop.
   try {
-    if (await sandbox.getState() === "running") {
-      await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
-    }
+    await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
   } catch (e: any) {
     console.error(`[admin/stop] final backup failed for ${userId} (continuing): ${e?.message || e}`);
   }
@@ -483,6 +480,19 @@ app.post("/api/admin/stop", async (c) => {
     return c.json({ userId, status: "stopped" });
   } catch (e: any) {
     return c.json({ userId, error: e.message || String(e) }, 500);
+  }
+});
+
+// Admin: prune backups for userId
+app.post("/api/admin/prune", async (c) => {
+  const userId = c.req.query("userId");
+  if (!userId) return c.json({ error: "Missing userId query param" }, 400);
+  const t0 = Date.now();
+  try {
+    const { kept, deleted } = await pruneSnapshots(c.env.BACKUP_BUCKET, userId);
+    return c.json({ userId, kept, deleted, duration_ms: Date.now() - t0 });
+  } catch (e: any) {
+    return c.json({ userId, error: e?.message || String(e), duration_ms: Date.now() - t0 }, 500);
   }
 });
 
@@ -591,9 +601,27 @@ app.post("/api/admin/gateway-jwt", async (c) => {
 // ---------------------------------------------------------------------------
 export default {
   fetch: app.fetch,
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
       (async () => {
+        if (event.cron === "0 */2 * * *") {
+          // Prune pass: run retention rules for every known user
+          try {
+            const users = await readActiveUsers(env.BACKUP_BUCKET);
+            for (const userId of users) {
+              try {
+                const { kept, deleted } = await pruneSnapshots(env.BACKUP_BUCKET, userId);
+                if (deleted > 0) console.log(`[cron:prune] ${userId}: deleted=${deleted}, kept=${kept}`);
+              } catch (e: any) {
+                console.error(`[cron:prune] ${userId}: ${e?.message || e}`);
+              }
+            }
+          } catch (err) {
+            console.error("[scheduled] prune pass failed:", err);
+          }
+          return;
+        }
+        // Snapshot pass (*/5 * * * *)
         try {
           await runCronSnapshots(env);
         } catch (err) {

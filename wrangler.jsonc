@@ -37,9 +37,9 @@
   ],
   "ai": { "binding": "AI" },
   "vars": {
-    "SNAPSHOT_INTERVAL_MINUTES": "60"
+    "SNAPSHOT_INTERVAL_MINUTES": "5"
   },
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["*/5 * * * *", "0 */2 * * *"]
   }
 }

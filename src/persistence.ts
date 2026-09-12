@@ -1,4 +1,5 @@
 import type { Sandbox, DirectoryBackup } from "@cloudflare/sandbox";
+import { removeFromIndex } from "./prune";
 
 /**
  * SDK-native persistence layer for Hermes' data dir.
@@ -140,6 +141,7 @@ export async function restoreLatest(
     if (/BACKUP_EXPIRED|BACKUP_NOT_FOUND|BackupExpiredError|BackupNotFoundError|Backup not found|has expired/i.test(msg)) {
       console.log(`[persistence:${userId}] backup ${handle.id} gone, clearing handle`);
       await deleteStoredHandle(bucket, keys.handle);
+      await removeFromIndex(bucket, userId, handle.id);
       return false;
     }
     throw err;
