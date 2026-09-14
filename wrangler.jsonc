@@ -35,6 +35,9 @@
   "r2_buckets": [
     { "binding": "BACKUP_BUCKET", "bucket_name": "hermes-agent-state" }
   ],
+  "kv_namespaces": [
+    { "binding": "CREDENTIALS_KV", "id": "REDACTED-KV-ID" }
+  ],
   "ai": { "binding": "AI" },
   "vars": {
     "SNAPSHOT_INTERVAL_MINUTES": "5"

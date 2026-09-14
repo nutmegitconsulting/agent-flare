@@ -1,9 +1,15 @@
-import type { R2Bucket, DurableObjectNamespace, Ai } from "@cloudflare/workers-types";
+import type { R2Bucket, KVNamespace, DurableObjectNamespace, Ai } from "@cloudflare/workers-types";
 import type { Sandbox } from "@cloudflare/sandbox";
 
 export interface Env {
   Sandbox: DurableObjectNamespace<Sandbox>;
   BACKUP_BUCKET: R2Bucket;
+  /** Credentials store (V9): tunnel token, dashboard session token, gateway
+   *  JWT. Kept OUT of the R2 backup bucket so third-party R2 backups never
+   *  carry usable credentials. Write-once/read-many fits KV's eventual
+   *  consistency (~60s propagation) — credentials are written at provision
+   *  time and read on wake, never rewritten mid-flight. */
+  CREDENTIALS_KV: KVNamespace;
   AI: Ai;
   ACCESS_AUD_TAG: string;
   CF_ACCOUNT_ID: string;
