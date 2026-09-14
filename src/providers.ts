@@ -1,4 +1,6 @@
 import type { Sandbox } from "@cloudflare/sandbox";
+import type { KVNamespace } from "@cloudflare/workers-types";
+import { getGatewayJwt, putGatewayJwt } from "./credentials";
 
 /**
  * Per-user AI Gateway custom providers (V8).
@@ -18,11 +20,10 @@ import type { Sandbox } from "@cloudflare/sandbox";
  *   CLOUDFLARE_AI_API_TOKEN (account-level, least privilege, shared across
  *   users) and routed per user via the cf-aig-gateway-id header.
  *
- * R2 layout (BACKUP_BUCKET):
+ * R2 layout (BACKUP_BUCKET) — config only, no secrets:
  *   users/<userId>/providers.json   worker-managed config (no secrets inside)
- *   users/<userId>/gateway-jwt.json session credential for the jwt-mode entry
- *                                    (short-lived by nature — client re-sends
- *                                    it on setup; no refresh machinery)
+ * The jwt-mode session credential lives in KV (cred:gwjwt:<userId>), NOT in
+ * the backup bucket (see ./credentials.ts).
  */
 
 export interface ProviderModelInfo {
@@ -60,17 +61,13 @@ export interface GatewayProviderEntry {
 }
 
 const PROVIDERS_KEY_SUFFIX = "providers.json";
-const JWT_KEY_SUFFIX = "gateway-jwt.json";
 const CONFIG_YAML = "/home/hermes/.hermes/config.yaml";
 const ENV_FILE = "/home/hermes/.hermes/.env";
 const BANNER = "# >>> hermes-cloudflare worker-managed custom_providers (do not edit)";
 const BANNER_END = "# <<< end worker-managed custom_providers";
 
-function keysFor(userId: string) {
-  return {
-    providers: `users/${userId}/${PROVIDERS_KEY_SUFFIX}`,
-    jwt: `users/${userId}/${JWT_KEY_SUFFIX}`,
-  };
+function providersKey(userId: string): string {
+  return `users/${userId}/${PROVIDERS_KEY_SUFFIX}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,11 +125,12 @@ export function validateProviders(data: unknown): { ok: true; entries: GatewayPr
 }
 
 // ---------------------------------------------------------------------------
-// R2 storage (no secrets ever stored here — only config + the session JWT)
+// KV storage for the gateway JWT — credentials never live in the backup
+// bucket (third-party replicated). providers.json (no secrets) stays in R2.
 // ---------------------------------------------------------------------------
 
 export async function loadProviders(bucket: R2Bucket, userId: string): Promise<GatewayProviderEntry[] | null> {
-  const obj = await bucket.get(keysFor(userId).providers);
+  const obj = await bucket.get(providersKey(userId));
   if (!obj) return null;
   const parsed = validateProviders(await obj.json().catch(() => null));
   if (!parsed.ok) return null; // corrupt/legacy file — treat as absent, log at call site
@@ -140,26 +138,18 @@ export async function loadProviders(bucket: R2Bucket, userId: string): Promise<G
 }
 
 export async function saveProviders(bucket: R2Bucket, userId: string, entries: GatewayProviderEntry[]): Promise<void> {
-  await bucket.put(keysFor(userId).providers, JSON.stringify(entries, null, 2), {
+  await bucket.put(providersKey(userId), JSON.stringify(entries, null, 2), {
     httpMetadata: { contentType: "application/json" },
   });
 }
 
-export async function storeGatewayJwt(bucket: R2Bucket, userId: string, jwt: string): Promise<void> {
-  await bucket.put(keysFor(userId).jwt, JSON.stringify({ jwt, updatedAt: new Date().toISOString() }), {
-    httpMetadata: { contentType: "application/json" },
-  });
+export async function storeGatewayJwt(kv: KVNamespace, userId: string, jwt: string): Promise<void> {
+  await putGatewayJwt(kv, userId, jwt);
 }
 
-export async function loadGatewayJwt(bucket: R2Bucket, userId: string): Promise<string | null> {
-  const obj = await bucket.get(keysFor(userId).jwt);
-  if (!obj) return null;
-  try {
-    const data = await obj.json() as { jwt?: string };
-    return data.jwt || null;
-  } catch {
-    return null;
-  }
+export async function loadGatewayJwt(kv: KVNamespace, userId: string): Promise<string | null> {
+  const creds = await getGatewayJwt(kv, userId);
+  return creds?.jwt ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,11 +254,11 @@ export interface InjectResult {
  * surfaces `providersError` in the response (container boots without the
  * custom providers, same as today).
  */
-export async function injectProviders(sandbox: Sandbox, bucket: R2Bucket, userId: string, aiApiToken: string): Promise<InjectResult> {
+export async function injectProviders(sandbox: Sandbox, kv: KVNamespace, bucket: R2Bucket, userId: string, aiApiToken: string): Promise<InjectResult> {
   const stored = await loadProviders(bucket, userId);
   if (!stored) return { providersIngested: 0, providersWritten: 0, errors: [] };
 
-  const gatewayJwt = await loadGatewayJwt(bucket, userId);
+  const gatewayJwt = await loadGatewayJwt(kv, userId);
   const { yaml, envLines, defaultModel, errors } = renderCustomProviders(stored, { aiApiToken, gatewayJwt });
 
   if (Object.keys(envLines).length === 0) {

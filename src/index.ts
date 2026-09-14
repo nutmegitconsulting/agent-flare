@@ -6,6 +6,12 @@ import type { Env } from "./env";
 import { createSnapshot, restoreLatest, snapshotIfDue } from "./persistence";
 import { pruneSnapshots } from "./prune";
 import {
+  getTunnelCreds,
+  putTunnelCreds,
+  getSessionToken,
+  putSessionToken,
+} from "./credentials";
+import {
   injectProviders,
   loadProviders,
   saveProviders,
@@ -70,7 +76,12 @@ async function runCronSnapshots(env: Env): Promise<void> {
     try {
       const sandbox: any = getSandboxAny(env.Sandbox, userId);
       const state = await sandbox.getState();
-      if (state !== "running") continue; // sleeping: skip, no live data change
+      // getState() returns {status, lastChange}. Live containers report "healthy"
+      // (set once ports are ready); "running" is only the transient startup state
+      // and "stopped" means slept/exited. Skipping anything not healthy/running
+      // never starts cold containers. (Old code compared the object to a string,
+      // which was always true — snapshots never ran.)
+      if (!state || !["healthy", "running"].includes(state.status)) continue;
       await snapshotIfDue(sandbox, env.BACKUP_BUCKET, userId, snapshotIntervalMs(env));
     } catch (e: any) {
       console.error(`[cron] snapshot failed for ${userId}: ${e?.message || e}`);
@@ -153,34 +164,22 @@ app.use("*", async (c, next) => {
 app.get("/health", (c) => c.json({ status: "ok" }));
 
 // ---------------------------------------------------------------------------
-// Client init: provision tunnel for this user (R2-backed, no DO)
+// Client init: provision tunnel for this user (KV-backed credentials, no DO)
 // ---------------------------------------------------------------------------
 
 app.post("/api/client-init", async (c) => {
   const userId = c.get("userId");
-  const credsKey = `users/${userId}/cloudflared/creds.json`;
 
-  // Check if already provisioned in R2
-  const existing = await c.env.BACKUP_BUCKET.head(credsKey);
-  if (existing) {
-    const obj = await c.env.BACKUP_BUCKET.get(credsKey);
-    const data = obj ? await obj.json() as { hostname: string } : null;
-    if (data?.hostname) {
-      // Fetch or generate session token even for existing tunnels
-      const tokenKey = `users/${userId}/session-token.json`;
-      let sessionToken = "";
-      const tokenObj = await c.env.BACKUP_BUCKET.get(tokenKey);
-      if (tokenObj) {
-        const tokenData = await tokenObj.json() as { token: string };
-        sessionToken = tokenData.token;
-      } else {
-        sessionToken = generateSessionToken();
-        await c.env.BACKUP_BUCKET.put(tokenKey, JSON.stringify({ token: sessionToken }), {
-          httpMetadata: { contentType: "application/json" },
-        });
-      }
-      return c.json({ userId, hostname: data.hostname, sessionToken, existing: true });
+  // Check if already provisioned (credentials live in KV, not the backup bucket)
+  const existing = await getTunnelCreds(c.env.CREDENTIALS_KV, userId);
+  if (existing?.hostname) {
+    // Fetch or generate session token even for existing tunnels
+    let sessionToken = await getSessionToken(c.env.CREDENTIALS_KV, userId);
+    if (!sessionToken) {
+      sessionToken = generateSessionToken();
+      await putSessionToken(c.env.CREDENTIALS_KV, userId, sessionToken);
     }
+    return c.json({ userId, hostname: existing.hostname, sessionToken, existing: true });
   }
 
   // Race: two requests could both pass the head() check above.
@@ -249,17 +248,13 @@ app.post("/api/client-init", async (c) => {
     }
   );
 
-  // Store tunnel creds in R2 for persistence across sleeps
-  await c.env.BACKUP_BUCKET.put(credsKey, JSON.stringify({ hostname, token: tunnelToken }), {
-    httpMetadata: { contentType: "application/json" },
-  });
+  // Store tunnel creds in KV for persistence across sleeps — OUT of the
+  // backup bucket so third-party R2 backups never carry usable credentials
+  await putTunnelCreds(c.env.CREDENTIALS_KV, userId, { hostname, token: tunnelToken });
 
   // Generate and store a unique dashboard session token for this user
-  const tokenKey = `users/${userId}/session-token.json`;
   const sessionToken = generateSessionToken();
-  await c.env.BACKUP_BUCKET.put(tokenKey, JSON.stringify({ token: sessionToken }), {
-    httpMetadata: { contentType: "application/json" },
-  });
+  await putSessionToken(c.env.CREDENTIALS_KV, userId, sessionToken);
 
   return c.json({ userId, hostname, sessionToken, existing: false });
 });
@@ -270,21 +265,11 @@ app.post("/api/client-init", async (c) => {
 
 app.get("/api/status", async (c) => {
   const userId = c.get("userId");
-  const credsKey = `users/${userId}/cloudflared/creds.json`;
 
-  const obj = await c.env.BACKUP_BUCKET.head(credsKey);
-  const provisioned = !!obj;
+  const creds = await getTunnelCreds(c.env.CREDENTIALS_KV, userId);
+  const provisioned = !!creds;
 
-  let hostname: string | null = null;
-  if (provisioned) {
-    const getObj = await c.env.BACKUP_BUCKET.get(credsKey);
-    if (getObj) {
-      const data = await getObj.json() as { hostname: string };
-      hostname = data.hostname || null;
-    }
-  }
-
-  return c.json({ userId, provisioned, hostname });
+  return c.json({ userId, provisioned, hostname: creds?.hostname ?? null });
 });
 
 // ---------------------------------------------------------------------------
@@ -293,23 +278,14 @@ app.get("/api/status", async (c) => {
 
 app.post("/api/wake", async (c) => {
   const userId = c.get("userId");
-  const credsKey = `users/${userId}/cloudflared/creds.json`;
 
-  const getObj = await c.env.BACKUP_BUCKET.get(credsKey);
-  if (!getObj) {
+  // Tunnel + session credentials come from KV (never the backup bucket)
+  const tunnelCreds = await getTunnelCreds(c.env.CREDENTIALS_KV, userId);
+  if (!tunnelCreds) {
     return c.json({ error: "Tunnel not provisioned. Call /api/client-init first." }, 400);
   }
-
-  const { token: tunnelToken } = await getObj.json() as { token: string };
-
-  // Retrieve the user's dashboard session token
-  const tokenKey = `users/${userId}/session-token.json`;
-  const tokenObj = await c.env.BACKUP_BUCKET.get(tokenKey);
-  let sessionToken = "";
-  if (tokenObj) {
-    const tokenData = await tokenObj.json() as { token: string };
-    sessionToken = tokenData.token;
-  }
+  const tunnelToken = tunnelCreds.token;
+  const sessionToken = (await getSessionToken(c.env.CREDENTIALS_KV, userId)) ?? "";
 
   const sandbox: any = getSandboxAny(c.env.Sandbox, userId, { sleepAfter: "30m" });
 
@@ -351,7 +327,7 @@ app.post("/api/wake", async (c) => {
   let providersWritten = 0;
   let providersError: string | undefined;
   try {
-    const result = await injectProviders(sandbox, c.env.BACKUP_BUCKET, userId, c.env.CLOUDFLARE_AI_API_TOKEN || "");
+    const result = await injectProviders(sandbox, c.env.CREDENTIALS_KV, c.env.BACKUP_BUCKET, userId, c.env.CLOUDFLARE_AI_API_TOKEN || "");
     providersWritten = result.providersWritten;
     if (result.errors.length) {
       console.warn(`[wake:${userId}] provider warnings: ${result.errors.join("; ")}`);
@@ -590,7 +566,7 @@ app.post("/api/admin/gateway-jwt", async (c) => {
   if (!body.jwt || typeof body.jwt !== "string" || body.jwt.length < 20) {
     return c.json({ error: "Missing or implausibly short jwt" }, 400);
   }
-  await storeGatewayJwt(c.env.BACKUP_BUCKET, userId, body.jwt);
+  await storeGatewayJwt(c.env.CREDENTIALS_KV, userId, body.jwt);
   return c.json({ userId, ok: true });
 });
 
