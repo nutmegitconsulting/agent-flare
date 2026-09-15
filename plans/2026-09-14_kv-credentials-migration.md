@@ -50,7 +50,7 @@ npx wrangler kv namespace create CREDENTIALS_KV
 ```jsonc
 // wrangler.jsonc
 "kv_namespaces": [
-  { "binding": "CREDENTIALS_KV", "id": "REDACTED-KV-ID" }
+  { "binding": "CREDENTIALS_KV", "id": "YOUR_KV_NAMESPACE_ID" }
 ],
 ```
 
