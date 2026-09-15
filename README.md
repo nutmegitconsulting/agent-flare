@@ -72,9 +72,27 @@ Both are visible to any process in the container, including the Hermes agent its
 
 Possible hardening (not yet implemented): move `CLOUDFLARED_TOKEN` to a restricted file (e.g., `/run/creds.json` with `0400` permissions) and run `cloudflared` as a separate user from the Hermes agent.
 
-## Quick Start
+## Deployment
 
-See `plans/ONBOARDING.md` for full setup instructions.
+Deploys are made manually with Wrangler from the operator's machine — there is no CI/CD pipeline by design. Deploying requires Cloudflare authentication (`wrangler login`) and a running Docker daemon (the container image is built and pushed at deploy time).
+
+1. **Install dependencies:** `npm install` (Node 22+)
+2. **Authenticate:** `npx wrangler login`
+3. **Create resources** (first deploy only):
+   - `npx wrangler kv namespace create CREDENTIALS_KV` — copy the namespace ID
+   - `npx wrangler r2 bucket create hermes-agent-state`
+4. **Configure:** `cp wrangler.example.jsonc wrangler.jsonc`, then fill in your KV namespace ID, custom domain, and (optionally) SSH authorized keys. `wrangler.jsonc` is gitignored — it carries account-specific values (KV IDs, SSH keys) and must never be committed.
+5. **Set Worker secrets:** `npx wrangler secret put CF_API_TOKEN` (repeat for `ACCESS_AUD_TAG`, `CLOUDFLARE_AI_API_TOKEN` as needed)
+6. **Deploy:** `npx wrangler deploy` — Docker must be running; the `Dockerfile` image is built and pushed to Cloudflare's registry as part of the deploy
+
+### SSH debugging (troubleshooting only)
+
+Sandboxes ship with `ssh.enabled: true` so a running container can be reached with `npx wrangler containers ssh <INSTANCE_ID>` (list instances via `npx wrangler containers instances`). The tunnel is authenticated by your Cloudflare account — no public port is exposed. A connection succeeds only if both of the following hold:
+
+- **sshd runs inside the container.** The image installs `openssh-server` and `start-hermes.sh` launches it. An image without an SSH server makes the tunnel useless.
+- **Your public key is hydrated via `authorized_keys`** in the container config (`ssh-ed25519` keys only). With no key entry, the tunnel opens but no login succeeds. See the [Cloudflare Containers SSH docs](https://developers.cloudflare.com/containers/) before enabling.
+
+SSH is a debugging affordance, not a feature — disable it by setting `ssh.enabled: false` in `wrangler.jsonc`.
 
 ## License
 
