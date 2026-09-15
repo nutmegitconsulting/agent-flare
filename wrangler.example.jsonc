@@ -1,0 +1,67 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hermes-cloudflare-v6",
+  "main": "src/index.ts",
+  "workers_dev": false,
+  "routes": [{ "pattern": "hermes-agent.hermes-test.app", "custom_domain": true }],
+  "compatibility_date": "2026-08-03",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    {
+      "class_name": "HermesSandbox",
+      "image": "./Dockerfile",
+      "instance_type": "standard-2",
+      "max_instances": 3,
+      // ssh.enabled is TROUBLESHOOTING-ONLY (debug shell via
+      // `wrangler containers ssh <INSTANCE_ID>`). Notes for anyone reading:
+      //  - Wrangler defaults this to true when omitted — the explicit true
+      //    is documentation, not a functional change. Set false to fully
+      //    disable the wrangler SSH tunnel.
+      //  - This flag only opens the wrangler-side tunnel. It grants nothing
+      //    by itself: connecting requires (a) sshd actually running inside
+      //    the sandbox image — here that's openssh-server in the Dockerfile,
+      //    launched by start-hermes.sh — and (b) your ssh-ed25519 public key
+      //    hydrated via authorized_keys below. Without both, SSH goes
+      //    nowhere.
+      //  - authorized_keys is intentionally left commented out. See the
+      //    Cloudflare Containers SSH docs before enabling:
+      //    https://developers.cloudflare.com/containers/
+      "ssh": {
+        "enabled": true
+      }
+      // SSH access (debugging): a running sandbox can be reached with
+      // `wrangler containers ssh <INSTANCE_ID>`, but it must first be
+      // hydrated with your ssh-ed25519 public key (the only supported type).
+      // Uncomment and fill in your own key — read the Cloudflare Containers
+      // docs on SSH before enabling: https://developers.cloudflare.com/containers/
+      // "authorized_keys": [
+      //   {
+      //     "name": "<your-name>",
+      //     "public_key": "ssh-ed25519 <your-public-key>"
+      //   }
+      // ]
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "Sandbox", "class_name": "HermesSandbox" }
+    ]
+  },
+  "migrations": [
+    { "new_sqlite_classes": ["HermesSandbox", "HermesAgent"], "tag": "v1" },
+    { "deleted_classes": ["HermesAgent"], "tag": "v2" }
+  ],
+  "r2_buckets": [
+    { "binding": "BACKUP_BUCKET", "bucket_name": "hermes-agent-state" }
+  ],
+  "kv_namespaces": [
+    { "binding": "CREDENTIALS_KV", "id": "YOUR_KV_NAMESPACE_ID" }
+  ],
+  "ai": { "binding": "AI" },
+  "vars": {
+    "SNAPSHOT_INTERVAL_MINUTES": "5"
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *", "0 */2 * * *"]
+  }
+}
