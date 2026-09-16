@@ -1,6 +1,6 @@
-# Hermes Cloudflare V6
+# Agent Flare
 
-Hermes Agent deployed on Cloudflare Sandbox with Hermes Desktop GUI connectivity via Cloudflare Tunnel.
+**Agent Flare** — Hermes Agent deployed on Cloudflare Sandbox with Hermes Desktop GUI connectivity via Cloudflare Tunnel.ermes Agent deployed on Cloudflare Sandbox with Hermes Desktop GUI connectivity via Cloudflare Tunnel.
 
 ## Overview
 

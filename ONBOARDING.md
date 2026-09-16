@@ -1,4 +1,4 @@
-# Hermes V6 Onboarding Guide
+# Agent Flare Onboarding Guide
 
 End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backed agent.
 
