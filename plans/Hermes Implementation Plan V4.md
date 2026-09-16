@@ -196,7 +196,7 @@ export default {
 2. Create Application:  
    * Type: Self-hosted  
    * Domain: your-project.pages.dev (or custom domain)  
-   * Policy: Allow → Email → you@example.com  
+   * Policy: Allow → Email → <you@example.com>  
    * Session: 24h  
 3. Save and Deploy  
 4. **Copy the Application Audience (AUD) Tag for the API Worker environment.**

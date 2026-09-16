@@ -152,31 +152,31 @@ Verify: `grep -n "gateway-jwt.json" src/providers.ts src/index.ts` — nothing. 
 
 Deploying the new code with an empty KV namespace makes the Worker treat every existing user as never-provisioned: `client-init` would create a new tunnel + hostname (orphaning the live one) and mint a new session token (killing the current dashboard session). This task copies the two self-healing-unsafe credentials from R2 into KV under the new keys so the migration is invisible to existing users. Run BEFORE `wrangler deploy` (Task 4).
 
-Per user (only `user` today — repeat as other users exist):
+Per user (only one user today — repeat as other users exist):
 
 ```bash
 # 1. Pull the two R2 credential objects to temp files (value = the JSON body itself)
-npx wrangler r2 object get hermes-agent-state/users/user/cloudflared/creds.json   --remote -f /tmp/kvseed-creds.json
-npx wrangler r2 object get hermes-agent-state/users/user/session-token.json       --remote -f /tmp/kvseed-session.json
+npx wrangler r2 object get hermes-agent-state/users/<user-id>/cloudflared/creds.json   --remote -f /tmp/kvseed-creds.json
+npx wrangler r2 object get hermes-agent-state/users/<user-id>/session-token.json       --remote -f /tmp/kvseed-session.json
 
 # 2. Verify the shape before pushing (creds.json = {hostname,token}, session-token.json = {token})
 python3 -c "import json;print(json.load(open('/tmp/kvseed-creds.json')).keys())"
 python3 -c "import json;print(json.load(open('/tmp/kvseed-session.json')).keys())"
 
 # 3. Push verbatim to KV under the new key layout (JSON bytes identical to R2)
-npx wrangler kv key put cred:tunnel:user  --path /tmp/kvseed-creds.json   --binding CREDENTIALS_KV
-npx wrangler kv key put cred:session:user --path /tmp/kvseed-session.json --binding CREDENTIALS_KV
+npx wrangler kv key put cred:tunnel:<user-id>  --path /tmp/kvseed-creds.json   --binding CREDENTIALS_KV
+npx wrangler kv key put cred:session:<user-id> --path /tmp/kvseed-session.json --binding CREDENTIALS_KV
 
 # 4. Clean up — temp files held live credentials
 rm -f /tmp/kvseed-creds.json /tmp/kvseed-session.json
 ```
 
 Notes:
-- `cred:gwjwt:user` is NOT seeded — the gateway JWT never lived in R2; the client re-POSTs it on every setup run (self-heals).
+- `cred:gwjwt:<user-id>` is NOT seeded — the gateway JWT never lived in R2; the client re-POSTs it on every setup run (self-heals).
 - `--path` reads the value from the file, so no secret touches argv/shell history.
 - KV is eventually consistent: seed → deploy → verify (Task 4) has >60s of margin; if the first verify shows `existing:false` anyway, wait a minute and re-run rather than re-seeding.
 
-Verify: `npx wrangler kv key get cred:tunnel:user --binding CREDENTIALS_KV` and `cred:session:user` both return the same JSON as the R2 source objects.
+Verify: `npx wrangler kv key get cred:tunnel:<user-id> --binding CREDENTIALS_KV` and `cred:session:<user-id>` both return the same JSON as the R2 source objects.
 
 ### Task 4: Deploy
 
@@ -198,11 +198,11 @@ Expected: `existing: true` with the same hostname and session token as pre-migra
 Deploy first, verify the Worker serves from KV, THEN delete — this ordering keeps rollback trivial (pre-deploy: R2 still authoritative; post-deploy: KV authoritative, R2 copies are vestigial).
 
 ```bash
-npx wrangler r2 object delete hermes-agent-state/users/user/cloudflared/creds.json --remote
-npx wrangler r2 object delete hermes-agent-state/users/user/session-token.json --remote
+npx wrangler r2 object delete hermes-agent-state/users/<user-id>/cloudflared/creds.json --remote
+npx wrangler r2 object delete hermes-agent-state/users/<user-id>/session-token.json --remote
 ```
 
-Verify: `npx wrangler r2 object get hermes-agent-state/users/user/cloudflared/creds.json --remote` — "key does not exist". Same for session-token. Repeat per-user as other users exist.
+Verify: `npx wrangler r2 object get hermes-agent-state/users/<user-id>/cloudflared/creds.json --remote` — "key does not exist". Same for session-token. Repeat per-user as other users exist.
 
 ## Rollback
 

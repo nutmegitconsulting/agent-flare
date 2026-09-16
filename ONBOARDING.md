@@ -51,7 +51,7 @@ End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backe
 From the repo directory:
 
 ```bash
-cd /home/user/projects/hermes-cloudflare-v6
+cd <repo-root>
 
 # Set Worker-level secrets
 npx wrangler secret put CF_API_TOKEN

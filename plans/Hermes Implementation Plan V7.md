@@ -23,7 +23,7 @@ Manual squashfs path (Option A+B as deployed today) cannot work reliably:
    and will corrupt user expectations once real snapshots exist.
 4. **Upload path never worked.** The in-container mksquashfs loop read
    UPLOAD_TOKEN/CF_ACCESS_JWT from env the CMD can't see → no hourly snapshots ever
-   landed since Aug 21 (only R2 object: backups/user/... Aug 21 final).
+   landed since Aug 21 (only R2 object: backups/<user-id>/... Aug 21 final).
 5. **Snapshot size.** We snapshot a home that contains the full Hermes install
    (2.7GB layer) → multi-GB snapshots, slow boot restores.
 
@@ -186,14 +186,14 @@ Root cause of the baked-state mystery AND the size problem.
 
 ### Step 5 — Data migration (the Aug 21 snapshot)
 
-Old R2 layout: `backups/user/final.sqfs` (Aug 21),
-`backups/user/hourly/*.sqfs` (old curl layout).
+Old R2 layout: `backups/<user-id>/final.sqfs` (Aug 21),
+`backups/<user-id>/hourly/*.sqfs` (old curl layout).
 New SDK layout expects `backups/<id>/data.sqsh` + `backups/<id>/meta.json`
 and a handle `{id, dir, localBucket}`.
 
 - ONE-OFF script (Node, local, uses wrangler R2 API or a tiny throwaway
   Worker script):
-  1. `wrangler r2 object get hermes-agent-state/hermes-agent-state/backups/user/final.sqfs`
+  1. `wrangler r2 object get hermes-agent-state/hermes-agent-state/backups/<user-id>/final.sqfs`
      (or via binding in a one-shot `wrangler deploy` script) → /tmp/final.sqfs
   2. validate: `file` shows Squashfs.
   3. put as `backups/migrate-user-aug21/data.sqsh`
@@ -204,7 +204,7 @@ and a handle `{id, dir, localBucket}`.
      throwaway backup of a small dir in a dev sandbox, fetch its meta.json,
      mirror the fields) with dir=/home/hermes.**
   5. put handle `{"id":"migrate-user-aug21","dir":"/home/hermes","localBucket":true}`
-     at `users/user/backup-handle.json` + index entry with createdAt=Aug 21.
+     at `users/<user-id>/backup-handle.json` + index entry with createdAt=Aug 21.
 - RISK: if the SDK validates meta.json strictly (checksum of the archive?),
   the hand-rolled meta may fail restoreBackup. Fallback: unsquashfs the Aug 21
   archive locally, push its CONTENTS into the running container via
@@ -242,7 +242,7 @@ and a handle `{id, dir, localBucket}`.
    Also validates the full createBackup→R2 path end-to-end before we trust
    it with real data. Destroy the test sandbox.
 5. Migrate Aug 21 handle (Step 5) with the confirmed meta schema.
-6. Cold-boot test: destroy user container → wake → response shows
+6. Cold-boot test: destroy the user container → wake → response shows
    `restored: true` → SSH in → `/home/hermes/.hermes` contains Aug 21
    config.yaml (mtime Aug 21, NOT Sep 3 build-time) → serve responds.
 7. Cron test: wait for a `*/5` tick with container running → new

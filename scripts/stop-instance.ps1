@@ -1,5 +1,5 @@
 # Hermes V6: Graceful stop sandbox by userId (SIGTERM → triggers onStop + squashfs backup)
-# Usage: .\stop-instance.ps1 -userId "user"
+# Usage: .\stop-instance.ps1 -userId "<your-user-id>"
 param(
     [Parameter(Mandatory = $true)]
     [string]$userId,
