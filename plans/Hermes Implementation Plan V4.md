@@ -196,7 +196,7 @@ export default {
 2. Create Application:  
    * Type: Self-hosted  
    * Domain: hermes-cloudflare.pages.dev (or custom domain)  
-   * Policy: Allow → Email → user@nutmegit.com  
+   * Policy: Allow → Email → <your-email@example.com>  
    * Session: 24h  
 3. Save and Deploy  
 4. **Copy the Application Audience (AUD) Tag for the API Worker environment.**

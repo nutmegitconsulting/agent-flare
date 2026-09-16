@@ -21,7 +21,7 @@ WORKER_URL="https://hermes-agent.hermes-test.app"
 # 1. Find container application ID
 # ---------------------------------------------------------------------------
 echo "Finding container application '$APP_NAME'..."
-APP_JSON=$(cd /home/user/projects/hermes-cloudflare-v6 && npx wrangler containers list --json 2>/dev/null)
+APP_JSON=$(cd "$(dirname "$0")/.." && npx wrangler containers list --json 2>/dev/null)
 APP_ID=$(echo "$APP_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(x['id'] for x in d if x['name']=='$APP_NAME'))" 2>/dev/null || true)
 
 if [ -z "$APP_ID" ]; then
@@ -34,7 +34,7 @@ echo "Found app ID: $APP_ID"
 # 2. Resolve instance ID to userId (name)
 # ---------------------------------------------------------------------------
 echo "Resolving instance '$INSTANCE_ID'..."
-INSTANCES_JSON=$(cd /home/user/projects/hermes-cloudflare-v6 && npx wrangler containers instances "$APP_ID" --json 2>/dev/null)
+INSTANCES_JSON=$(cd "$(dirname "$0")/.." && npx wrangler containers instances "$APP_ID" --json 2>/dev/null)
 USER_ID=$(echo "$INSTANCES_JSON" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)

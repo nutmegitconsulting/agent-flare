@@ -1,6 +1,6 @@
 # Hermes V6 Admin: Destroy Sandbox Instance by userId
 # Requires: cloudflared CLI (authenticated)
-# Usage: .\scripts\destroy-instance.ps1 -userId "user"
+# Usage: .\scripts\destroy-instance.ps1 -userId "<your-user-id>"
 param(
     [Parameter(Mandatory = $true)]
     [string]$userId,

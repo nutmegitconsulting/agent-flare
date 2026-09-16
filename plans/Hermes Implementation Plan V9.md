@@ -60,7 +60,7 @@ vanilla. That is exactly what we are re-implementing.
   failure for V8-era handles; re-wake once — restoreLatest deletes the handle only on
   EXPIRED/NOT_FOUND, so instead: if this bites in validation, delete
   `users/<userId>/backup-handle.json` once (one `wrangler r2 object delete`), then
-  wake fresh. Expected in practice: user's live handle rolls to a V9 snapshot on
+  wake fresh. Expected in practice: the user's live handle rolls to a V9 snapshot on
   the first stop/wake before this ever matters.
 
 ## Step-by-step tasks
@@ -320,13 +320,13 @@ V1 — wake + boot (user runs Windows commands; agent verifies from R2/logs):
 V2 — round-trip (the money test):
 ```powershell
 # Windows: plant marker, force snapshot, destroy, wake, verify
-cloudflared access curl "https://hermes-agent.hermes-test.app/api/debug/exec?userId=user&cmd=echo%20v9-roundtrip%20%3E%20/home/hermes/.hermes/roundtrip.txt" -s
-cloudflared access curl "https://hermes-agent.hermes-test.app/api/admin/snapshot?userId=user" -s -X POST
+cloudflared access curl "https://hermes-agent.hermes-test.app/api/debug/exec?userId=<user-id>&cmd=echo%20v9-roundtrip%20%3E%20/home/hermes/.hermes/roundtrip.txt" -s
+cloudflared access curl "https://hermes-agent.hermes-test.app/api/admin/snapshot?userId=<user-id>" -s -X POST
 #   expect handle dir == "/home/hermes"  (V9 proof; ".hermes" = stale deploy)
-cloudflared access curl "https://hermes-agent.hermes-test.app/api/admin/destroy?userId=user" -s -X POST
+cloudflared access curl "https://hermes-agent.hermes-test.app/api/admin/destroy?userId=<user-id>" -s -X POST
 cloudflared access curl "https://hermes-agent.hermes-test.app/api/wake" -s -X POST
 #   expect "restored": true
-cloudflared access curl "https://hermes-agent.hermes-test.app/api/debug/exec?userId=user&cmd=cat%20/home/hermes/.hermes/roundtrip.txt%3B%20test%20-s%20/home/hermes/.local/bin/hermes%20%26%26%20echo%20SENTINEL_OK%3B%20test%20-x%20/opt/hermes-install/hermes-agent/venv/bin/python%20%26%26%20echo%20VENV_OK" -s
+cloudflared access curl "https://hermes-agent.hermes-test.app/api/debug/exec?userId=<user-id>&cmd=cat%20/home/hermes/.hermes/roundtrip.txt%3B%20test%20-s%20/home/hermes/.local/bin/hermes%20%26%26%20echo%20SENTINEL_OK%3B%20test%20-x%20/opt/hermes-install/hermes-agent/venv/bin/python%20%26%26%20echo%20VENV_OK" -s
 ```
 Expected: `v9-roundtrip`, `SENTINEL_OK`, `VENV_OK`.
 

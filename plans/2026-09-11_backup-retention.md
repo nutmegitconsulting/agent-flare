@@ -190,7 +190,7 @@ npx wrangler deploy
 Then trigger a prune:
 
 ```bash
-curl -s https://hermes-agent.hermes-test.app/api/admin/prune?userId=user \
+curl -s https://hermes-agent.hermes-test.app/api/admin/prune?userId=<user-id> \
   -H "Authorization: Bearer ***" -X POST
 ```
 
@@ -202,8 +202,8 @@ app.post("/api/admin/prune", async (c) => { ... pruneSnapshots ... })
 
 Expected wrangler tail output after a cron tick:
 ```
-[cron] snapshot for user created in 6601ms
-[cron] pruned backups for user: deleted=0, kept=5
+[cron] snapshot for <user-id> created in 6601ms
+[cron] pruned backups for <user-id>: deleted=0, kept=5
 ```
 
 Tests / validation

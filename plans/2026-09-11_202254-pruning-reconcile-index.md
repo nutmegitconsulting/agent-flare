@@ -181,10 +181,10 @@ cd ~/projects/hermes-cloudflare-v6 && npx wrangler deploy --containers-rollout=n
 
 Verify reconcile endpoint:
 ```bash
-curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/reconcile?userId=user" \
+curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/reconcile?userId=<user-id>" \
   -H "Authorization: Bearer ***"
 ```
-Expected: `{ "userId": "user", "indexRemoved": 0, "r2Deleted": 0 }` if no drift.
+Expected: `{ "userId": "<user-id>", "indexRemoved": 0, "r2Deleted": 0 }` if no drift.
 
 Tests / validation
 - Manual drift test: delete one R2 object via `wrangler r2 object delete` directly, then call reconcile endpoint. Expect `indexRemoved: 1`.

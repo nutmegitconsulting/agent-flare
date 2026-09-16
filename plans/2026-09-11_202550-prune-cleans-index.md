@@ -142,21 +142,21 @@ import { createSnapshot, restoreLatest, snapshotIfDue, pruneSnapshots } from "./
 
 Task 5: Run a manual prune test via curl
 ```bash
-curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/prune?userId=user" \
+curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/prune?userId=<user-id>" \
   -H "Authorization: Bearer ***"
 ```
 
 Expected JSON:
 ```json
-{ "userId": "user", "kept": 7, "deleted": 3 }
+{ "userId": "<user-id>", "kept": 7, "deleted": 3 }
 ```
 
 Then verify the index shrank:
 ```bash
-curl -s "https://hermes-agent.hermes-test.app/api/admin/providers?userId=user" \
+curl -s "https://hermes-agent.hermes-test.app/api/admin/providers?userId=<user-id>" \
   -H "Authorization: Bearer ***"
 ```
-No, there is no GET for the raw index. Use the R2 binding directly in a debug script, or read the Worker logs (wrangler tail) for the `[prune:user] deleting backup X` and `[index:user] removed entry Y` lines.
+No, there is no GET for the raw index. Use the R2 binding directly in a debug script, or read the Worker logs (wrangler tail) for the `[prune:<user-id>] deleting backup X` and `[index:<user-id>] removed entry Y` lines.
 
 Task 6: Deploy
 ```bash
@@ -164,7 +164,7 @@ cd ~/projects/hermes-cloudflare-v6 && npx wrangler deploy --containers-rollout=n
 ```
 
 Tests / validation
-- Trigger a backup restore with a stale handle (e.g., manually delete R2 objects for the newest backup, then wake). The `removeFromIndex()` path should log `[index:user] removed entry <id>` in wrangler tail.
+- Trigger a backup restore with a stale handle (e.g., manually delete R2 objects for the newest backup, then wake). The `removeFromIndex()` path should log `[index:<user-id>] removed entry <id>` in wrangler tail.
 - Trigger the prune endpoint after taking 5+ snapshots in quick succession. Verify `backups-index.json` shrinks to the expected count.
 
 Risks, tradeoffs, and open questions

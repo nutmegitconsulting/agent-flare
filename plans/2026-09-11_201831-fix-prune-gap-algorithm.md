@@ -128,7 +128,7 @@ const { TIERS, getTier, shouldKeep } = require('./src/persistence.ts');
 
 Better: trigger a manual prune via the existing admin endpoint after deploy:
 ```bash
-curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/prune?userId=user" \
+curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/prune?userId=<user-id>" \
   -H "Authorization: Bearer ***"
 ```
 

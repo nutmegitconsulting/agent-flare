@@ -212,10 +212,10 @@ npx wrangler tail | grep "snapshot.*created"
 
 Verify prune:
 ```bash
-curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/prune?userId=user" \
+curl -s -X POST "https://hermes-agent.hermes-test.app/api/admin/prune?userId=<user-id>" \
   -H "Authorization: Bearer $(cat ~/.hermes/.env | grep SESSION_TOKEN | head -1 | cut -d= -f2)"
 ```
-Expected JSON: `{ "userId": "user", "kept": N, "deleted": M }`.
+Expected JSON: `{ "userId": "<user-id>", "kept": N, "deleted": M }`.
 
 Tests / validation
 - Unit test for `shouldKeep`: construct 72 entries over 3 days with 5-min spacing; assert the correct number survive after pruning.
