@@ -35,7 +35,7 @@ if ($LASTEXITCODE -ne 0) { Write-Error "docker build failed (exit $LASTEXITCODE)
 Write-Host ""
 Write-Host "==> Verifying Hermes version inside the new image..."
 $versionOut = docker run --rm --entrypoint /bin/bash $Image -c `
-    'su hermes -c "HERMES_HOME=/home/hermes/.hermes /usr/local/bin/hermes --version" 2>&1'
+    'su hermes -c "HERMES_HOME=/home/hermes/.hermes /home/hermes/.local/bin/hermes --version" 2>&1'
 if ($LASTEXITCODE -ne 0) { Write-Error "version check failed to run (exit $LASTEXITCODE)."; exit 1 }
 $versionOut | ForEach-Object { Write-Host "    $_" }
 # No freshness gate: --no-cache is the freshness guarantee (the install layer

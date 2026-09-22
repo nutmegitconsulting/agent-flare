@@ -32,7 +32,7 @@ docker build --no-cache -f Dockerfile -t "$IMAGE" .
 echo ""
 echo "==> Verifying Hermes version inside the new image..."
 VERSION_OUT="$(docker run --rm --entrypoint /bin/bash "$IMAGE" -c \
-  'su hermes -c "HERMES_HOME=/home/hermes/.hermes /usr/local/bin/hermes --version" 2>&1')"
+  'su hermes -c "HERMES_HOME=/home/hermes/.hermes /home/hermes/.local/bin/hermes --version" 2>&1')"
 echo "$VERSION_OUT" | sed 's/^/    /'
 # No freshness gate here: --no-cache is the freshness guarantee (the install
 # layer re-runs every build). Hermes' "Up to date" line is unreliable inside
