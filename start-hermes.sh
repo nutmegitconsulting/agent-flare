@@ -27,7 +27,7 @@ log() {
 }
 
 export HERMES_HOME=/home/hermes/.hermes
-export PATH="/usr/local/bin:/home/hermes/.hermes/node/bin:$PATH"
+export PATH="/home/hermes/.local/bin:/opt/hermes-install/node/bin:/usr/local/bin:$PATH"
 
 mkdir -p "$HERMES_HOME"
 
