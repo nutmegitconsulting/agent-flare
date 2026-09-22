@@ -1,21 +1,16 @@
 # =============================================================================
-# Hermes Agent on Cloudflare Sandbox — VANILLA layout
+# Hermes Agent on Cloudflare Sandbox (V9 — hermes-flare install/profile split)
 # =============================================================================
-# Base: cloudflare/sandbox:0.12.7-python (must match @cloudflare/sandbox version).
+# Base: cloudflare/sandbox:0.12.7-python (matches @cloudflare/sandbox version).
 #
-# LAYOUT (vanilla root FHS install — no /opt split):
-#   /usr/local/lib/hermes-agent        code + venv (baked, outside snapshot)
-#   /usr/local/bin/hermes              self-contained launcher shim (outside)
-#   /usr/local/share/uv/{python,bin}   uv-managed CPython (world-readable)
-#   /home/hermes/.hermes               ALL mutable state (HERMES_HOME) = snapshot
-#                                       + baked runtime bits: bin/uv, node/, skills/
+# LAYOUT (install vs. user-state separated so snapshots stay small):
+#   /opt/hermes-install           code + venv + Node bundle + managed uv (~1.5-2 GB)
+#   /opt/uv                       uv-managed CPython
+#   /home/hermes/.hermes          runtime user data (HERMES_HOME; ships EMPTY)
+#   /home/hermes/.local/bin/hermes  tiny `hermes` wrapper (points at /opt) = SENTINEL
 #
-# The SDK snapshots dir=/home/hermes/.hermes via createBackup (mksquashfs in
-# container, uploaded through the bound BACKUP_BUCKET R2). Restores are
-# `unsquashfs -f -d /home/hermes/.hermes` — force-overwrite ONTO the baked
-# install, so the /usr/local code is never disturbed.
-#
-# The container ends as root so the Sandbox SDK can run mksquashfs.
+# The SDK snapshots BACKUP_DIR=/home/hermes — small (~50-150 MB) and carries no
+# install artifacts. The container ends as root so the SDK can run mksquashfs.
 # =============================================================================
 
 FROM docker.io/cloudflare/sandbox:0.12.7-python
@@ -23,7 +18,7 @@ FROM docker.io/cloudflare/sandbox:0.12.7-python
 USER root
 
 # --- System tools ---
-# build-essential: required by install.sh's node-pty native build.
+# build-essential is required by install.sh's node-pty native build.
 # squashfs-tools: createBackup/restoreBackup run mksquashfs/unsquashfs in-container.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -43,57 +38,49 @@ RUN curl -sfL --output /usr/local/bin/cloudflared \
         https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
     && chmod +x /usr/local/bin/cloudflared
 
-# --- hermes user (owns the runtime data dir; install runs as root below) ---
+# --- hermes user (install + runtime data owner) ---
 RUN useradd --create-home --shell /bin/bash --uid 1000 hermes
 
-# HERMES_HOME: the ONE snapshot tree. Everything mutable lives here.
+# Runtime data dir. SHIPS EMPTY — snapshot tree must not carry build-time state
+# (a baked config.yaml makes a failed restore look like a healthy boot).
 ENV HERMES_HOME=/home/hermes/.hermes
 ENV UV_NO_CONFIG=1
-ENV PATH=/usr/local/bin:$PATH
 
-# --- Vanilla install as ROOT -> FHS layout (code/venv/shim under /usr/local) ---
-# uv-managed CPython lands world-readable at /usr/local/share/uv (install.sh does
-# this automatically for root Linux FHS installs). Managed uv binary and the
-# managed Node bundle (if needed) land inside $HERMES_HOME (bin/uv, node/) —
-# inside the snapshot tree on purpose: a restore re-materializes them, and a
-# fresh user gets them baked in.
-RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-      | bash -s -- --skip-setup --non-interactive \
-    && test -x /usr/local/bin/hermes \
-    && test -x /usr/local/lib/hermes-agent/venv/bin/python \
-    && ls -la /usr/local/lib/hermes-agent \
-    && chown -R hermes:hermes /home/hermes
+# Install to /opt/hermes-install (OUTSIDE the snapshot tree) as the hermes user:
+# install.sh resolves INSTALL_DIR=$HERMES_HOME/hermes-agent, the Node bundle lands
+# at $HERMES_HOME/node, managed uv at $HERMES_HOME/bin/uv, and the `hermes` wrapper
+# in $HOME/.local/bin — so everything heavy lives under /opt and only the tiny
+# wrapper sits in /home/hermes. UV_PYTHON_INSTALL_DIR/BIN_DIR keep uv's CPython in
+# /opt too.
+RUN mkdir -p /opt/hermes-install /opt/uv /home/hermes/.hermes \
+    && chown -R hermes:hermes /opt/hermes-install /opt/uv /home/hermes
 
-# The install is a root-owned git clone. Mark it safe system-wide so non-root
-# users (the hermes user — used by build-and-push's version probe) can run
-# git-based update checks against it; without this, `hermes --version` as
-# hermes silently skips the "Up to date" freshness line (dubious ownership).
-RUN git config --system --add safe.directory /usr/local/lib/hermes-agent
+USER hermes
+WORKDIR /home/hermes
+ENV HOME=/home/hermes
+RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_PYTHON_BIN_DIR=/opt/uv/bin \
+    curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
+      | bash -s -- --skip-setup --non-interactive --hermes-home /opt/hermes-install \
+    && test -x /opt/hermes-install/bin/uv \
+    && ls -la /opt/hermes-install/hermes-agent \
+    # Strip install-time caches — uv wheels/npm cache land in $HOME and are
+    # hundreds of MB we don't need at runtime.
+    && rm -rf /home/hermes/.cache /home/hermes/.npm \
+    && chown -R hermes:hermes /opt/uv /home/hermes
 
-# --- Wipe build-time user state (Pitfall 12) ---------------------------------
-# install.sh's copy_config_templates seeded $HERMES_HOME at build time with
-# template config.yaml / .env / SOUL.md, install_id, bundled skills, empty data
-# dirs, etc. Ship the home WITHOUT that state so (a) a failed restore shows an
-# obviously-empty home instead of fake-healthy build state, and (b) the snapshot
-# stays small. KEEP the baked runtime bits that live inside the tree:
-#   bin/  (managed uv binary), node/ (managed Node), skills/ (bundled skills).
-RUN rm -rf /home/hermes/.hermes/config.yaml \
-         /home/hermes/.hermes/.env \
-         /home/hermes/.hermes/SOUL.md \
-         /home/hermes/.hermes/install_id \
-         /home/hermes/.hermes/state.db \
-         /home/hermes/.hermes/state.db-wal \
-         /home/hermes/.hermes/state.db-shm \
-         /home/hermes/.hermes/.startup-status \
-    && find /home/hermes/.hermes -mindepth 1 -maxdepth 1 \
-         ! -name bin ! -name node ! -name skills -exec rm -rf {} + \
-    && chown -R hermes:hermes /home/hermes \
-    && chmod -R a+rX /home/hermes/.hermes
+# `hermes` CLI lives in ~/.local/bin; managed Node (if any) in /opt/hermes-install/node/bin.
+ENV PATH=/home/hermes/.local/bin:/opt/hermes-install/node/bin:/usr/local/bin:$PATH
+
+# Snapshot-friendly perms: createBackup's mksquashfs needs everything readable.
+RUN chmod -R a+rX /home/hermes
+
+# Container runs as root at runtime so the Sandbox SDK can run mksquashfs.
+USER root
 
 # --- Startup ---
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
 RUN chmod +x /usr/local/bin/start-hermes.sh
 
-# sandbox binary is ENTRYPOINT; CMD is spawned as its child.
-USER root
+# sandbox binary is ENTRYPOINT; CMD is spawned as child.
 CMD ["/usr/local/bin/start-hermes.sh"]
