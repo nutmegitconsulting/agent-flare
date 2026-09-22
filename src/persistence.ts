@@ -25,23 +25,19 @@ import { removeFromIndex } from "./prune";
  * backup that still exists in the bucket — the "most recent available backup"
  * is always restorable regardless of how long the bucket keeps it.
  */
-const BACKUP_DIR = "/home/hermes/.hermes";
+const BACKUP_DIR = "/home/hermes";
 const SECONDS_PER_DAY = 86_400;
 /** SDK refuses to restore past (createdAt + ttl). Keep it well beyond the
  *  bucket's retention window so any object still present is restorable. */
 const BACKUP_TTL_SECONDS = 365 * SECONDS_PER_DAY;
 /**
- * Corruption sentinel: a healthy snapshot tree always has a non-empty bundled
- * skills manifest at /home/hermes/.hermes/skills/.bundled_manifest (baked into
- * the image by install.sh's skills_sync.py). It is inside the snapshot tree, so
- * every backup carries it (old /home/hermes-backed ones too, because the old
- * runtime synced bundled skills into the same absolute path); a partial
- * unsquashfs extraction — seen when a restore's archive transfer is truncated —
- * leaves it missing or 0-byte. Checked before every snapshot (never archive a
- * corrupt tree: that turns one bad restore into a permanently bad
- * newest-backup) and after every restore (fail loudly).
+ * Corruption sentinel: a healthy /home/hermes always has a non-empty hermes
+ * launcher wrapper at /home/hermes/.local/bin/hermes (baked into the image,
+ * pointing at /opt/hermes-install/venv). It is inside the snapshot tree, so
+ * every backup carries it; a partial unsquashfs extraction leaves it as a
+ * 0-byte regular file. Checked before every snapshot and after every restore.
  */
-const SENTINEL_FILE = "/home/hermes/.hermes/skills/.bundled_manifest";
+const SENTINEL_FILE = "/home/hermes/.local/bin/hermes";
 const HANDLE_KEY_SUFFIX = "backup-handle.json";
 const INDEX_KEY_SUFFIX = "backups-index.json";
 
