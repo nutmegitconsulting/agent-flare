@@ -16,7 +16,7 @@ This project deploys the Hermes AI Agent inside Cloudflare Sandbox containers, u
 
 ### Persistence
 
-State lives in the container at `/home/hermes/.hermes` (HERMES_HOME — runtime data plus the baked runtime bits; the install is a vanilla root FHS layout under `/usr/local`, outside the snapshot tree). Backups are written by the SDK through the bound `BACKUP_BUCKET` R2 binding (`localBucket: true`): the container runs `mksquashfs`, the SDK uploads the archive to R2. No presigned URLs, no R2 tokens, and no credentials of any kind exist in the container. Restores are a plain `unsquashfs` extraction into a normal ext4 directory.
+State lives in the container at `/home/hermes/.hermes` (HERMES_HOME); the snapshot tree is `/home/hermes`, which also carries the tiny `hermes` wrapper. The install (code, venv, Node, uv) lives at `/opt/hermes-install` (+ `/opt/uv`), outside the snapshot tree. Backups are written by the SDK through the bound `BACKUP_BUCKET` R2 binding (`localBucket: true`): the container runs `mksquashfs`, the SDK uploads the archive to R2. No presigned URLs, no R2 tokens, and no credentials of any kind exist in the container. Restores are a plain `unsquashfs` extraction into a normal ext4 directory.
 
 R2 key layout (multi-tenant):
 
@@ -32,16 +32,16 @@ backups/<id>/meta.json             SDK-written metadata
 
 Backup lifecycle:
 
-- **Restore:** `/api/wake` calls `restoreLatest()` (extracts the newest handle into `/home/hermes/.hermes`) and writes `/tmp/restore-done` to unblock the boot script. A missing/expired handle is treated as a fresh start; a failed restore does not fail the wake.
+- **Restore:** `/api/wake` calls `restoreLatest()` (extracts the newest handle into `/home/hermes`) and writes `/tmp/restore-done` to unblock the boot script. A missing/expired handle is treated as a fresh start; a failed restore does not fail the wake.
 - **Periodic snapshots:** a Worker cron fires every 5 minutes; for each user in `active-users.json` whose container is `running`, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES` (default 60). Sleeping containers are skipped.
 - **Final snapshots:** `/api/admin/stop` and `/api/admin/destroy` take a best-effort final backup before stopping/destroying.
 - **Retention:** the code never deletes backups. Retention is owned by the R2 bucket's lifecycle rules on the `backups/` prefix. Per-backup TTL is 365 days so any object still present is restorable.
-- **Integrity:** every snapshot and restore checks a sentinel file (`/home/hermes/.hermes/skills/.bundled_manifest`) to detect partial extractions and refuse to archive a corrupt tree.
+- **Integrity:** every snapshot and restore checks a sentinel file (`/home/hermes/.local/bin/hermes`) to detect partial extractions and refuse to archive a corrupt tree.
 
 ### Container image
 
 - Base: `cloudflare/sandbox:0.12.7-python`
-- Vanilla root FHS install: code + venv at `/usr/local/lib/hermes-agent`, launcher at `/usr/local/bin/hermes`, uv CPython at `/usr/local/share/uv`. `/home/hermes/.hermes` ships without build-time user state (config.yaml/.env/SOUL.md are wiped at build time); it carries only the baked runtime bits (`bin/uv`, `node/`, `skills/`) plus whatever the user's restore brings back
+- Install (code, venv, Node bundle, uv CPython) lands in `/opt/hermes-install` + `/opt/uv`; `/home/hermes/.hermes` ships empty and only the tiny `hermes` wrapper lives in the snapshot tree
 - Container runs as root at runtime so the SDK can run `mksquashfs`
 - `start-hermes.sh` polls for `/tmp/restore-done` (120 s cap) before starting `hermes serve`
 
@@ -102,7 +102,7 @@ Portions of this project are derived from [**hermes-flare**](https://github.com/
 
 - The R2-backed squashfs state persistence pattern (`createBackup` / `restoreBackup`)
 - The sentinel-file integrity check approach for ephemeral container state hydration
-- The vanilla FHS install (`/usr/local`) kept outside the snapshot tree (`/home/hermes/.hermes`)
+- The separation of install path (`/opt/hermes-install`) from mutable state (`/home/hermes`)
 
 The Apache License, Version 2.0 applies to those derived portions. A copy of the Apache 2.0 license is included in this repository for compliance. All original work in this project is licensed under MIT.
 
