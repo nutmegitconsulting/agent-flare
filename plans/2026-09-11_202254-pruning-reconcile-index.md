@@ -1,4 +1,8 @@
-Goal
+Status: SUPERCEDED — NOT IMPLEMENTED
+
+The slot-filling retention algorithm (5 daily + 5 weekly hard caps) already bounds `backups-index.json` growth. The reconcile step described below is unnecessary.
+
+Original goal (preserved for reference):
 Make the pruning system the single source of truth for backup retention by adding a reconcile step that scrubs both orphaned R2 objects and phantom index entries before applying retention rules.
 
 Current context / assumptions

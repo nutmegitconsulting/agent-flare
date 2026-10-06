@@ -10,3 +10,4 @@ dist/
 users/
 active-users.json
 wrangler.jsonc
+.hermes/
