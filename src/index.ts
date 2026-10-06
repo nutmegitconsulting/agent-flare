@@ -209,7 +209,19 @@ app.post("/api/client-init", async (c) => {
   const tunnelId = tunnelJson.result.id;
   const tunnelToken = tunnelJson.result.token;
 
-  const hostname = `hermes-${safeId}.hermes-test.app`;
+  // Per-user tunnel hostname under the tenant's own subdomain. TUNNEL_BASE_DOMAIN
+  // must be set in wrangler vars (e.g. "nutmegit.com" → hermes-<user>.nutmegit.com,
+  // or "hermes.nutmegit.com" → hermes-<user>.hermes.nutmegit.com). DNS record is
+  // created in the zone CF_ZONE_ID — the API token only needs Zone:DNS:Edit there.
+  const baseDomain = c.env.TUNNEL_BASE_DOMAIN;
+  if (!baseDomain) {
+    return c.json(
+      { error: "TUNNEL_BASE_DOMAIN var is not set; cannot provision tunnel hostname" },
+      500
+    );
+  }
+  const hostnamePrefix = c.env.TUNNEL_NAME_PREFIX || "hermes";
+  const hostname = `${hostnamePrefix}-${safeId}.${baseDomain}`;
   await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/cfd_tunnel/${tunnelId}/configurations`,
     {

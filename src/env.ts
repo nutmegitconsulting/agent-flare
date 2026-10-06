@@ -16,6 +16,12 @@ export interface Env {
   CF_ZONE_ID: string;
   CF_API_TOKEN: string;
   SNAPSHOT_INTERVAL_MINUTES: string;
+  /** Per-user tunnel hostnames are `<TUNNEL_NAME_PREFIX>-<userId>.<TUNNEL_BASE_DOMAIN>`.
+   *  TUNNEL_BASE_DOMAIN is required (fail-fast at client-init when absent);
+   *  TUNNEL_NAME_PREFIX defaults to "hermes". Both live in wrangler vars —
+   *  they are tenant-specific, not code. */
+  TUNNEL_BASE_DOMAIN: string;
+  TUNNEL_NAME_PREFIX?: string;
   /** V8: CF API token with Workers AI:Read — credential for mode=api_token
    *  provider entries (account-scoped AI Gateway REST endpoint). Optional at
    *  type level so jwt-only setups don't need it; unset entries are skipped
