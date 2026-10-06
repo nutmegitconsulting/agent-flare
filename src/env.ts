@@ -21,6 +21,11 @@ export interface Env {
    *  they are tenant-specific, not code. */
   TUNNEL_BASE_DOMAIN: string;
   TUNNEL_NAME_PREFIX?: string;
+  /** Access team domain (e.g. "myteam.cloudflareaccess.com") that issues the
+   *  Access JWTs this worker validates. Required: JWT validation fetches
+   *  signing certs from https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs and
+   *  rejects tokens whose iss doesn't match. */
+  ACCESS_TEAM_DOMAIN: string;
   /** V8: CF API token with Workers AI:Read — credential for mode=api_token
    *  provider entries (account-scoped AI Gateway REST endpoint). Optional at
    *  type level so jwt-only setups don't need it; unset entries are skipped
