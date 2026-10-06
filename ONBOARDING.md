@@ -2,95 +2,174 @@
 
 End-to-end steps to get Hermes Desktop GUI talking to a Cloudflare Sandbox-backed agent.
 
+This guide covers the **V9** architecture: install lives at `/opt/hermes-install` (outside the snapshot tree), mutable state at `/home/hermes` (including the tiny `hermes` wrapper sentinel), credentials in KV, and slot-filling retention pruning.
+
 ---
 
-## Phase 1 — Cloudflare (One-Time Admin Setup)
+## Prerequisites
 
-### Step 1. Create R2 Bucket
+| Tool | Version / Note |
+|---|---|
+| Git | Any |
+| Node.js | 22+ (for Wrangler) |
+| npm | Comes with Node |
+| Docker Desktop | Must be running during deploy (containers beta builds the image) |
+| Cloudflared (Windows) | `winget install --id Cloudflare.cloudflared` |
+| A Cloudflare account | With Workers, R2, KV, Tunnels, and Access enabled |
+
+---
+
+## Phase 1 — Clone & Install
+
+```bash
+git clone <repo-url>
+cd hermes-cloudflare-v6
+npm install
+```
+
+Authenticate Wrangler with your Cloudflare account:
+
+```bash
+npx wrangler login
+```
+
+---
+
+## Phase 2 — Cloudflare Dashboard (One-Time Admin Setup)
+
+### Step 1. Create the R2 Bucket
 
 1. Go to **Cloudflare Dashboard → R2**
 2. Click **Create bucket**
 3. Name it `hermes-agent-state`
 4. Region: default
 
-### Step 2. Create Cloudflare API Token
+This bucket stores squashfs backups (`backups/<id>/data.sqsh`), backup indexes (`users/<userId>/backups-index.json`), restore handles (`users/<userId>/backup-handle.json`), and provider configs (`users/<userId>/providers.json`).
+
+### Step 2. Create the KV Namespace
+
+1. Go to **Cloudflare Dashboard → Workers & Pages → KV**
+2. Click **Create a namespace**
+3. Name it `CREDENTIALS_KV`
+4. Copy the **Namespace ID** — you will paste it into `wrangler.jsonc` in Step 5
+
+This namespace stores **credentials only** (tunnel tokens, session tokens, gateway JWTs) so they never leak into third-party R2 backups.
+
+### Step 3. Create a Cloudflare API Token
 
 1. Go to **Cloudflare Dashboard → My Profile → API Tokens**
 2. Click **Create Token**
-3. Use **Custom token** with these permissions:
+3. Use **Custom token** with these minimum permissions:
    - **Account:Cloudflare Tunnel:Edit**
    - **Zone:DNS:Edit** (for the domain you'll use for tunnel hostnames)
-   - **Account:R2:Read & Write**
+   - **Account:Workers Scripts:Edit** (if not using wrangler login)
+   - **Account:Workers AI:Read** (only if you plan to use AI Gateway `api_token` mode)
 4. Account Resources: include your account
-5. Save the token value — this is `CF_API_TOKEN`
-6. [REDACTED - ROTATED]
+5. Zone Resources: include the zone you'll use for tunnel hostnames
+6. Save the token value — this is `CF_API_TOKEN`
 
-### Step 3. Note Your Account ID
+### Step 4. Note Account & Zone IDs
 
-1. In the Cloudflare dashboard right sidebar, copy **Account ID**
-2. This is `CF_ACCOUNT_ID`
-3. [REDACTED-CF-ACCOUNT-ID]
+1. In the Cloudflare dashboard right sidebar, copy **Account ID** — this is `CF_ACCOUNT_ID`
+2. On your zone's overview page, copy **Zone ID** — this is `CF_ZONE_ID`
 
-### Step 4. Set Up Cloudflare Access Application
+### Step 5. Set Up Cloudflare Access
 
 1. Go to **Cloudflare Zero Trust → Access → Applications**
-2. Click **Add an application**
-3. Select **Self-hosted**
-4. Configure:
-   - **Application name:** `hermes-agent`
+2. Click **Add an application → Self-hosted**
+3. Configure:
+   - **Application name:** `hermes-agent` (or your preference)
    - **Session duration:** 24 hours
-   - **Subdomain / Domain:** pick any domain in your account, e.g. `hermes-agent.yourdomain.com`
-   - **Identity providers:** select your IdP(s) (e.g., Google, Okta, Azure AD)
+   - **Subdomain / Domain:** pick the same domain the Worker will use, e.g. `hermes-agent.hermes-test.app`
+   - **Identity providers:** select your IdP(s)
    - **Policies:** add a rule allowing your email domain or specific users
-5. Save
-6. Copy the **Audience (AUD) Tag** from the application settings page — this is `ACCESS_AUD_TAG`
-7. [REDACTED-CF-ACCESS-AUD]
+4. Save
+5. Copy the **Audience (AUD) Tag** from the application settings page — this is `ACCESS_AUD_TAG`
 
-### Step 5. Deploy the Worker
+**Important:** The Worker's JWT validation checks this AUD tag. If you configure the wrong tag, every API call returns 401.
 
-From the repo directory:
+---
+
+## Phase 3 — Repo Configuration
+
+### Step 6. Configure wrangler.jsonc
+
+The repo ships `wrangler.example.jsonc` as a sanitized template. Copy it and fill in your values:
 
 ```bash
-cd <repo-root>
-
-# Set Worker-level secrets
-npx wrangler secret put CF_API_TOKEN
-# Paste the token from Step 2
+cp wrangler.example.jsonc wrangler.jsonc
 ```
 
-**Set public vars via the Cloudflare dashboard** (not in the repo):
+Edit `wrangler.jsonc`:
 
-1. In the Cloudflare dashboard, go to **Workers & Pages** → select your Worker
-2. Select **Settings**
-3. Under **Variables and Secrets**, select **Add**
-4. Select type **Text**, input the variable name, and input its value:
-   - `ACCESS_AUD_TAG` = your AUD tag from Step 4
-   - `CF_ACCOUNT_ID` = your account ID from Step 3
-5. Select **Deploy** to implement your changes
+1. **KV namespace ID**: replace `YOUR_KV_NAMESPACE_ID` with the ID from Step 2
+2. **Custom domain**: update the `routes` pattern to your domain (must match the Access app domain from Step 5)
+3. **SSH authorized_keys** (optional, debugging only):
+   - Uncomment the `authorized_keys` block
+   - Replace with your own `ssh-ed25519` public key
+   - Leave `ssh.enabled: true` for troubleshooting, or set `false` to disable
 
-These are stored in Cloudflare's platform, not your repo.
+`wrangler.jsonc` is **gitignored** — never commit it.
 
-**Important:** Do not put `ACCESS_AUD_TAG` or `CF_ACCOUNT_ID` in `wrangler.jsonc` if you plan to publish the repo — they would be exposed.
+### Step 7. Set Worker Secrets & Variables
 
-Deploy:
+Set secrets via Wrangler CLI (never commit these):
+
+```bash
+# Secret: the API token from Step 3
+npx wrangler secret put CF_API_TOKEN
+
+# Secret (optional): AI Gateway api_token mode credential
+npx wrangler secret put CLOUDFLARE_AI_API_TOKEN
+```
+
+Set plain text variables via the **Cloudflare dashboard** (recommended — keeps them out of the repo):
+
+1. Go to **Cloudflare Dashboard → Workers & Pages** → select your Worker
+2. Select **Settings → Variables and Secrets**
+3. Click **Add**
+4. Select type **Text**, then enter each variable:
+   - `ACCESS_AUD_TAG` = AUD tag from Step 5
+   - `CF_ACCOUNT_ID` = Account ID from Step 4
+   - `CF_ZONE_ID` = Zone ID from Step 4
+   - `SNAPSHOT_INTERVAL_MINUTES` = `5` (snapshot cadence in minutes; prune runs every 2h via cron)
+5. Click **Deploy**
+
+Alternatively, you can pass plain text variables at deploy time with the `--var` flag:
+
+```bash
+npx wrangler deploy --var ACCESS_AUD_TAG:<your-aud> --var CF_ACCOUNT_ID:<your-account> --var CF_ZONE_ID:<your-zone> --var SNAPSHOT_INTERVAL_MINUTES:5
+```
+
+**Note:** `CF_API_TOKEN` must be a secret (encrypted). `ACCESS_AUD_TAG`, `CF_ACCOUNT_ID`, `CF_ZONE_ID`, and `SNAPSHOT_INTERVAL_MINUTES` are plain text variables — they should not be committed to the repo, but they do not require encryption.
+
+**Deploy-order warning:** `npx wrangler deploy` deletes dashboard-set plain-text variables that are not in `wrangler.jsonc`. The configs in this repo set `keep_vars: true` to preserve dashboard-set vars across deploys — do not remove it. If your `wrangler.jsonc` lacks that flag, either add it or pass the variables at deploy time with `--var` (as above) *on every deploy*.
+
+### Step 8. First Deploy
 
 ```bash
 npx wrangler deploy
 ```
 
-Note the deployed Worker URL: `https://hermes-cloudflare-v6.your-account.workers.dev`
+This builds the Docker image (V9 flare split), pushes it to Cloudflare's registry, and deploys the Worker. First deploy takes 5–10 minutes.
+
+**For subsequent updates** (to force a fresh Hermes install rather than a cached Docker layer):
+
+```bash
+bash scripts/build-and-push.sh --deploy
+```
+
+The `--deploy` flag pushes the image and runs `wrangler deploy`.
 
 ---
 
-## Phase 2 — Windows Client (Per-User Setup)
+## Phase 4 — Windows Client (Per-User Setup)
 
-### Step 6. Install cloudflared on Windows
+### Step 9. Install cloudflared on Windows
 
 ```powershell
 winget install --id Cloudflare.cloudflared
 ```
-
-Or download directly from https://github.com/cloudflare/cloudflared/releases/latest
 
 Verify:
 
@@ -98,87 +177,41 @@ Verify:
 cloudflared --version
 ```
 
-### Step 7. Authenticate with Cloudflare Access
+### Step 10. Authenticate with Cloudflare Access
 
-Open browser and visit your Access application URL:
+Open a browser and visit your Access application URL:
 
 ```
 https://hermes-agent.yourdomain.com
 ```
 
-Sign in via your identity provider. This establishes the Access session cookie in your browser.
+Sign in via your identity provider. This establishes the Access session.
 
-### Step 8. Get Your Cloudflare Access JWT Token
+### Step 11. Run the Client Setup Script
 
-The Worker API requires a valid Access JWT. To get one for API calls:
-
-**Option A — Browser DevTools (quick):**
-1. Open `https://hermes-agent.yourdomain.com` in browser (already signed in)
-2. Open DevTools → Network tab
-3. Reload page
-4. Click any request → Headers → find `CF-Access-Jwt-Assertion`
-5. Copy the value — this is your `$JWT_TOKEN`
-
-**Option B — cloudflared token command:**
+From the repo directory on Windows (or copy `scripts/hermes-client.ps1` to the client machine):
 
 ```powershell
-cloudflared access token -app=https://hermes-agent.yourdomain.com
+.\scripts\hermes-client.ps1
 ```
 
-This prints a JWT if you're already authenticated.
+This script:
+1. Authenticates with Cloudflare Access (opens browser if needed)
+2. Calls `/api/client-init` to provision your tunnel + hostname
+3. Calls `/api/wake` to start your sandbox container
+4. Starts the local `cloudflared access tcp` proxy on `localhost:9119`
 
-### Step 9. Provision Your Tunnel (One-Time Per User)
-
-```powershell
-$WORKER_URL = "https://hermes-cloudflare-v6.your-account.workers.dev"
-$JWT_TOKEN = "paste-your-jwt-here"
-
-# Init tunnel
-Invoke-RestMethod -Uri "$WORKER_URL/api/client-init" `
-  -Method POST `
-  -Headers @{ "CF-Access-Jwt-Assertion" = $JWT_TOKEN } `
-  -ContentType "application/json"
-```
-
-Expected response:
+Expected output after init:
 
 ```json
-{ "userId": "you@domain.com", "hostname": "hermes-you@domain.com.yourdomain.com", "existing": false }
+{ "userId": "you@domain.com", "hostname": "hermes-you.hermes-test.app", "existing": false }
 ```
 
 If `existing: true`, your tunnel was already provisioned.
 
-### Step 10. Wake the Sandbox
-
-```powershell
-Invoke-RestMethod -Uri "$WORKER_URL/api/wake" `
-  -Method POST `
-  -Headers @{ "CF-Access-Jwt-Assertion" = $JWT_TOKEN } `
-  -ContentType "application/json"
-```
-
-This creates/reuses your sandbox container and injects the tunnel token.
-
-### Step 11. Start Local TCP Proxy
-
-```powershell
-$HOSTNAME = "hermes-you@domain.com.yourdomain.com"
-cloudflared access tcp --hostname $HOSTNAME --url localhost:9119
-```
-
-Leave this running in a PowerShell window. It opens `127.0.0.1:9119` locally.
-
-**Verify it's listening:**
-
-```powershell
-netstat -an | Select-String "9119"
-```
-
-You should see `TCP    127.0.0.1:9119    0.0.0.0:0    LISTENING`.
-
 ### Step 12. Launch Hermes Desktop GUI
 
-1. Open Hermes Desktop App
+1. Open the Hermes Desktop App
 2. Settings → Remote Gateway → set endpoint to `http://localhost:9119`
 3. Connect
 
@@ -186,152 +219,166 @@ You should see the agent status as connected.
 
 ---
 
-## Phase 3 — Daily Use (After First Setup)
+## Phase 5 — Daily Use
 
 After the initial setup, the daily flow is:
 
 ```powershell
-# 1. Start the local proxy (if not already running)
-cloudflared access tcp --hostname hermes-you@domain.com.yourdomain.com --url localhost:9119
+# Start the local proxy (if not already running)
+cloudflared access tcp --hostname hermes-you.hermes-test.app --url localhost:9119
 
-# 2. Launch Hermes Desktop GUI
+# Launch Hermes Desktop GUI
 # It connects to localhost:9119 automatically
 ```
 
 If the sandbox is sleeping (after 30 min idle), the first request will wake it automatically. Expect 5–10s cold start.
 
----
-
-## Phase 4 — Full Automation Script
-
-Save as `scripts/hermes-connect.ps1`:
-
-```powershell
-param(
-  [string]$WorkerUrl = "https://hermes-cloudflare-v6.your-account.workers.dev",
-  [string]$Hostname = "hermes-you@domain.com.yourdomain.com"
-)
-
-# Step 1: Get Access JWT (requires browser auth first time)
-$jwt = cloudflared access token -app="https://hermes-agent.yourdomain.com" 2> $null
-if (-not $jwt) {
-  Write-Host "Not authenticated with Cloudflare Access. Opening browser..."
-  Start-Process "https://hermes-agent.yourdomain.com"
-  Read-Host "Sign in, then press Enter to continue"
-  $jwt = cloudflared access token -app="https://hermes-agent.yourdomain.com"
-}
-
-# Step 2: Wake sandbox
-Write-Host "Waking sandbox..."
-Invoke-RestMethod -Uri "$WorkerUrl/api/wake" -Method POST `
-  -Headers @{ "CF-Access-Jwt-Assertion" = $jwt } | Out-Null
-
-# Step 3: Start TCP proxy
-Write-Host "Starting local proxy on localhost:9119..."
-cloudflared access tcp --hostname $Hostname --url localhost:9119
-```
-
-Run:
-
-```powershell
-.\scripts\hermes-connect.ps1
-```
+For a one-command start, run `hermes-client.ps1` again — it reuses existing credentials and only re-wakes if needed.
 
 ---
 
-## Phase 5 — AI Gateway Custom Providers (Optional, V8)
+## Phase 6 — AI Gateway Custom Providers (Optional)
 
-Route the agent's model calls through your Cloudflare AI Gateway. The
-worker injects a `custom_providers:` section into the container's
-`config.yaml` on wake (worker-owned, bannered — do not hand-edit it in the
-container; it is re-rendered from R2 every wake).
+Route the agent's model calls through your Cloudflare AI Gateway. The Worker injects a `custom_providers:` section into the container's `config.yaml` on every wake (worker-owned, bannered — do not hand-edit it in the container; it is re-rendered from R2 every wake).
 
-### One-time: gateway setup (Cloudflare dashboard)
+### One-time: Gateway Setup (Cloudflare Dashboard)
 
-1. AI > AI Gateway → select/create your gateway.
-2. **Custom domains** tab: assign a custom domain (e.g. `ai-gw.yourdomain.com`).
-3. **Access** tab: enable Cloudflare Access for the gateway (auto-creates the
-   Access app) and add an email policy for the user.
+1. **AI → AI Gateway** → select/create your gateway.
+2. **Custom domains** tab: assign a custom domain (e.g. `aigw.yourdomain.com`).
+3. **Access** tab: enable Cloudflare Access for the gateway (auto-creates the Access app) and add an email policy for the user.
 
-### Per-user: deliver the provider config
+### Per-user: Deliver the Provider Config
 
 1. Edit `scripts/reference-providers.json` for your gateway:
-   - **`mode: "jwt"`** (custom domain + Access, per-user identity,
-     `cf.user_id` attribution): set `base_url` to
-     `https://<gateway-custom-domain>/openai/v1`. No `gateway_id`, no
-     `extra_headers` — the Access JWT *is* the credential
-     (`Authorization: Bearer <JWT>`, verified at the Access edge) and the
-     gateway selects itself via the domain.
-   - **`mode: "api_token"`** (account-scoped endpoint, shared token): set
-     `base_url` to
-     `https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1`,
-     set `gateway_id` to the gateway slug (the worker adds the
-     `cf-aig-gateway-id` header automatically). The worker secret
-     `CLOUDFLARE_AI_API_TOKEN` (a CF API token with **Workers AI:Read**)
-     supplies the credential — set it with
-     `echo <token> | npx wrangler secret put CLOUDFLARE_AI_API_TOKEN`.
+   - **`mode: "jwt"`** (custom domain + Access, per-user identity, `cf.user_id` attribution): set `base_url` to `https://<gateway-custom-domain>/openai/v1`. No `gateway_id`, no `extra_headers` — the Access JWT *is* the credential (`Authorization: Bearer *** verified at the Access edge) and the gateway selects itself via the domain.
+   - **`mode: "api_token"`** (account-scoped endpoint, shared token): set `base_url` to `https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1`, set `gateway_id` to the gateway slug (the worker adds the `cf-aig-gateway-id` header automatically). The worker secret `CLOUDFLARE_AI_API_TOKEN` (a CF API token with **Workers AI:Read**) supplies the credential — set it with `npx wrangler secret put CLOUDFLARE_AI_API_TOKEN`.
+
 2. Run the client with the gateway domain:
 
    ```powershell
-   .\scripts\setup-client.ps1 -GatewayDomain https://ai-gw.yourdomain.com
+   .\scripts\setup-client.ps1 -GatewayDomain https://aigw.yourdomain.com
    ```
 
-   First run opens a second browser login (the gateway's Access app). The
-   script stores the providers JSON + your gateway Access JWT in the worker
-   (R2, per-user) and the following wake injects them. Re-run the script any
-   time to refresh the JWT (session-scoped; this project's containers don't
-   outlive a session, so no refresh machinery is needed).
+   First run opens a second browser login (the gateway's Access app). The script stores the providers JSON + your gateway Access JWT in the worker (KV for JWT, R2 for provider config) and the following wake injects them. Re-run the script any time to refresh the JWT (session-scoped; containers don't outlive a session, so no refresh machinery is needed).
 
-### Verify
+### Verify Providers Are Injected
 
 ```powershell
-# providers stored?
-cloudflared access curl "$WorkerUrl/api/admin/providers?userId=<you>" -s
-# wake, then check the rendered section
-cloudflared access curl "$WorkerUrl/api/wake" -s -X POST   # look for providersWritten: 1
-cloudflared access curl "$WorkerUrl/api/debug/exec?userId=<you>&cmd=cat%20/home/hermes/.hermes/config.yaml" -s
+# Check providers stored in R2
+cloudflared access curl "https://hermes-agent.yourdomain.com/api/admin/providers?userId=<you>" -s
+
+# Wake and check the rendered count
+cloudflared access curl "https://hermes-agent.yourdomain.com/api/wake" -s -X POST
+# Look for "providersWritten" in the JSON response
+
+# Inspect the rendered config.yaml inside the container
+cloudflared access curl "https://hermes-agent.yourdomain.com/api/debug/exec?userId=<you>&cmd=cat%20/home/hermes/.hermes/config.yaml" -s
 ```
 
-In the GUI, switch models to one of the injected ids (e.g.
-`@cf/openai/gpt-oss-20b`). In the gateway dashboard, the request should show
-`cf.user_id` = your Access subject (jwt mode).
+In the GUI, switch models to one of the injected IDs (e.g. `@cf/openai/gpt-oss-20b`). In the gateway dashboard, the request should show `cf.user_id` = your Access subject (JWT mode).
+
+---
+
+## Phase 7 — Architecture Notes (V9)
+
+### Container Layout
+
+| Path | Contents | In Snapshot? |
+|---|---|---|
+| `/opt/hermes-install` | Hermes code, venv, Node bundle, managed uv (~1.5–2 GB) | **No** |
+| `/opt/uv` | uv-managed CPython | **No** |
+| `/home/hermes/.hermes` | Runtime config, sessions, skills, caches (HERMES_HOME) | **Yes** |
+| `/home/hermes/.local/bin/hermes` | Tiny launcher wrapper (sentinel file) | **Yes** |
+
+The snapshot tree is `/home/hermes` — only mutable user state. The install is baked into the image at `/opt` and never backed up.
+
+### Credentials
+
+| Credential | Storage | Key |
+|---|---|---|
+| Tunnel token | KV | `cred:tunnel:<userId>` |
+| Dashboard session token | KV | `cred:session:<userId>` |
+| Gateway JWT | KV | `cred:gwjwt:<userId>` |
+| Provider config (no secrets) | R2 | `users/<userId>/providers.json` |
+
+### Persistence
+
+- **Restore:** `/api/wake` calls `restoreLatest()` (extracts the newest handle into `/home/hermes`) and writes `/tmp/restore-done` to unblock the boot script.
+- **Snapshots:** Worker cron fires every 5 minutes (`*/5 * * * *`); for each running user whose container is healthy, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES`. The code default is 60 (hourly); this repo sets it to `5` via the `vars` block in `wrangler.jsonc`.
+- **Pruning:** Worker cron fires every 2 hours (`0 */2 * * *`); slot-filling retention, newest-first: one backup per 5-minute slot for backups younger than 2h, one per hourly slot for backups younger than 24h, then the newest 5 distinct calendar-day slots and newest 5 distinct ISO-week slots (regardless of age), plus a safety rule that the absolute newest backup is never deleted; everything else is deleted.
+- **Final snapshots:** `/api/admin/stop` and `/api/admin/destroy` take a best-effort final backup before stopping/destroying.
+- **Integrity:** every snapshot and restore checks the sentinel file (`/home/hermes/.local/bin/hermes`) to detect partial extractions.
+
+---
+
+## Phase 8 — SSH Debugging (Troubleshooting Only)
+
+Sandboxes ship with `ssh.enabled: true` so a running container can be reached with:
+
+```bash
+npx wrangler containers list                       # → application ID
+npx wrangler containers instances <APP_ID>         # → instance IDs
+npx wrangler containers ssh <INSTANCE_ID>
+```
+
+Requirements:
+1. **sshd runs inside the container** — the image installs `openssh-server` and `start-hermes.sh` launches it.
+2. **Your public key is in `authorized_keys`** — only `ssh-ed25519` keys are supported. Add yours to `wrangler.jsonc`.
+
+The tunnel is authenticated by your Cloudflare account — no public port is exposed.
+
+To disable SSH, set `ssh.enabled: false` in `wrangler.jsonc`.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| `missing Access JWT` | Re-authenticate with Access in browser; get fresh JWT |
-| `Tunnel not provisioned` | Run `/api/client-init` first |
-| `cloudflared access tcp` hangs | Check that tunnel exists in Cloudflare dashboard → Tunnels |
-| Hermes GUI can't connect | Verify `netstat` shows `127.0.0.1:9119` listening |
+| Symptom | Cause & Fix |
+|---|---|
+| `missing Access JWT` or `invalid Access JWT` | Re-authenticate with Access in browser; get fresh JWT via `cloudflared access token -app=...` |
+| `Tunnel not provisioned` | Run `client-init` first (or re-run `hermes-client.ps1`) |
+| `cloudflared access tcp` hangs | Check that tunnel exists in Cloudflare dashboard → Tunnels; verify hostname matches |
+| Hermes GUI can't connect | Verify `netstat -an` shows `127.0.0.1:9119` listening |
 | Cold start > 10s | Normal for first wake after sleep; subsequent requests are fast |
-| Container sleeps mid-session | Internal bash loop may not count as activity. If this happens, call `/api/wake` from a background script or accept the cold start. |
-| Wake shows `providersError` | Provider injection failed — the container still boots (no custom providers). Check `wrangler tail` logs, fix `reference-providers.json`, re-run the client. |
-| Provider entry skipped (`no Access JWT on file`) | The gateway JWT wasn't delivered. Finish the gateway Access browser login and re-run `setup-client.ps1 -GatewayDomain ...`. |
-| Model calls 401/403 via gateway (jwt mode) | Gateway JWT expired or Access policy doesn't allow the user. Re-run the client script; check the gateway Access tab policies. |
+| Container sleeps mid-session | Internal bash loop may not count as activity. Call `/api/wake` from a background script or accept the cold start. |
+| Wake shows `restoreError` | Restore failed but container still boots. Check `wrangler tail` logs. |
+| Wake shows `providersError` | Provider injection failed — container boots without custom providers. Check `wrangler tail`, fix `reference-providers.json`, re-run `setup-client.ps1`. |
+| Provider entry skipped (`no Access JWT on file`) | Gateway JWT wasn't delivered. Finish the gateway Access browser login and re-run `setup-client.ps1 -GatewayDomain ...`. |
+| Model calls 401/403 via gateway (JWT mode) | Gateway JWT expired or Access policy doesn't allow the user. Re-run the client script; check the gateway Access tab policies. |
 | Model calls 401 (api_token mode) | `CLOUDFLARE_AI_API_TOKEN` secret missing or lacks Workers AI:Read permission. |
+| Sentinel check fails after restore | `/home/hermes/.local/bin/hermes` is missing or 0 bytes. This means the backup is corrupt or from a V8-era handle. Delete `users/<userId>/backup-handle.json` from R2 and wake fresh. |
 
 ---
 
 ## Required Cloudflare Products Summary
 
-| Product | Purpose | Cost |
-|---------|---------|------|
-| Cloudflare Workers + Sandbox | Backend runtime | Free tier: 100k req/day |
-| R2 | State snapshots | Free tier: 10GB storage |
-| Cloudflare Tunnel | Secure connectivity | Free |
-| Cloudflare Access | SSO authentication | Free (up to 50 users) |
+| Product | Purpose | Free Tier |
+|---|---|---|
+| Cloudflare Workers + Sandbox | Backend runtime | 100,000 requests/day, 10 ms CPU/invocation |
+| R2 | State snapshots | 10 GB storage, 1M Class A ops, 10M Class B ops |
+| KV | Credentials storage | 100,000 reads/day, 1,000 writes/day, 1 GB storage |
+| Cloudflare Tunnel | Secure connectivity | Unlimited |
+| Cloudflare Access | SSO authentication | Up to 50 users (then $7/user/month) |
+
+**Plan note:** Containers require the **Workers Paid plan ($5/month)** — the Workers Free plan does not support them (Containers pricing lists Free as N/A; billed usage applies for vCPU, memory, and disk on top of the plan). Workers, R2, KV, Tunnels, and Access are usable on the free tier within the limits shown above.
 
 ---
 
 ## Files Reference
 
-- `wrangler.jsonc` — Worker config (containers, DOs, R2 bucket, cron)
-- `src/index.ts` — Worker routes (`/api/client-init`, `/api/wake`, `/api/admin/*`, etc.)
-- `src/persistence.ts` — SDK-native state persistence (`createBackup` / `restoreBackup` to R2)
-- `src/providers.ts` — V8 per-user AI Gateway custom providers (R2 → config.yaml/.env injection on wake)
-- `scripts/reference-providers.json` — V8 reference provider config (edit per gateway, then delivered by the client)
-- `start-hermes.sh` — Container boot script (restore gate, starts cloudflared + hermes)
-- `Dockerfile` — Container image (cloudflared + squashfs-tools + hermes)
+| File | Purpose |
+|---|---|
+| `wrangler.jsonc` | Worker config (containers, DOs, R2 bucket, KV namespace, cron). **Gitignored** — copy from `wrangler.example.jsonc`. |
+| `wrangler.example.jsonc` | Sanitized template for `wrangler.jsonc` |
+| `src/index.ts` | Worker routes (`/api/client-init`, `/api/wake`, `/api/admin/*`, etc.) |
+| `src/persistence.ts` | SDK-native state persistence (`createBackup` / `restoreBackup` to R2) |
+| `src/prune.ts` | Slot-filling retention pruning (5-min → hourly → daily → weekly) |
+| `src/credentials.ts` | KV credential access (tunnel, session, gateway JWT) |
+| `src/providers.ts` | Per-user AI Gateway custom providers (R2 config → config.yaml/.env injection on wake) |
+| `src/env.ts` | Worker environment type definitions |
+| `scripts/hermes-client.ps1` | Main Windows client script (Access auth → init → wake → proxy) |
+| `scripts/setup-client.ps1` | Gateway provider setup script (delivers `reference-providers.json` + JWT) |
+| `scripts/reference-providers.json` | Reference provider config (edit per gateway, then delivered by `setup-client.ps1`) |
+| `scripts/build-and-push.sh` | Force-rebuild the container image with `--no-cache` and deploy |
+| `start-hermes.sh` | Container boot script (restore gate, starts cloudflared + hermes + sshd) |
+| `Dockerfile` | V9 container image (flare split: `/opt/hermes-install` + `/home/hermes` snapshot tree) |

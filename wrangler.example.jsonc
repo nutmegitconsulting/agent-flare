@@ -58,6 +58,10 @@
     { "binding": "CREDENTIALS_KV", "id": "YOUR_KV_NAMESPACE_ID" }
   ],
   "ai": { "binding": "AI" },
+  // Plain-text vars (ACCESS_AUD_TAG, CF_ACCOUNT_ID, CF_ZONE_ID) are set in the
+  // dashboard; without keep_vars, `wrangler deploy` deletes every var not
+  // listed here. keep_vars: true also preserves dashboard-managed secrets.
+  "keep_vars": true,
   "vars": {
     "SNAPSHOT_INTERVAL_MINUTES": "5"
   },

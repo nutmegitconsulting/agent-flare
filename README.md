@@ -23,19 +23,20 @@ R2 key layout (multi-tenant):
 ```
 users/<userId>/backup-handle.json   newest DirectoryBackup handle (restore target)
 users/<userId>/backups-index.json   array of {id, dir, createdAt} (observability only)
-users/<userId>/cloudflared/creds.json  per-user tunnel creds + hostname
-users/<userId>/session-token.json  dashboard session token
+users/<userId>/providers.json       per-user AI Gateway provider config (no secrets)
 active-users.json                  userIds with currently-running containers
 backups/<id>/data.sqsh             SDK-written squashfs archive
 backups/<id>/meta.json             SDK-written metadata
 ```
+
+Usable credentials (tunnel token, dashboard session token, gateway JWT) do NOT live in this bucket — since V9 they are in the dedicated `CREDENTIALS_KV` KV namespace under `cred:tunnel:<userId>`, `cred:session:<userId>`, `cred:gwjwt:<userId>`, so third-party R2 backups never carry credentials.
 
 Backup lifecycle:
 
 - **Restore:** `/api/wake` calls `restoreLatest()` (extracts the newest handle into `/home/hermes`) and writes `/tmp/restore-done` to unblock the boot script. A missing/expired handle is treated as a fresh start; a failed restore does not fail the wake.
 - **Periodic snapshots:** a Worker cron fires every 5 minutes; for each user in `active-users.json` whose container is `running`, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES` (default 60). Sleeping containers are skipped.
 - **Final snapshots:** `/api/admin/stop` and `/api/admin/destroy` take a best-effort final backup before stopping/destroying.
-- **Retention:** the code never deletes backups. Retention is owned by the R2 bucket's lifecycle rules on the `backups/` prefix. Per-backup TTL is 365 days so any object still present is restorable.
+- **Retention:** slot-filling retention pruning runs on the `0 */2 * * *` Worker cron for every user in `active-users.json` (also on demand via `POST /api/admin/prune`): newest-first, it keeps one backup per 5-minute slot for backups younger than 2h, one per hourly slot for backups younger than 24h, then the newest 5 distinct calendar-day slots and newest 5 distinct ISO-week slots regardless of age, and never deletes the absolute newest backup; everything else is deleted (`backups/<id>/data.sqsh` + `meta.json`). The SDK backup TTL itself is 365 days, so any backup that survives pruning stays restorable.
 - **Integrity:** every snapshot and restore checks a sentinel file (`/home/hermes/.local/bin/hermes`) to detect partial extractions and refuse to archive a corrupt tree.
 
 ### Container image
@@ -60,6 +61,8 @@ All endpoints (except `/health` and `/internal/*`) require a valid Cloudflare Ac
 | `GET /api/admin/status` | Container state for a user |
 | `POST /api/admin/snapshot` | Force a snapshot now |
 | `POST /api/admin/restore` | Force-restore the latest backup now |
+| `POST /api/admin/prune` | Run slot-filling retention pruning for a user now |
+| `POST /api/admin/gateway-jwt` | Store the user's gateway Access JWT (used by `setup-client.ps1`) |
 
 ## Security Notes
 
@@ -87,7 +90,7 @@ Deploys are made manually with Wrangler from the operator's machine — there is
 
 ### SSH debugging (troubleshooting only)
 
-Sandboxes ship with `ssh.enabled: true` so a running container can be reached with `npx wrangler containers ssh <INSTANCE_ID>` (list instances via `npx wrangler containers instances`). The tunnel is authenticated by your Cloudflare account — no public port is exposed. A connection succeeds only if both of the following hold:
+Sandboxes ship with `ssh.enabled: true` so a running container can be reached with `npx wrangler containers ssh <INSTANCE_ID>`. Get the application ID with `npx wrangler containers list`, then the instance IDs with `npx wrangler containers instances <APP_ID>` (both steps are required — `instances` takes the application ID as an argument, and `ssh` takes the instance ID). The tunnel is authenticated by your Cloudflare account — no public port is exposed. A connection succeeds only if both of the following hold:
 
 - **sshd runs inside the container.** The image installs `openssh-server` and `start-hermes.sh` launches it. An image without an SSH server makes the tunnel useless.
 - **Your public key is hydrated via `authorized_keys`** in the container config (`ssh-ed25519` keys only). With no key entry, the tunnel opens but no login succeeds. See the [Cloudflare Containers SSH docs](https://developers.cloudflare.com/containers/) before enabling.
