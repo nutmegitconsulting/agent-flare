@@ -62,9 +62,10 @@
   // listed here. keep_vars: true also preserves dashboard-managed secrets.
   "keep_vars": true,
   "vars": {
-    "SNAPSHOT_INTERVAL_MINUTES": "5"
+    "SNAPSHOT_INTERVAL_MINUTES": "10",
+    "ACCESS_TEAM_DOMAIN": "REPLACE_ME.cloudflareaccess.com"
   },
   "triggers": {
-    "crons": ["*/5 * * * *", "0 */2 * * *"]
+    "crons": ["*/10 * * * *", "0 */2 * * *"]
   }
 }

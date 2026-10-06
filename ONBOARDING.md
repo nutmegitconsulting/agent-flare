@@ -132,7 +132,7 @@ Set plain text variables via the **Cloudflare dashboard** (recommended — keeps
    - `ACCESS_AUD_TAG` = AUD tag from Step 5
    - `CF_ACCOUNT_ID` = Account ID from Step 4
    - `CF_ZONE_ID` = Zone ID from Step 4
-   - `SNAPSHOT_INTERVAL_MINUTES` = `5` (snapshot cadence in minutes; prune runs every 2h via cron)
+   - `SNAPSHOT_INTERVAL_MINUTES` = `10` (snapshot cadence in minutes; prune runs every 2h via cron)
 5. Click **Deploy**
 
 Alternatively, you can pass plain text variables at deploy time with the `--var` flag:
@@ -304,7 +304,7 @@ The snapshot tree is `/home/hermes` — only mutable user state. The install is 
 ### Persistence
 
 - **Restore:** `/api/wake` calls `restoreLatest()` (extracts the newest handle into `/home/hermes`) and writes `/tmp/restore-done` to unblock the boot script.
-- **Snapshots:** Worker cron fires every 5 minutes (`*/5 * * * *`); for each running user whose container is healthy, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES`. The code default is 60 (hourly); this repo sets it to `5` via the `vars` block in `wrangler.jsonc`.
+- **Snapshots:** Worker cron fires every 10 minutes (`*/10 * * * *`); for each running user whose container is healthy, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES`. The code default is 60 (hourly); this repo sets it to `10` via the `vars` block in `wrangler.jsonc`.
 - **Pruning:** Worker cron fires every 2 hours (`0 */2 * * *`); slot-filling retention, newest-first: one backup per 5-minute slot for backups younger than 2h, one per hourly slot for backups younger than 24h, then the newest 5 distinct calendar-day slots and newest 5 distinct ISO-week slots (regardless of age), plus a safety rule that the absolute newest backup is never deleted; everything else is deleted.
 - **Final snapshots:** `/api/admin/stop` and `/api/admin/destroy` take a best-effort final backup before stopping/destroying.
 - **Integrity:** every snapshot and restore checks the sentinel file (`/home/hermes/.local/bin/hermes`) to detect partial extractions.

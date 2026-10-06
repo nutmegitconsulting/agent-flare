@@ -3,8 +3,8 @@
 # Requires: cloudflared CLI (winget install --id Cloudflare.cloudflared)
 
 param(
-    [string]$WorkerUrl    = "https://hermes-agent.hermes-test.app",
-    [string]$AccessAppUrl = "https://hermes-agent.hermes-test.app",
+    [string]$WorkerUrl    = "https://hermes.nutmegit.com",
+    [string]$AccessAppUrl = "https://hermes.nutmegit.com",
     [string]$LocalPort    = "9119",
     [string]$CloudflaredPath = (Get-Command cloudflared -ErrorAction SilentlyContinue).Source,
     # V8 (optional): custom domain of your Cloudflare AI Gateway (Access-protected).
