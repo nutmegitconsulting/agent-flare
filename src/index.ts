@@ -125,15 +125,24 @@ app.use("*", async (c, next) => {
   }
 
   try {
-    const certsRes = await fetch(
-      "https://calm-waterfall-91be.cloudflareaccess.com/cdn-cgi/access/certs"
-    );
+    // Decode JWT header/payload first: the signing certs must come from the
+    // Access team that ISSUED the token (its `iss` claim), not a hardcoded
+    // team domain — tokens from any other Access org would fail with
+    // "Signing cert not found".
+    const [headerB64, payloadB64] = jwtParts;
+    const header = JSON.parse(atob(headerB64)) as { kid: string; alg?: string };
+    const payload = JSON.parse(atob(payloadB64)) as { email?: string; sub?: string; aud?: string | string[]; exp?: number; iss?: string };
+
+    const iss = payload.iss;
+    if (!iss) throw new Error("JWT missing iss claim");
+    const issOrigin = new URL(iss).origin;
+    if (!/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(issOrigin)) {
+      throw new Error("Unexpected JWT issuer: " + issOrigin);
+    }
+
+    const certsRes = await fetch(`${issOrigin}/cdn-cgi/access/certs`);
     if (!certsRes.ok) throw new Error("Failed to fetch Access certs");
     const certs = await certsRes.json() as { keys: { kid: string; x5c: string[] }[] };
-
-    const [headerB64, payloadB64] = jwtParts;
-    const header = JSON.parse(atob(headerB64)) as { kid: string };
-    const payload = JSON.parse(atob(payloadB64)) as { email?: string; sub?: string; aud?: string | string[]; exp?: number };
 
     const aud = payload.aud;
     const audMatch = Array.isArray(aud)
