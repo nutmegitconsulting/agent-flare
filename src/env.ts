@@ -1,4 +1,4 @@
-import type { R2Bucket, KVNamespace, DurableObjectNamespace, Ai } from "@cloudflare/workers-types";
+import type { R2Bucket, KVNamespace, DurableObjectNamespace } from "@cloudflare/workers-types";
 import type { Sandbox } from "@cloudflare/sandbox";
 
 export interface Env {
@@ -10,7 +10,6 @@ export interface Env {
    *  consistency (~60s propagation) — credentials are written at provision
    *  time and read on wake, never rewritten mid-flight. */
   CREDENTIALS_KV: KVNamespace;
-  AI: Ai;
   ACCESS_AUD_TAG: string;
   CF_ACCOUNT_ID: string;
   CF_ZONE_ID: string;
