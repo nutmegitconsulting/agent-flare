@@ -174,6 +174,21 @@ app.use("*", async (c, next) => {
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
+// Root route: the Access CLI login callback (https://<domain>/?aud=...&token=...)
+// lands here after the edge has already delivered the token to the local
+// cloudflared listener. Without this route the user sees a bare "404 Not
+// Found" and can't tell the authorization worked.
+app.get("/", (c) =>
+  c.text(
+    "Authorization received.\n\n" +
+      "This browser tab can be closed. Your device is now authorized for " +
+      "Hermes Desktop to reach your container at Cloudflare.\n" +
+      "Return to the terminal and let setup-client.ps1 finish.",
+    200,
+    { "Content-Type": "text/plain; charset=UTF-8" },
+  ),
+);
+
 // ---------------------------------------------------------------------------
 // Client init: provision tunnel for this user (KV-backed credentials, no DO)
 // ---------------------------------------------------------------------------
