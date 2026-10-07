@@ -25,66 +25,48 @@ if (-not $CloudflaredPath) {
 Write-Host "cloudflared found at: $CloudflaredPath"
 
 # ---------------------------------------------------------------------------
-# 2. Authenticate with Cloudflare Access (at most ONE browser prompt per run)
-#    Reuse strategy: probe the local cloudflared token cache first; if a valid
-#    app token exists, skip the browser entirely. Otherwise run login ONCE,
-#    verify it actually returned a token, and reuse that JWT explicitly on
-#    every request below so no per-request challenge can ever pop up.
+# 2. Authenticate with Cloudflare Access (opens browser once, caches locally)
 # ---------------------------------------------------------------------------
 Write-Host "`nAuthenticating with Cloudflare Access..."
 Write-Host "  App URL: $AccessAppUrl"
 
-$jwt = $null
-$probeOut = & $CloudflaredPath access token -app=$AccessAppUrl 2>$null
-if ($LASTEXITCODE -eq 0 -and $probeOut) {
-    $candidate = @($probeOut | Where-Object { $_ -match "^eyJ" }) | Select-Object -First 1
-    if ($candidate) { $jwt = $candidate.Trim() }
+& $CloudflaredPath access login $AccessAppUrl 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "cloudflared access login failed (exit code $LASTEXITCODE)."
+    exit 1
 }
-
-if (-not $jwt) {
-    Write-Host "  No cached token - opening the browser once for authorization..."
-    $loginOut = (& $CloudflaredPath access login $AccessAppUrl 2>&1) | Out-String
-    if ($loginOut -match "eyJ[A-Za-z0-9_\-\.=]+") {
-        $jwt = $Matches[0].Trim()
-    }
-    if (-not $jwt) {
-        Write-Error "cloudflared access login did not produce a token (exit code $LASTEXITCODE). Login output:`n$loginOut"
-        exit 1
-    }
-}
-Write-Host "Access token ready - it will be reused for every request (no further prompts)."
-
-# All authenticated requests go through this helper: URL first (cloudflared
-# requires the URL before flags), then the acquired JWT as an explicit header
-# so individual requests never fall back to their own (possibly empty) cache.
-function Invoke-AccessCurl {
-    param([Parameter(Mandatory)][string]$Url, [string[]]$ExtraArgs = @())
-    $output = & $CloudflaredPath access curl $Url -H "CF-Access-Jwt-Assertion: $jwt" @ExtraArgs 2>&1
-    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (($output | Out-String).Trim()) }
-}
+Write-Host "Access authentication successful."
 
 # ---------------------------------------------------------------------------
 # 3. Provision tunnel (one-time per user)
 # ---------------------------------------------------------------------------
 Write-Host "`nProvisioning tunnel via Worker..."
 
-$initRes = Invoke-AccessCurl -Url "$WorkerUrl/api/client-init" -ExtraArgs @("-X", "POST")
-if ($initRes.ExitCode -ne 0 -or -not $initRes.Output) {
-    Write-Error "cloudflared access curl failed (exit code $($initRes.ExitCode)).`nOutput:`n$($initRes.Output)"
+$proc = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "$WorkerUrl/api/client-init", "-s", "-X", "POST") `
+    -RedirectStandardOutput "client-init-out.txt" `
+    -RedirectStandardError  "client-init-err.txt" `
+    -Wait -PassThru -NoNewWindow
+
+$initJson = Get-Content "client-init-out.txt" -Raw -ErrorAction SilentlyContinue
+$initErr  = Get-Content "client-init-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "client-init-out.txt", "client-init-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc.ExitCode -ne 0 -or -not $initJson) {
+    Write-Error "cloudflared access curl failed (exit code $($proc.ExitCode)).`nSTDERR:`n$initErr"
     exit 1
 }
-$initJson = $initRes.Output
 
 try {
-    $init = $initJson | ConvertFrom-Json
+    $initRes = $initJson | ConvertFrom-Json
 } catch {
     Write-Error "Invalid JSON from Worker: $initJson"
     exit 1
 }
 
-$hostname = $init.hostname
-$userId   = $init.userId
-$sessionToken = $init.sessionToken
+$hostname = $initRes.hostname
+$userId   = $initRes.userId
+$sessionToken = $initRes.sessionToken
 
 # Sanitize userId for local use (strip domain from email)
 $userId = $userId.Split("@")[0]
@@ -122,21 +104,15 @@ if ($GatewayDomain) {
     $gatewayBase = $GatewayDomain.TrimEnd("/")
     Write-Host "`nAuthenticating with AI Gateway Access..."
     Write-Host "  Gateway domain: $gatewayBase"
-    # Gateway is a different Access app: try cached token first, one login if absent.
-    $gwToken = $null
-    $gwProbe = & $CloudflaredPath access token -app=$gatewayBase 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $gwCandidate = @($gwProbe | Where-Object { $_ -match "^eyJ" }) | Select-Object -First 1
-        if ($gwCandidate) { $gwToken = $gwCandidate.Trim() }
-    }
-    if (-not $gwToken) {
-        $gwLoginOut = (& $CloudflaredPath access login $gatewayBase 2>&1) | Out-String
-        if ($gwLoginOut -match "eyJ[A-Za-z0-9_\-\.=]+") {
-            $gwToken = $Matches[0].Trim()
-        }
-    }
+    $gwLogin = Start-Process -FilePath $CloudflaredPath `
+        -ArgumentList @("access", "login", $gatewayBase) `
+        -RedirectStandardOutput "gw-login-out.txt" `
+        -RedirectStandardError  "gw-login-err.txt" `
+        -Wait -PassThru -NoNewWindow
+    $gwToken = (Get-Content "gw-login-out.txt" -Raw -ErrorAction SilentlyContinue).Trim()
+    Remove-Item "gw-login-out.txt", "gw-login-err.txt" -ErrorAction SilentlyContinue
 
-    if (-not $gwToken -or $gwToken -match "^(https?://|Error|error)") {
+    if ($gwLogin.ExitCode -ne 0 -or -not $gwToken -or $gwToken -match "^(https?://|Error|error)") {
         Write-Host "Gateway Access login did not return a token. Skipping provider setup."
         Write-Host "  (Finish the browser login and re-run this script.)"
     } else {
@@ -148,16 +124,26 @@ if ($GatewayDomain) {
         $providersJson = Get-Content $providersFile -Raw
 
         Write-Host "Delivering provider config to worker..."
-        $putRes = Invoke-AccessCurl -Url "$WorkerUrl/api/admin/providers?userId=$userId" -ExtraArgs @("-X", "PUT", "-H", "Content-Type: application/json", "-d", $providersJson)
-        $putOut = $putRes.Output
-        if ($putRes.ExitCode -ne 0 -or -not $putOut) {
+        $putProc = Start-Process -FilePath $CloudflaredPath `
+            -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/providers?userId=$userId", "-s", "-X", "PUT", "-H", "Content-Type: application/json", "-d", $providersJson) `
+            -RedirectStandardOutput "providers-out.txt" `
+            -RedirectStandardError  "providers-err.txt" `
+            -Wait -PassThru -NoNewWindow
+        $putOut = (Get-Content "providers-out.txt" -Raw -ErrorAction SilentlyContinue).Trim()
+        Remove-Item "providers-out.txt", "providers-err.txt" -ErrorAction SilentlyContinue
+        if ($putProc.ExitCode -ne 0 -or -not $putOut) {
             Write-Warning "Failed to PUT providers (will retry next run): $putOut"
         } else {
             Write-Host "  Providers stored: $putOut"
             $jwtBody = ('{{"jwt":"{0}"}}' -f $gwToken.Replace('\', '\\').Replace('"', '\"'))
-            $jwtRes = Invoke-AccessCurl -Url "$WorkerUrl/api/admin/gateway-jwt?userId=$userId" -ExtraArgs @("-X", "POST", "-H", "Content-Type: application/json", "-d", $jwtBody)
-            $jwtOut = $jwtRes.Output
-            if ($jwtRes.ExitCode -ne 0 -or -not $jwtOut) {
+            $jwtProc = Start-Process -FilePath $CloudflaredPath `
+                -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/gateway-jwt?userId=$userId", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", $jwtBody) `
+                -RedirectStandardOutput "jwt-out.txt" `
+                -RedirectStandardError  "jwt-err.txt" `
+                -Wait -PassThru -NoNewWindow
+            $jwtOut = (Get-Content "jwt-out.txt" -Raw -ErrorAction SilentlyContinue).Trim()
+            Remove-Item "jwt-out.txt", "jwt-err.txt" -ErrorAction SilentlyContinue
+            if ($jwtProc.ExitCode -ne 0 -or -not $jwtOut) {
                 Write-Warning "Failed to POST gateway JWT (will retry next run): $jwtOut"
             } else {
                 Write-Host "  Gateway JWT stored: $jwtOut"
@@ -172,15 +158,23 @@ if ($GatewayDomain) {
 # ---------------------------------------------------------------------------
 Write-Host "`nWaking sandbox container..."
 
-$wakeRes = Invoke-AccessCurl -Url "$WorkerUrl/api/wake" -ExtraArgs @("-X", "POST")
-if ($wakeRes.ExitCode -ne 0 -or -not $wakeRes.Output) {
-    Write-Error "cloudflared access curl failed (exit code $($wakeRes.ExitCode)).`nOutput:`n$($wakeRes.Output)"
+$proc2 = Start-Process -FilePath $CloudflaredPath `
+    -ArgumentList @("access", "curl", "$WorkerUrl/api/wake", "-s", "-X", "POST") `
+    -RedirectStandardOutput "wake-out.txt" `
+    -RedirectStandardError  "wake-err.txt" `
+    -Wait -PassThru -NoNewWindow
+
+$wakeJson = Get-Content "wake-out.txt" -Raw -ErrorAction SilentlyContinue
+$wakeErr  = Get-Content "wake-err.txt"  -Raw -ErrorAction SilentlyContinue
+Remove-Item "wake-out.txt", "wake-err.txt" -ErrorAction SilentlyContinue
+
+if ($proc2.ExitCode -ne 0 -or -not $wakeJson) {
+    Write-Error "cloudflared access curl failed (exit code $($proc2.ExitCode)).`nSTDERR:`n$wakeErr"
     exit 1
 }
-$wakeJson = $wakeRes.Output
 
 try {
-    $wake = $wakeJson | ConvertFrom-Json
+    $wakeRes = $wakeJson | ConvertFrom-Json
 } catch {
     Write-Error "Invalid JSON from Worker: $wakeJson"
     exit 1
@@ -189,7 +183,7 @@ try {
 # ---------------------------------------------------------------------------
 # 5. Poll container platform status AND startup script progress in real-time
 # ---------------------------------------------------------------------------
-Write-Host "`nSandbox status: $($wake.status)"
+Write-Host "`nSandbox status: $($wakeRes.status)"
 Write-Host "Container is waking - this may take 2-5 minutes on first boot..."
 
 $maxWaitSeconds = 300
@@ -206,11 +200,17 @@ while ($elapsed -lt $maxWaitSeconds) {
     $elapsed += $pollIntervalSeconds
 
     # --- A. Poll startup script status ---
-    $statusRes = Invoke-AccessCurl -Url "$WorkerUrl/api/debug/exec?userId=$userId&cmd=cat%20/home/hermes/.hermes/.startup-status%202%3E%261%20%7C%7C%20echo%20NOT_STARTED"
-    $statusText = $statusRes.Output
+    $statusProc = Start-Process -FilePath $CloudflaredPath `
+        -ArgumentList @("access", "curl", "$WorkerUrl/api/debug/exec?userId=$userId&cmd=cat%20/home/hermes/.hermes/.startup-status%202%3E%261%20%7C%7C%20echo%20NOT_STARTED", "-s") `
+        -RedirectStandardOutput "startup-out.txt" `
+        -RedirectStandardError  "startup-err.txt" `
+        -Wait -PassThru -NoNewWindow
+
+    $statusText = Get-Content "startup-out.txt" -Raw -ErrorAction SilentlyContinue
+    Remove-Item "startup-out.txt", "startup-err.txt" -ErrorAction SilentlyContinue
 
     $currentStartupStatus = ""
-    if ($statusRes.ExitCode -eq 0 -and $statusText) {
+    if ($statusProc.ExitCode -eq 0 -and $statusText) {
         if ($statusText -match '"stdout"\s*:\s*"([^"]*)"') {
             $currentStartupStatus = $Matches[1] -replace '\\n', ''
         } else {
@@ -231,13 +231,19 @@ while ($elapsed -lt $maxWaitSeconds) {
 
     # --- B. Poll platform status every ~10 seconds (every 5th iteration) ---
     if ($elapsed % 10 -eq 0 -or -not $lastPlatformStatus) {
-        $pollRes = Invoke-AccessCurl -Url "$WorkerUrl/api/admin/status?userId=$userId"
-        $pollJson = $pollRes.Output
+        $pollProc = Start-Process -FilePath $CloudflaredPath `
+            -ArgumentList @("access", "curl", "$WorkerUrl/api/admin/status?userId=$userId", "-s") `
+            -RedirectStandardOutput "status-out.txt" `
+            -RedirectStandardError  "status-err.txt" `
+            -Wait -PassThru -NoNewWindow
 
-        if ($pollRes.ExitCode -eq 0 -and $pollJson) {
+        $pollJson = Get-Content "status-out.txt" -Raw -ErrorAction SilentlyContinue
+        Remove-Item "status-out.txt", "status-err.txt" -ErrorAction SilentlyContinue
+
+        if ($pollProc.ExitCode -eq 0 -and $pollJson) {
             try {
-                $pollRes2 = $pollJson | ConvertFrom-Json
-                $state = $pollRes2.state
+                $pollRes = $pollJson | ConvertFrom-Json
+                $state = $pollRes.state
                 $platformStatus = if ($state.status) { $state.status } else { "unknown" }
 
                 if ($platformStatus -eq "stopped_with_code") {
