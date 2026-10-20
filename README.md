@@ -2,6 +2,34 @@
 
 **Agent Flare** — Hermes Agent deployed on Cloudflare Sandbox with Hermes Desktop GUI connectivity via Cloudflare Tunnel.
 
+## Architecture at a glance
+
+**Agent Flare** runs the Hermes AI agent in a custom Python container on Cloudflare, driven from a desktop UI on your laptop — with the container's state snapshotted to R2 as squashfs so it survives the ephemeral container lifecycle.
+
+```
+┌─────────────────────┐  cloudflared access tcp    ┌──────────────────────────────┐
+│  Laptop             │  (outbound-only tunnel)    │  Cloudflare Edge             │
+│  Hermes Desktop UI  │───────────────────────────▶│  Access (JWT auth)           │
+│  localhost:9119     │  no inbound ports anywhere │  Hono Worker (provisioning,  │
+└─────────────────────┘                            │  wake/stop, snapshot APIs)   │
+                                                   └───────────────┬──────────────┘
+                                                                   │ per-user Tunnel
+                                                   ┌───────────────▼──────────────┐
+                                                   │  Python container            │
+                                                   │  (cloudflare/sandbox-python) │
+                                                   │  Hermes agent + cloudflared  │
+                                                   │  mksquashfs ────▶ R2 snapshots
+                                                   └──────────────────────────────┘
+```
+
+The five moves:
+
+1. **Desktop UI runs locally.** The Hermes Desktop GUI lives on your laptop and connects to `localhost:9119` — it is never hosted in the cloud.
+2. **Cloudflared bridges laptop → cloud.** The desktop client runs `cloudflared access tcp`, which dials an outbound-only connection through Cloudflare Access to the user's tunnel. No inbound ports are open on the laptop, and the container is never directly exposed.
+3. **Per-user Python containers on Cloudflare.** Each user's agent runs in its own container (base image `cloudflare/sandbox:0.12.7-python`) alongside a Hono Worker that provisions the tunnel, wakes and stops containers, and exposes snapshot/admin APIs.
+4. **Squashfs state backups to R2 — every 5 minutes and at shutdown.** The container filesystem is ephemeral: the container's live state (`/home/hermes/.hermes`) is archived with `mksquashfs` on a 5-minute cadence (Worker cron; `SNAPSHOT_INTERVAL_MINUTES`), the SDK uploads the archive through the bound R2 bucket (no presigned URLs, no credentials in the container), and one last snapshot is taken just before the container is stopped (`SIGTERM`) or destroyed. On the next boot the newest archive is `unsquashfs`-extracted back in, so the agent resumes exactly where it left off. Slot-filling retention pruning keeps the snapshot history small.
+5. **Cloudflare Access in front of everything.** All public hostnames sit behind Cloudflare Access (JWT verification on every request); `workers.dev` exposure is disabled. The only authenticated way in is through Access, and tunnel credentials for each user live in a dedicated KV namespace rather than in the R2 backup bucket.
+
 ## Overview
 
 This project deploys the Hermes AI Agent inside Cloudflare Sandbox containers, using Cloudflare Tunnel for secure connectivity from a local Hermes Desktop GUI. A serverless Worker (Hono) provisions Cloudflare Tunnels per user and manages container wake/stop; user state persists in R2 as squashfs backups written by the Sandbox SDK.
