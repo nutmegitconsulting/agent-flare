@@ -8,15 +8,15 @@ set -e
 # NEVER sees setEnvVars values. All per-user values arrive via a file the
 # Worker writes on /api/wake:
 #   /run/hermes-bootstrap.json  - { userId, cloudflaredToken, dashboardSessionToken }
-#   /tmp/restore-done           - marker: Worker finished restoreBackup (or there
-#                                 was no backup). Written AFTER restoreBackup, or
-#                                 immediately when no backup exists.
 #
 # Persistence is owned by the WORKER (createBackup/restoreBackup via the
 # Sandbox SDK). This script performs NO snapshots and NO uploads — the SDK
-# handles the container side of mksquashfs/unsquashfs. Our only coordination
-# point is the restore gate below: wait for /tmp/restore-done so the first
-# `hermes serve` reads the restored tree, not the empty image default.
+# handles the container side of mksquashfs/unsquashfs. There is NO boot gate
+# (G1): the Worker writes the bootstrap file and runs the restore while the
+# container is still booting — the wake's container calls are what boot it —
+# so `hermes serve` starts immediately on the restored tree. Snapshots are
+# kept small (H3 empty-tree guard in src/persistence.ts), which keeps
+# restores inside that boot window.
 # =============================================================================
 
 LOG_FILE="/var/log/hermes-startup.log"
@@ -47,40 +47,10 @@ if ! command -v cloudflared &> /dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
-# RESTORE GATE (the one coordination point with the Worker).
-# The Worker restores the newest backup into /home/hermes via restoreBackup,
-# then writes /tmp/restore-done. Poll for it so `hermes serve` does not start
-# on the empty image tree before the restore lands. Order-independent: wake may
-# arrive before or after this script starts; the poll covers both.
-#
-# If the marker never arrives within the cap (e.g. the container was started
-# without a wake), the cap still releases and serve starts on whatever is on
-# disk. A fresh user's wake writes the marker immediately (restored:false), so
-# fresh boots do not wait out the full window.
+# Snapshot-friendly perms so the SDK's mksquashfs can read everything on the
+# next createBackup (the Worker's restore, if any, lands while we're still
+# coming up).
 # ---------------------------------------------------------------------------
-RESTORE_MARKER="/tmp/restore-done"
-RESTORE_WAITED=0
-RESTORE_TIMEOUT=120
-status "Waiting for restore marker from Worker..."
-log "Waiting for restore marker from Worker..."
-while [ ! -e "$RESTORE_MARKER" ]; do
-    sleep 2
-    RESTORE_WAITED=$((RESTORE_WAITED + 2))
-    if [ $RESTORE_WAITED -ge $RESTORE_TIMEOUT ]; then
-        break
-    fi
-done
-if [ -e "$RESTORE_MARKER" ]; then
-    log "Restore marker received ($(cat "$RESTORE_MARKER" 2>/dev/null || echo '?')) after ${RESTORE_WAITED}s."
-    status "Restore marker received. Starting..."
-else
-    log "No restore marker within ${RESTORE_TIMEOUT}s (waited ${RESTORE_WAITED}s). Starting on current disk state."
-    status "No restore marker. Starting on current state."
-fi
-rm -f "$RESTORE_MARKER"
-
-# Snapshot-friendly perms for the (possibly just-restored) tree so the SDK's
-# mksquashfs can read everything on the next createBackup.
 chown -R hermes:hermes "$HERMES_HOME" 2>/dev/null || true
 chmod -R a+rX "$HERMES_HOME" 2>/dev/null || true
 
@@ -174,6 +144,13 @@ _term() {
     exit 0
 }
 trap _term SIGTERM
+
+# ---------------------------------------------------------------------------
+# Fixed 15s head start: the Worker's wake writes the bootstrap file and runs
+# the SDK restore/inject while this script is coming up. Sleep once, then exec
+# serve — no marker file, no Worker coupling, every boot pays the same 15s.
+# ---------------------------------------------------------------------------
+sleep 15
 
 # ---------------------------------------------------------------------------
 # Start Hermes (foreground - script blocks here; container sleeps after idle)

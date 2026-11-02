@@ -343,11 +343,32 @@ app.post("/api/wake", async (c) => {
     console.error(`[wake] active-user registry write failed for ${userId}: ${e?.message || e}`);
   }
 
-  // SDK-native restore: extract the newest backup into /home/hermes before the
-  // boot script unblocks. restoreLatest no-ops (returns false) when no backup
-  // exists, and clears a stale handle when the backup has expired/been pruned.
-  // A failed restore must NOT fail the wake — surface it in the response and
-  // let the container come up on whatever is on disk.
+  // W1: bootstrap file FIRST — before restore/injectProviders. It only carries
+  // what the CMD genuinely needs (tunnel + dashboard session tokens; no upload
+  // token / Access JWT / URLs — the container performs no uploads, the SDK
+  // uploads backups through the bound R2), so writing it up front means the
+  // tunnel and dashboard auth come up even when a later step hangs or fails.
+  // Written on every wake so a rotated token / refreshed dashboard session
+  // token is picked up live (the CMD re-reads the file on each use).
+  try {
+    const bootstrap = JSON.stringify({
+      userId,
+      cloudflaredToken: tunnelToken,
+      dashboardSessionToken: sessionToken,
+    });
+    await sandbox.writeFile("/run/hermes-bootstrap.json", bootstrap);
+  } catch (e: any) {
+    console.error(`[wake] bootstrap write failed for ${userId}: ${e?.message || e}`);
+  }
+
+  // SDK-native restore: extract the newest VALID backup into /home/hermes
+  // (H1: empty-tree and missing-blob index entries are skipped, so a
+  // fresh-boot container's empty snapshot can never shadow real data).
+  // restoreLatest no-ops (returns false) when no valid backup exists. In
+  // practice this completes while the container is still booting — this wake
+  // is what boots it — and `hermes serve` (no boot gate since G1) starts on
+  // the restored tree. A failed restore must NOT fail the wake — surface it
+  // in the response and let the container run on whatever is on disk.
   let restored = false;
   let restoreError: string | undefined;
   try {
@@ -357,11 +378,11 @@ app.post("/api/wake", async (c) => {
     console.error(`[wake] restore failed for ${userId} (continuing): ${restoreError}`);
   }
 
-  // V8 provider injection — must complete BEFORE the boot script unblocks,
-  // so the first `hermes serve` reads config.yaml with its custom_providers
-  // section and .env with the key_env credentials. Same failure policy as
-  // restore: never fail the wake; the container boots without custom
-  // providers (today's behavior) and the error surfaces in the response.
+  // V8 provider injection — runs AFTER the restore so the restored tree's
+  // config.yaml/.env cannot clobber the injected custom_providers section and
+  // key_env credentials. Same failure policy as restore: never fail the wake;
+  // the container boots without custom providers and the error surfaces in
+  // the response.
   let providersWritten = 0;
   let providersError: string | undefined;
   try {
@@ -373,30 +394,6 @@ app.post("/api/wake", async (c) => {
   } catch (e: any) {
     providersError = e?.message || String(e);
     console.error(`[wake] provider injection failed for ${userId} (continuing): ${providersError}`);
-  }
-
-  // Unblock the boot poll. start-hermes.sh gates on /tmp/restore-done — written
-  // after restoreBackup succeeds (or immediately when no backup exists) so the
-  // first `hermes serve` reads the restored tree.
-  try {
-    await sandbox.writeFile("/tmp/restore-done", "restored:" + restored);
-  } catch (e: any) {
-    console.error(`[wake] restore-done marker write failed for ${userId}: ${e?.message || e}`);
-  }
-
-  // Bootstrap file — SHRUNK to what the CMD genuinely needs. No upload token,
-  // Access JWT, or URLs: the container performs no uploads anymore (the SDK
-  // uploads backups through the bound R2). Written on every wake so a rotated
-  // token / refreshed dashboard session token is picked up live.
-  try {
-    const bootstrap = JSON.stringify({
-      userId,
-      cloudflaredToken: tunnelToken,
-      dashboardSessionToken: sessionToken,
-    });
-    await sandbox.writeFile("/run/hermes-bootstrap.json", bootstrap);
-  } catch (e: any) {
-    console.error(`[wake] bootstrap write failed for ${userId}: ${e?.message || e}`);
   }
 
   // Warmup ping to force container creation if sleeping
@@ -536,6 +533,9 @@ app.post("/api/admin/snapshot", async (c) => {
   const t0 = Date.now();
   try {
     const handle = await createSnapshot(sandbox, c.env.BACKUP_BUCKET, userId);
+    if (!handle) {
+      return c.json({ userId, ok: true, skipped: true, duration_ms: Date.now() - t0 });
+    }
     return c.json({ userId, ok: true, handle, duration_ms: Date.now() - t0 });
   } catch (e: any) {
     return c.json({ userId, ok: false, error: e?.message || String(e), duration_ms: Date.now() - t0 }, 500);

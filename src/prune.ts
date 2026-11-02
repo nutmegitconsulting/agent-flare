@@ -1,18 +1,19 @@
 import type { R2Bucket } from "@cloudflare/workers-types";
+import type { DirectoryBackup } from "@cloudflare/sandbox";
 
 export interface BackupEntry {
   id: string;
   dir: string;
   createdAt: string;
+  /** Full SDK restore handle (always present in V8+ entries) */
+  handle: DirectoryBackup;
 }
 
-const HANDLE_KEY = "backup-handle.json";
 const INDEX_KEY  = "backups-index.json";
 
 function keysFor(userId: string) {
   return {
-    handle: `users/${userId}/${HANDLE_KEY}`,
-    index:  `users/${userId}/${INDEX_KEY}`,
+    index: `users/${userId}/${INDEX_KEY}`,
   };
 }
 

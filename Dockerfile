@@ -1,7 +1,7 @@
 # =============================================================================
 # Hermes Agent on Cloudflare Sandbox (V9 — hermes-flare install/profile split)
 # =============================================================================
-# Base: cloudflare/sandbox:0.12.7-python (matches @cloudflare/sandbox version).
+# Base: cloudflare/sandbox:0.12.14-python (matches @cloudflare/sandbox version).
 #
 # LAYOUT (install vs. user-state separated so snapshots stay small):
 #   /opt/hermes-install           code + venv + Node bundle + managed uv (~1.5-2 GB)
@@ -13,7 +13,7 @@
 # install artifacts. The container ends as root so the SDK can run mksquashfs.
 # =============================================================================
 
-FROM docker.io/cloudflare/sandbox:0.12.7-python
+FROM docker.io/cloudflare/sandbox:0.12.14-python
 
 USER root
 
@@ -58,14 +58,11 @@ RUN mkdir -p /opt/hermes-install /opt/uv /home/hermes/.hermes \
 USER hermes
 WORKDIR /home/hermes
 ENV HOME=/home/hermes
+ARG CACHE_BUST=2
 RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_PYTHON_BIN_DIR=/opt/uv/bin \
     curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
       | bash -s -- --skip-setup --non-interactive --hermes-home /opt/hermes-install \
-    && test -x /opt/hermes-install/bin/uv \
-    && ls -la /opt/hermes-install/hermes-agent \
-    # Strip install-time caches — uv wheels/npm cache land in $HOME and are
-    # hundreds of MB we don't need at runtime.
     && rm -rf /home/hermes/.cache /home/hermes/.npm \
     && chown -R hermes:hermes /opt/uv /home/hermes
 
@@ -75,8 +72,14 @@ ENV PATH=/home/hermes/.local/bin:/opt/hermes-install/node/bin:/usr/local/bin:$PA
 # Snapshot-friendly perms: createBackup's mksquashfs needs everything readable.
 RUN chmod -R a+rX /home/hermes
 
-# Container runs as root at runtime so the Sandbox SDK can run mksquashfs.
+# The container runs as root at runtime so the Sandbox SDK can run mksquashfs,
+# but hermes refuses to update a checkout owned by a different uid than the
+# running one — serve exited 1 on every boot with "refusing to update
+# /opt/hermes-install/hermes-agent: owned by uid 1000, not the current uid 0".
+# The install tree (and uv-managed python) must be root-owned; /home/hermes
+# stays hermes-owned (runtime data, re-chowned at boot).
 USER root
+RUN chown -R root:root /opt/hermes-install /opt/uv
 
 # --- Startup ---
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh

@@ -61,18 +61,18 @@ Usable credentials (tunnel token, dashboard session token, gateway JWT) do NOT l
 
 Backup lifecycle:
 
-- **Restore:** `/api/wake` calls `restoreLatest()` (extracts the newest handle into `/home/hermes`) and writes `/tmp/restore-done` to unblock the boot script. A missing/expired handle is treated as a fresh start; a failed restore does not fail the wake.
+- **Restore:** `/api/wake` writes the bootstrap file first (tunnel + dashboard tokens), then calls `restoreLatest()` (restores the newest VALID backup into `/home/hermes`; empty-tree/missing blobs are skipped). No boot gate — `hermes serve` starts immediately on boot; a failed restore does not fail the wake.
 - **Periodic snapshots:** a Worker cron fires every 10 minutes; for each user in `active-users.json` whose container is `running`, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES` (default 60). Sleeping containers are skipped.
 - **Final snapshots:** `/api/admin/stop` and `/api/admin/destroy` take a best-effort final backup before stopping/destroying.
 - **Retention:** slot-filling retention pruning runs on the `0 */2 * * *` Worker cron for every user in `active-users.json` (also on demand via `POST /api/admin/prune`): newest-first, it keeps one backup per 5-minute slot for backups younger than 2h, one per hourly slot for backups younger than 24h, then the newest 5 distinct calendar-day slots and newest 5 distinct ISO-week slots regardless of age, and never deletes the absolute newest backup; everything else is deleted (`backups/<id>/data.sqsh` + `meta.json`). The SDK backup TTL itself is 365 days, so any backup that survives pruning stays restorable.
-- **Integrity:** every snapshot and restore checks a sentinel file (`/home/hermes/.local/bin/hermes`) to detect partial extractions and refuse to archive a corrupt tree.
+- **Integrity:** restore candidates are validated against their SDK-written `meta.json` (blob must exist and exceed a minimum size, so an empty-tree snapshot can never shadow real data); `createSnapshot` refuses to snapshot an empty tree when history exists.
 
 ### Container image
 
-- Base: `cloudflare/sandbox:0.12.7-python`
+- Base: `cloudflare/sandbox:0.12.14-python`
 - Install (code, venv, Node bundle, uv CPython) lands in `/opt/hermes-install` + `/opt/uv`; `/home/hermes/.hermes` ships empty and only the tiny `hermes` wrapper lives in the snapshot tree
 - Container runs as root at runtime so the SDK can run `mksquashfs`
-- `start-hermes.sh` polls for `/tmp/restore-done` (120 s cap) before starting `hermes serve`
+- `start-hermes.sh` has no boot gate — `hermes serve` starts immediately on boot; the wake's restore completes during container boot in the common case
 
 ## API
 

@@ -248,8 +248,10 @@ export interface InjectResult {
 /**
  * Merge providers into the container's config.yaml + .env.
  *
- * Called from /api/wake AFTER restoreLatest and BEFORE the /tmp/restore-done
- * marker, so `hermes serve` never starts without its provider section.
+ * Called from /api/wake AFTER restoreLatest, so the restored tree's
+ * config.yaml/.env cannot clobber the injected section (no boot gate since
+ * G1 — the wake's container calls complete during container boot in the
+ * common case).
  * A failure here must not fail the wake — the caller try/catches and
  * surfaces `providersError` in the response (container boots without the
  * custom providers, same as today).
@@ -261,13 +263,8 @@ export async function injectProviders(sandbox: Sandbox, kv: KVNamespace, bucket:
   const gatewayJwt = await loadGatewayJwt(kv, userId);
   const { yaml, envLines, defaultModel, errors } = renderCustomProviders(stored, { aiApiToken, gatewayJwt });
 
-  if (Object.keys(envLines).length === 0) {
-    // Nothing injectable (e.g. jwt configured but no JWT delivered yet).
-    return { providersIngested: stored.length, providersWritten: 0, errors };
-  }
-
   // 1. config.yaml — read, merge the bannered section, write back (SDK
-  //    writeFile, same primitive as the restore-done marker).
+  //    writeFile primitive).
   let config: string;
   try {
     const res = await sandbox.exec(`cat ${CONFIG_YAML} 2>/dev/null || true`);

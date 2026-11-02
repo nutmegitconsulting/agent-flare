@@ -14,74 +14,60 @@ import { removeFromIndex } from "./prune";
  *
  * Storage layout (multi-tenant — keys namespaced per user; the SDK-owned
  * blobs are globally unique by backup id, so they take no user prefix):
- *   users/<userId>/backup-handle.json   newest DirectoryBackup handle (restore target)
- *   users/<userId>/backups-index.json   array of {id, dir, createdAt} (observability only)
+ *   users/<userId>/backups-index.json   array of {id, dir, createdAt, handle}
  *   backups/<id>/data.sqsh              SDK-written squashfs archive
  *   backups/<id>/meta.json              SDK-written metadata
  *
+ * The index is the single source of truth for restores. The newest entry
+ * (by createdAt) is the restore target.
+ *
  * Retention: this module NEVER deletes backups. The user manages retention
- * via the R2 bucket's own lifecycle rules (backups/ prefix). The per-backup
+ * via the bucket's own lifecycle rules (backups/ prefix). The per-backup
  * TTL is therefore set to 365 days so the SDK never refuses to restore a
  * backup that still exists in the bucket — the "most recent available backup"
  * is always restorable regardless of how long the bucket keeps it.
  */
-const BACKUP_DIR = "/home/hermes";
+const BACKUP_DIR = "/home/hermes/.hermes";
 const SECONDS_PER_DAY = 86_400;
 /** SDK refuses to restore past (createdAt + ttl). Keep it well beyond the
  *  bucket's retention window so any object still present is restorable. */
 const BACKUP_TTL_SECONDS = 365 * SECONDS_PER_DAY;
-/**
- * Corruption sentinel: a healthy /home/hermes always has a non-empty hermes
- * launcher wrapper at /home/hermes/.local/bin/hermes (baked into the image,
- * pointing at /opt/hermes-install/venv). It is inside the snapshot tree, so
- * every backup carries it; a partial unsquashfs extraction leaves it as a
- * 0-byte regular file. Checked before every snapshot and after every restore.
- */
-const SENTINEL_FILE = "/home/hermes/.local/bin/hermes";
-const HANDLE_KEY_SUFFIX = "backup-handle.json";
 const INDEX_KEY_SUFFIX = "backups-index.json";
+/** H1: an empty-tree squashfs is ~4KB (a fresh-boot container's .hermes holds
+ *  only boot artifacts). Real trees are MBs. Candidates below this size are
+ *  skipped so an empty snapshot can never shadow real data. */
+const MIN_VALID_BACKUP_BYTES = 8192;
 
-async function assertTreeHealthy(sandbox: Sandbox, context: string): Promise<void> {
-  const check = await sandbox.exec(`test -s ${SENTINEL_FILE} && echo __ok__ || true`);
-  if (!check.stdout.includes("__ok__")) {
-    throw new Error(
-      `${context}: ${SENTINEL_FILE} is missing or empty — ${BACKUP_DIR} looks corrupt (partial restore?)`,
-    );
+/** SDK-written metadata for one backup blob (backups/<id>/meta.json). */
+interface BackupMeta {
+  sizeBytes?: number;
+}
+
+/** H1: read one backup's SDK-written meta.json; null when missing/unparseable. */
+async function metaFor(bucket: R2Bucket, backupId: string): Promise<BackupMeta | null> {
+  const obj = await bucket.get(`backups/${backupId}/meta.json`);
+  if (!obj) return null;
+  try {
+    return (await obj.json()) as BackupMeta;
+  } catch {
+    return null;
   }
 }
 
 /** Per-user R2 key namespace. */
 function keysFor(userId: string) {
-  const prefix = `users/${userId}/`;
   return {
-    handle: prefix + HANDLE_KEY_SUFFIX,
-    index: prefix + INDEX_KEY_SUFFIX,
+    index: `users/${userId}/${INDEX_KEY_SUFFIX}`,
   };
 }
 
-async function getStoredHandle(bucket: R2Bucket, key: string): Promise<DirectoryBackup | null> {
-  const obj = await bucket.get(key);
-  if (!obj) return null;
-  return obj.json();
-}
-
-async function storeHandle(
-  bucket: R2Bucket,
-  key: string,
-  handle: DirectoryBackup,
-): Promise<void> {
-  await bucket.put(key, JSON.stringify(handle));
-}
-
-async function deleteStoredHandle(bucket: R2Bucket, key: string): Promise<void> {
-  await bucket.delete(key);
-}
-
 /** One retained backup. `backups-index.json` is an array of these. */
-interface BackupEntry {
+export interface BackupEntry {
   id: string;
   dir: string;
   createdAt: string; // ISO 8601
+  /** Full SDK restore handle */
+  handle: DirectoryBackup;
 }
 
 async function getIndex(bucket: R2Bucket, key: string): Promise<BackupEntry[]> {
@@ -99,11 +85,16 @@ async function putIndex(bucket: R2Bucket, key: string, entries: BackupEntry[]): 
 }
 
 /**
- * Restore the latest backup if one exists. Returns true if a restore ran.
+ * Restore the newest VALID backup if one exists. Returns true if a restore ran.
  *
- * Called exactly once, from /api/wake, before the boot script unblocks. A
- * failed restore must NOT fail the wake — the caller wraps this and surfaces
- * the error in the response instead of keeping the container down.
+ * H1: candidates are walked newest-first and validated against their
+ * SDK-written meta.json before restoring — entries whose blob is missing or
+ * an empty-tree snapshot are skipped, so a poisoned index (e.g. a cron
+ * snapshot of a fresh-boot container that never hydrated) cannot shadow real
+ * data. Expired/gone entries are removed from the index and the walk
+ * continues to older candidates. A failed restore must NOT fail the wake —
+ * the caller wraps this and surfaces the error in the response instead of
+ * keeping the container down.
  */
 export async function restoreLatest(
   sandbox: Sandbox,
@@ -111,11 +102,16 @@ export async function restoreLatest(
   userId: string,
 ): Promise<boolean> {
   const keys = keysFor(userId);
-  const handle = await getStoredHandle(bucket, keys.handle);
-  if (!handle) {
+  const index = await getIndex(bucket, keys.index);
+  if (index.length === 0) {
     console.log(`[persistence:${userId}] no prior backup, starting fresh`);
     return false;
   }
+
+  // Sort newest-first, then walk candidates until one is valid.
+  const sorted = [...index].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
 
   // Clear any stale FUSE overlay before re-restoring (no-op on the localBucket
   // path, which uses unsquashfs extraction rather than a FUSE mount).
@@ -125,39 +121,71 @@ export async function restoreLatest(
     /* may not be mounted */
   }
 
-  console.log(`[persistence:${userId}] restoring backup ${handle.id}`);
-  const t0 = Date.now();
-  try {
-    await sandbox.restoreBackup(handle);
-    await assertTreeHealthy(sandbox, `restore ${handle.id}`);
-    console.log(`[persistence:${userId}] restored in ${Date.now() - t0}ms`);
-    return true;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (/BACKUP_EXPIRED|BACKUP_NOT_FOUND|BackupExpiredError|BackupNotFoundError|Backup not found|has expired/i.test(msg)) {
-      console.log(`[persistence:${userId}] backup ${handle.id} gone, clearing handle`);
-      await deleteStoredHandle(bucket, keys.handle);
-      await removeFromIndex(bucket, userId, handle.id);
-      return false;
+  for (const candidate of sorted) {
+    const meta = await metaFor(bucket, candidate.id);
+    if (!meta || !meta.sizeBytes || meta.sizeBytes < MIN_VALID_BACKUP_BYTES) {
+      console.log(
+        `[persistence:${userId}] skipping backup ${candidate.id} (sizeBytes=${meta?.sizeBytes ?? "missing"} < ${MIN_VALID_BACKUP_BYTES}, or blob gone)`,
+      );
+      continue;
     }
-    throw err;
+
+    console.log(`[persistence:${userId}] restoring backup ${candidate.id}`);
+    const t0 = Date.now();
+    try {
+      await sandbox.restoreBackup(candidate.handle);
+      console.log(`[persistence:${userId}] restored ${candidate.id} in ${Date.now() - t0}ms`);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/BACKUP_EXPIRED|BACKUP_NOT_FOUND|BackupExpiredError|BackupNotFoundError|Backup not found|has expired/i.test(msg)) {
+        console.log(`[persistence:${userId}] backup ${candidate.id} gone, removing from index, trying older`);
+        await removeFromIndex(bucket, userId, candidate.id);
+        continue;
+      }
+      throw err;
+    }
   }
+
+  console.log(`[persistence:${userId}] no valid backup among ${sorted.length} entries, starting fresh`);
+  return false;
 }
 
 /**
- * Snapshot /home/hermes to R2 and record it as the newest handle.
+ * Snapshot /home/hermes/.hermes to R2 and record it in the index.
+ *
+ * H3: refuses to snapshot an empty tree when history exists. A fresh-boot
+ * container's .hermes holds only boot artifacts (.startup-status, .env);
+ * snapshotting that would make the empty tree the index's newest entry and
+ * poison every future restore. Returns null when skipped. A genuinely fresh
+ * user (no index entries) still gets a baseline snapshot.
  *
  * No pruning happens here — the user owns retention via the bucket's
  * lifecycle rules. The index is appended to (for observability / manual
- * reference) and the handle always points at the newest backup.
+ * reference) and the newest entry is the restore target.
  */
 export async function createSnapshot(
   sandbox: Sandbox,
   bucket: R2Bucket,
   userId: string,
-): Promise<DirectoryBackup> {
+): Promise<DirectoryBackup | null> {
   const keys = keysFor(userId);
-  await assertTreeHealthy(sandbox, "pre-snapshot check");
+
+  // H3 content check: real content = any file besides boot artifacts.
+  const [contentCheck, existingIndex] = await Promise.all([
+    sandbox.exec(
+      `find ${BACKUP_DIR} -type f ! -name '.startup-status' ! -name '.env' 2>/dev/null | head -5`,
+    ),
+    getIndex(bucket, keys.index),
+  ]);
+  const hasContent = (contentCheck.stdout || "").trim().length > 0;
+  if (!hasContent && existingIndex.length > 0) {
+    console.log(
+      `[persistence:${userId}] skipping snapshot: .hermes has no real content and ${existingIndex.length} backups exist`,
+    );
+    return null;
+  }
+
   // Ensure permissions are readable for mksquashfs.
   await sandbox.exec(`chmod -R a+rX ${BACKUP_DIR} 2>/dev/null; true`);
 
@@ -176,19 +204,18 @@ export async function createSnapshot(
   const createdAt = new Date().toISOString();
   console.log(`[persistence:${userId}] snapshot ${handle.id} created in ${Date.now() - t0}ms`);
 
-  // Append to the index (observability only — we do not prune).
+  // Append to the index. The full handle is stored so restoreLatest can use
+  // the index as the single source of truth.
   const index = await getIndex(bucket, keys.index);
-  index.push({ id: handle.id, dir: handle.dir, createdAt });
+  index.push({ id: handle.id, dir: handle.dir, createdAt, handle });
   await putIndex(bucket, keys.index, index);
-  await storeHandle(bucket, keys.handle, handle); // newest = restore target
   return handle;
 }
 
 /**
- * Snapshot /home/hermes only if the latest backup is older than maxAgeMs (or
- * there is none). Cheap to call on every cron tick — one R2 HEAD on the fast
- * path. Reuses backup-handle.json's own upload time, so there's no extra
- * state to track. Returns true if a snapshot was taken.
+ * Snapshot /home/hermes/.hermes only if the latest backup is older than
+ * maxAgeMs (or there is none). Cheap to call on every cron tick — one R2
+ * HEAD on the fast path. Returns true if a snapshot was taken.
  */
 export async function snapshotIfDue(
   sandbox: Sandbox,
@@ -196,8 +223,9 @@ export async function snapshotIfDue(
   userId: string,
   maxAgeMs: number,
 ): Promise<boolean> {
-  const meta = await bucket.head(keysFor(userId).handle);
+  const keys = keysFor(userId);
+  const meta = await bucket.head(keys.index);
   if (meta && Date.now() - meta.uploaded.getTime() < maxAgeMs) return false;
-  await createSnapshot(sandbox, bucket, userId);
-  return true;
+  const handle = await createSnapshot(sandbox, bucket, userId);
+  return handle !== null;
 }
