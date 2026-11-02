@@ -100,6 +100,15 @@ The repo ships `wrangler.example.jsonc` as a sanitized template. Copy it and fil
 cp wrangler.example.jsonc wrangler.jsonc
 ```
 
+Also copy the example script templates and edit them with your deployment URLs:
+
+```powershell
+Copy-Item scripts\setup-client.example.ps1 scripts\setup-client.ps1
+Copy-Item scripts\hermes-client.example.ps1 scripts\hermes-client.ps1
+Copy-Item scripts\reference-providers.example.json scripts\reference-providers.json
+# then set your Worker/Access URLs and your gateway base_url
+```
+
 Edit `wrangler.jsonc`:
 
 1. **KV namespace ID**: replace `YOUR_KV_NAMESPACE_ID` with the ID from Step 2
@@ -138,7 +147,7 @@ Set plain text variables via the **Cloudflare dashboard** (recommended — keeps
 Alternatively, you can pass plain text variables at deploy time with the `--var` flag:
 
 ```bash
-npx wrangler deploy --var ACCESS_AUD_TAG:<your-aud> --var CF_ACCOUNT_ID:<your-account> --var CF_ZONE_ID:<your-zone> --var SNAPSHOT_INTERVAL_MINUTES:5
+npx wrangler deploy --var ACCESS_AUD_TAG:<your-aud> --var CF_ACCOUNT_ID:<your-account> --var CF_ZONE_ID:<your-zone> --var SNAPSHOT_INTERVAL_MINUTES:10
 ```
 
 **Note:** `CF_API_TOKEN` must be a secret (encrypted). `ACCESS_AUD_TAG`, `CF_ACCOUNT_ID`, `CF_ZONE_ID`, and `SNAPSHOT_INTERVAL_MINUTES` are plain text variables — they should not be committed to the repo, but they do not require encryption.

@@ -236,7 +236,7 @@ app.post("/api/client-init", async (c) => {
   const tunnelToken = tunnelJson.result.token;
 
   // Per-user tunnel hostname under the tenant's own subdomain. TUNNEL_BASE_DOMAIN
-  // must be set in wrangler vars (e.g. "nutmegit.com" → hermes-<user>.nutmegit.com,
+  // must be set in wrangler vars (e.g. "agents.example.com" → hermes-<user>.agents.example.com,
   // or "hermes-agent.example.com" → hermes-<user>.hermes-agent.example.com). DNS record is
   // created in the zone CF_ZONE_ID — the API token only needs Zone:DNS:Edit there.
   const baseDomain = c.env.TUNNEL_BASE_DOMAIN;

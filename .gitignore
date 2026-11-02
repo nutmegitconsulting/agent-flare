@@ -11,3 +11,12 @@ users/
 active-users.json
 wrangler.jsonc
 .hermes/
+
+# Local copies of the script templates (contain your deployment's URLs)
+scripts/setup-client.ps1
+scripts/hermes-client.ps1
+scripts/stop-instance.ps1
+scripts/destroy-instance.ps1
+scripts/stop-instance.sh
+scripts/destroy-instance.sh
+scripts/reference-providers.json
