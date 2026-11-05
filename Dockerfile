@@ -1,8 +1,10 @@
 # =============================================================================
 # Hermes Agent on Cloudflare Sandbox (V9 — hermes-flare install/profile split)
 # =============================================================================
-# Base: cloudflare/sandbox:0.12.14-python (matches @cloudflare/sandbox version).
-# Serves the Hermes webapp on port 443 once the Worker has hydrated the home.
+# Base: cloudflare/sandbox:0.12.14-python (matches @cloudflare/sandbox version), pinned by digest so a
+# local image with the same tag can't quietly become the base of a production build.
+# Serves the Hermes webapp on its default port, 9120, once the Worker has hydrated the home. Browsers
+# use 443 at Cloudflare; only the Worker can reach this port.
 #
 # LAYOUT (install vs. user-state separated so snapshots stay small):
 #   /opt/hermes-install           code + venv + Node bundle + managed uv (~1.5-2 GB)
@@ -14,9 +16,11 @@
 # caches, logs and secrets. The container ends as root so the SDK can run mksquashfs.
 # =============================================================================
 
-FROM docker.io/cloudflare/sandbox:0.12.14-python
+ARG AF_BASE_IMAGE=docker.io/cloudflare/sandbox:0.12.14-python@sha256:226351e2bbb2ab1f97f921e3e5930d7eb908a8f79865aa04b9a41553b2260230
+FROM ${AF_BASE_IMAGE}
 
 USER root
+COPY --chmod=644 container/build-ca-env.sh /usr/local/lib/af-build-ca-env
 
 # Without pipefail a failed `curl | bash` builds an image with no Hermes in it.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -60,7 +64,9 @@ ENV HOME=/home/hermes
 # Tested Hermes commit. The webapp and its auth internals move fast, so bump this
 # deliberately and re-run tests/container/run.sh.
 ARG HERMES_COMMIT=ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df
-RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+RUN --mount=type=secret,id=build_ca,uid=1000,required=false \
+    . /usr/local/lib/af-build-ca-env \
+    && UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_PYTHON_BIN_DIR=/opt/uv/bin \
     curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
       | bash -s -- --skip-setup --non-interactive --skip-browser --commit "$HERMES_COMMIT" --hermes-home /opt/hermes-install \
@@ -71,7 +77,9 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/uv/python \
 ENV PATH=/home/hermes/.local/bin:/opt/hermes-install/node/bin:/usr/local/bin:$PATH
 
 # Build the webapp bundle into the image; users must not wait for it at boot.
-RUN HERMES_HOME=/opt/hermes-install hermes webapp --build-only \
+RUN --mount=type=secret,id=build_ca,uid=1000,required=false \
+    . /usr/local/lib/af-build-ca-env \
+    && HERMES_HOME=/opt/hermes-install hermes webapp --build-only \
     && test -f /opt/hermes-install/hermes-agent/apps/desktop/dist-webapp/index.html
 
 # The container runs as root at runtime so the Sandbox SDK can run mksquashfs,
@@ -89,14 +97,15 @@ COPY --chown=root:root container/plugins/cloudflare_access /opt/hermes-install/h
 COPY --chown=root:root container/af_state.py /usr/local/lib/af_state.py
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
 # af-python: Hermes' own venv, which provides ruamel.yaml for af_state.py.
-RUN chmod +x /usr/local/bin/start-hermes.sh \
+RUN rm -f /usr/local/lib/af-build-ca-env \
+    && chmod +x /usr/local/bin/start-hermes.sh \
     && printf '#!/bin/sh\nexec %s "$@"\n' "$(ls -d /opt/hermes-install/installs/*/environments/*/venv/bin/python | head -1)" > /usr/local/bin/af-python \
     && chmod +x /usr/local/bin/af-python \
     && af-python -c "import ruamel.yaml" \
     && HERMES_HOME=/opt/hermes-install hermes --version
 
 # The Worker reaches this through the sandbox, so wrangler must see the port.
-EXPOSE 443
+EXPOSE 9120
 
 # sandbox binary is ENTRYPOINT; CMD is spawned as child.
 CMD ["/usr/local/bin/start-hermes.sh"]

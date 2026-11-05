@@ -8,6 +8,7 @@ dist/
 .dev.vars.*
 !.dev.vars.example
 wrangler.jsonc
+wrangler.prod.jsonc
 .hermes/
 __pycache__/
 # Your real templates can name people and internal settings. templates/example is the only tracked one.

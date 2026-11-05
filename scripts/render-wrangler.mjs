@@ -2,7 +2,9 @@
 // Writes wrangler.jsonc from wrangler.example.jsonc and environment variables, so the
 // tracked repo holds no deployment details. Used locally and by the GitHub deploy workflow.
 //   AF_HOSTNAME  ACCESS_TEAM_DOMAIN  ACCESS_AUD_TAG  AF_KV_ID   required
-//   AF_R2_BUCKET  AF_ADMIN_EMAILS  AF_MAX_INSTANCES  AF_WORKER_NAME   optional
+//   AF_R2_BUCKET  AF_ADMIN_EMAILS  AF_MAX_INSTANCES  AF_WORKER_NAME  AF_TEMPLATE_SECRETS   optional
+//   AF_IMAGE   a pushed registry image to run instead of building ./Dockerfile
+//   AF_WRANGLER_OUT   file to write; default wrangler.jsonc
 import { readFileSync, writeFileSync } from "node:fs";
 
 const env = process.env;
@@ -21,11 +23,14 @@ const replacements = [
   ['"bucket_name": "agent-flare-state"', `"bucket_name": "${env.AF_R2_BUCKET || "agent-flare-state"}"`],
   ['"ADMIN_EMAILS": ""', `"ADMIN_EMAILS": "${env.AF_ADMIN_EMAILS || ""}"`],
   ['"max_instances": 10', `"max_instances": ${Number(env.AF_MAX_INSTANCES) || 10}`],
+  ['"TEMPLATE_SECRETS": ""', `"TEMPLATE_SECRETS": "${env.AF_TEMPLATE_SECRETS || ""}"`],
+  ['"image": "./Dockerfile"', `"image": "${env.AF_IMAGE || "./Dockerfile"}"`],
 ];
 let text = readFileSync("wrangler.example.jsonc", "utf8");
 for (const [from, to] of replacements) {
   if (!text.includes(from)) throw new Error(`template no longer contains ${from}`);
   text = text.replace(from, to);
 }
-writeFileSync("wrangler.jsonc", text);
-console.log("wrote wrangler.jsonc");
+const out = env.AF_WRANGLER_OUT || "wrangler.jsonc";
+writeFileSync(out, text);
+console.log(`wrote ${out}`);
