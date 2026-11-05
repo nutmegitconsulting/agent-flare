@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { clearProviderKey, keyStatus, resolveProviderKey, setProviderKey } from "../../src/credentials";
 import { applyOverride, configFingerprint, resolveEffective, withGateway } from "../../src/effective";
 import type { Env } from "../../src/env";
-import { MODEL_TIERS } from "../../src/model-tiers";
 import type { GatewayProviderEntry } from "../../src/providers";
 
 function fakeBucket(objects: Record<string, string>) {
@@ -128,13 +127,5 @@ describe("pending state", () => {
     expect(await configFingerprint(effective({ role: "other" }), { gw: { source: "worker-secret", changedAt: null } })).not.toBe(base);
     expect(await configFingerprint(effective({ providers: [provider({ model: "b" })] }), { gw: { source: "worker-secret", changedAt: null } })).not.toBe(base);
     expect(await configFingerprint(effective(), { gw: { source: "user", changedAt: "2026-11-05" } })).not.toBe(base);
-  });
-});
-
-describe("price tiers", () => {
-  it("hold a tier for every model, and no price", () => {
-    expect(new Set(Object.values(MODEL_TIERS))).toEqual(new Set(["low", "medium", "high"]));
-    expect(JSON.stringify(MODEL_TIERS)).not.toMatch(/\$|\d\.\d\d/);
-    expect(Object.keys(MODEL_TIERS)).toHaveLength(11);
   });
 });

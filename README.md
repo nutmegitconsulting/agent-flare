@@ -137,8 +137,6 @@ Keys are write-only, and sealed in KV. Screens show only whether one is set and 
 
 Every change applies at the user's next boot, and the Users screen shows who's waiting. A user's page can apply it now: that snapshots and then restarts, and if the snapshot fails, nothing changes. A role's default model follows a role change only if the user hasn't picked their own. `config_managed` reapplies every boot; `config_defaults` applies once and is then the user's.
 
-The picker shows a price tier, such as `●●○ / medium`, from `src/model-tiers.ts`.
-
 ## Routes
 
 Everything is behind Access. Anything not listed goes to the caller's Hermes webapp.

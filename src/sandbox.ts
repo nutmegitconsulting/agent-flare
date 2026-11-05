@@ -18,7 +18,6 @@ import type { Env } from "./env";
 import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest, type RestoreOutcome } from "./persistence";
 import { keyStatuses, resolveProviderKey } from "./credentials";
 import { configFingerprint, resolveEffective } from "./effective";
-import { MODEL_TIERS } from "./model-tiers";
 import { renderProviders } from "./providers";
 import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
@@ -223,7 +222,6 @@ export class HermesSandbox extends Sandbox<Env> {
       sub: identity.sub, email: identity.email, name: identity.name ?? "", issuer: identity.issuer,
     }));
     await this.exec(`chmod 600 ${RUN_DIR}/auth.json`);
-    await this.writeFile(`${RUN_DIR}/model-tiers.json`, JSON.stringify(MODEL_TIERS));
     await this.writeFile(`${RUN_DIR}/bundle.json`, JSON.stringify(bundle));
     const result = await this.exec(`${AF_STATE} apply ${HERMES_HOME} ${RUN_DIR}/bundle.json`);
     await this.exec(`rm -f ${RUN_DIR}/bundle.json`);
