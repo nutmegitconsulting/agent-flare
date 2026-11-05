@@ -14,13 +14,17 @@
 #
 # Snapshots come from a staged copy of .hermes (container/af_state.py), minus
 # caches, logs and secrets. The container ends as root so the SDK can run mksquashfs.
+#
+# STAGES: `install` holds everything that needs the network, and any build CA. The
+# final image takes only files from it, in several layers: a chown after installing
+# would rewrite all of it as one 4 GB layer, too big for a registry push to finish
+# and slow to pull on every cold start.
 # =============================================================================
 
 ARG AF_BASE_IMAGE=docker.io/cloudflare/sandbox:0.12.14-python@sha256:226351e2bbb2ab1f97f921e3e5930d7eb908a8f79865aa04b9a41553b2260230
-FROM ${AF_BASE_IMAGE}
+FROM ${AF_BASE_IMAGE} AS system
 
 USER root
-COPY --chmod=644 container/build-ca-env.sh /usr/local/lib/af-build-ca-env
 
 # Without pipefail a failed `curl | bash` builds an image with no Hermes in it.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -58,6 +62,8 @@ ENV UV_NO_CONFIG=1
 RUN mkdir -p /opt/hermes-install /opt/uv /home/hermes/.hermes \
     && chown -R hermes:hermes /opt/hermes-install /opt/uv /home/hermes
 
+FROM system AS install
+COPY --chmod=644 container/build-ca-env.sh /usr/local/lib/af-build-ca-env
 USER hermes
 WORKDIR /home/hermes
 ENV HOME=/home/hermes
@@ -82,14 +88,33 @@ RUN --mount=type=secret,id=build_ca,uid=1000,required=false \
     && HERMES_HOME=/opt/hermes-install hermes webapp --build-only \
     && test -f /opt/hermes-install/hermes-agent/apps/desktop/dist-webapp/index.html
 
+# Sorted into trees for the layers below.
+USER root
+RUN rm -rf /home/hermes/.npm /home/hermes/.cache \
+    && for tree in tools installs cache hermes-agent/.build hermes-agent/node_modules hermes-agent/.git; do \
+         mkdir -p "/split/$tree" && rmdir "/split/$tree" \
+         && mv "/opt/hermes-install/$tree" "/split/$tree"; \
+       done
+
+FROM system
+ENV HOME=/home/hermes
+WORKDIR /home/hermes
+ENV PATH=/home/hermes/.local/bin:/opt/hermes-install/node/bin:/usr/local/bin:$PATH
+
 # The container runs as root at runtime so the Sandbox SDK can run mksquashfs,
 # but hermes refuses to update a checkout owned by a different uid than the
-# running one — serve exited 1 on every boot with "refusing to update
-# /opt/hermes-install/hermes-agent: owned by uid 1000, not the current uid 0".
-# The install tree (and uv-managed python) must be root-owned; /home/hermes
+# running one, so the install tree and uv's Python are root-owned. /home/hermes
 # stays hermes-owned (runtime data, re-chowned at boot).
-USER root
-RUN chown -R root:root /opt/hermes-install /opt/uv
+COPY --from=install --chown=0:0 /split/tools /opt/hermes-install/tools
+COPY --from=install --chown=0:0 /split/installs /opt/hermes-install/installs
+COPY --from=install --chown=0:0 /split/cache /opt/hermes-install/cache
+COPY --from=install --chown=0:0 /opt/hermes-install /opt/hermes-install
+COPY --from=install --chown=0:0 /split/hermes-agent/.build /opt/hermes-install/hermes-agent/.build
+COPY --from=install --chown=0:0 /split/hermes-agent/node_modules /opt/hermes-install/hermes-agent/node_modules
+COPY --from=install --chown=0:0 /split/hermes-agent/.git /opt/hermes-install/hermes-agent/.git
+COPY --from=install --chown=0:0 /opt/uv /opt/uv
+COPY --from=install --chown=1000:1000 /home/hermes /home/hermes
+RUN chown root:root /opt/hermes-install /opt/hermes-install/hermes-agent /opt/uv
 
 # --- Agent Flare additions ---
 # Bundled plugin location: discovered like Hermes' own dashboard auth providers.
@@ -97,8 +122,7 @@ COPY --chown=root:root container/plugins/cloudflare_access /opt/hermes-install/h
 COPY --chown=root:root container/af_state.py /usr/local/lib/af_state.py
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
 # af-python: Hermes' own venv, which provides ruamel.yaml for af_state.py.
-RUN rm -f /usr/local/lib/af-build-ca-env \
-    && chmod +x /usr/local/bin/start-hermes.sh \
+RUN chmod +x /usr/local/bin/start-hermes.sh \
     && printf '#!/bin/sh\nexec %s "$@"\n' "$(ls -d /opt/hermes-install/installs/*/environments/*/venv/bin/python | head -1)" > /usr/local/bin/af-python \
     && chmod +x /usr/local/bin/af-python \
     && af-python -c "import ruamel.yaml" \

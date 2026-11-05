@@ -412,8 +412,7 @@ try {
 } finally {
   stopAll();
   // Only this project's: another project's wrangler dev has workerd containers too.
-  const ours = execFileSync("docker", ["ps", "--filter", "name=workerd", "--format", "{{.ID}} {{.Image}}"], { encoding: "utf8" })
-    .split("\n").filter((l) => l.includes("hermessandbox")).map((l) => l.split(" ")[0]);
+  const ours = execFileSync("docker", ["ps", "-q", "--filter", "name=workerd-agent-flare"], { encoding: "utf8" }).split("\n").filter(Boolean);
   for (const id of ours) {
     try { execFileSync("docker", ["rm", "-f", id], { stdio: "ignore" }); } catch {}
   }
