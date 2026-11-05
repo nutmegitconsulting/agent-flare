@@ -103,13 +103,38 @@ describe("providers", () => {
     expect(rendered.customProviders[0].extra_headers).toEqual({
       "cf-aig-gateway-id": "g1", "cf-aig-metadata": JSON.stringify({ user: "a@b.com" }),
     });
-    expect(rendered.defaultModel).toBe("m1");
+    expect(rendered.candidates).toEqual([{ provider: "gw", model: "m1", key_env: "GW_KEY" }]);
+  });
+  it("selects the first listed model when none is named", () => {
+    const parsed = validateProviders([{ ...entry, model: undefined, models: { first: {}, second: {} } }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(renderProviders(parsed.entries, "tok", "a@b.com").candidates[0].model).toBe("first");
+  });
+  it("names a user_env provider without injecting anything", () => {
+    const parsed = validateProviders([{ name: "byo", mode: "user_env", base_url: "https://x/v1", key_env: "BYO", models: { m: {} } }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const rendered = renderProviders(parsed.entries, "tok", "a@b.com");
+    expect(rendered.env).toEqual({});
+    expect(rendered.candidates).toEqual([{ provider: "byo", model: "m", key_env: "BYO" }]);
+  });
+  it("refuses what Hermes wouldn't route, or what would put a secret in config.yaml", () => {
+    const error = (e: unknown) => {
+      const result = validateProviders([e]);
+      return result.ok ? "" : result.error;
+    };
+    expect(error({ ...entry, name: "openrouter" })).toContain("built-in");
+    expect(error({ ...entry, name: "My Gateway" })).toContain("lowercase");
+    expect(error({ ...entry, model: "other" })).toContain("not in models");
+    expect(error({ ...entry, extra_headers: { "cf-aig-authorization": "Bearer abc" } })).toContain("credential");
+    expect(error({ ...entry, extra_headers: { "cf-aig-authorization": "Bearer \${AIG_TOKEN}" } })).toBe("");
   });
   it("skips api_token entries when the Worker secret is unset", () => {
     const parsed = validateProviders([entry]);
     if (!parsed.ok) throw new Error(parsed.error);
     const rendered = renderProviders(parsed.entries, "", "a@b.com");
     expect(rendered.customProviders).toEqual([]);
+    expect(rendered.candidates).toEqual([]);
     expect(rendered.warnings).toHaveLength(1);
+    expect(rendered.warnings[0]).toContain("CLOUDFLARE_AI_API_TOKEN");
   });
 });

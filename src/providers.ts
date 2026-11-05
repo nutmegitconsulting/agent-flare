@@ -1,13 +1,18 @@
 /**
- * AI Gateway custom providers, delivered through config templates.
+ * Inference providers, delivered through config templates: what makes a user's first launch able to
+ * answer without any setup.
  *
- * Validates a template's `providers` list and turns it into config.yaml `custom_providers`
- * entries plus the .env values they read. Credentials never go in the template:
+ * Validates a template's `providers` list and turns it into config.yaml `custom_providers` entries,
+ * the .env values they read, and an ordered list of candidates. The container selects the first
+ * candidate whose credential is present (af_state.py), because a listed provider isn't a selected one:
+ * Hermes uses `model.provider`, and without it reports that no provider is connected.
  *
- * - `api_token`: the account-scoped endpoint. Credential is the Worker secret
- *   CLOUDFLARE_AI_API_TOKEN (Workers AI:Read), routed per gateway by the cf-aig-gateway-id header.
- * - `user_env`: the value comes from the user, as an admin prefill or the user's own .env.
- *   Nothing is injected; the entry just names the variable.
+ * Credentials never go in the template:
+ *
+ * - `api_token`: the shared credential is the Worker secret CLOUDFLARE_AI_API_TOKEN. Requests are tagged
+ *   with the gateway and the user through cf-aig-* headers.
+ * - `user_env`: the value comes from .env: an admin prefill, the user's own value, or the template's
+ *   `env` with "$NAME" reading a Worker secret.
  */
 
 export interface ProviderModelInfo {
@@ -16,7 +21,7 @@ export interface ProviderModelInfo {
 }
 
 export interface GatewayProviderEntry {
-  /** Display name. Must match the model prefix `@<name>/`. */
+  /** What `model.provider` names: lowercase letters, digits and dashes. */
   name: string;
   mode: "api_token" | "user_env";
   base_url: string;
@@ -29,12 +34,28 @@ export interface GatewayProviderEntry {
   discover_models?: boolean;
   extra_headers?: Record<string, string>;
   models: Record<string, ProviderModelInfo>;
-  /** Per-entry default model. */
+  /** Model to select. Defaults to the first of `models`. */
   model?: string;
+}
+
+/** A provider the container may select, once `key_env` has a value in .env. */
+export interface ProviderCandidate {
+  provider: string;
+  model: string;
+  key_env: string;
 }
 
 const API_MODES = new Set(["chat_completions", "responses", "anthropic", "bedrock_converse", "auto"]);
 const ENV_VAR_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+/** Hermes routes these names to its built-in provider, whatever the entry says. */
+const BUILTIN_PROVIDER_NAMES = new Set([
+  "ai-gateway", "anthropic", "bedrock", "custom", "deepseek", "gemini", "lmstudio", "minimax", "nous",
+  "openai", "openai-codex", "openrouter", "xai",
+]);
+const CREDENTIAL_HEADER_RE = /authorization|api[-_]?key|token|secret|password/i;
+/** A header that carries a credential has to read it from .env: config.yaml is backed up to R2. */
+const ENV_REFERENCE_RE = /\$\{[A-Za-z_][A-Za-z0-9_]*\}/;
 
 export function validateProviders(
   data: unknown,
@@ -46,7 +67,12 @@ export function validateProviders(
     const e = data[i] as Partial<GatewayProviderEntry>;
     const at = `entry[${i}]`;
     if (typeof e !== "object" || e === null) return { ok: false, error: `${at} must be an object` };
-    if (typeof e.name !== "string" || !e.name.trim()) return { ok: false, error: `${at}.name is required` };
+    if (typeof e.name !== "string" || !NAME_RE.test(e.name)) {
+      return { ok: false, error: `${at}.name must be lowercase letters, digits and dashes` };
+    }
+    if (BUILTIN_PROVIDER_NAMES.has(e.name)) {
+      return { ok: false, error: `${at}.name "${e.name}" is a Hermes built-in provider; choose another` };
+    }
     if (e.mode !== "api_token" && e.mode !== "user_env") {
       return { ok: false, error: `${at}.mode must be "api_token" or "user_env"` };
     }
@@ -71,12 +97,21 @@ export function validateProviders(
         (typeof e.extra_headers !== "object" || e.extra_headers === null || Array.isArray(e.extra_headers))) {
       return { ok: false, error: `${at}.extra_headers must be an object` };
     }
+    for (const [header, value] of Object.entries(e.extra_headers ?? {})) {
+      if (typeof value !== "string") return { ok: false, error: `${at}.extra_headers.${header} must be a string` };
+      if (CREDENTIAL_HEADER_RE.test(header) && !ENV_REFERENCE_RE.test(value)) {
+        return { ok: false, error: `${at}.extra_headers.${header} looks like a credential; use "\${ENV_VAR}"` };
+      }
+    }
     if (typeof e.models !== "object" || e.models === null || Array.isArray(e.models) ||
         Object.keys(e.models).length === 0) {
       return { ok: false, error: `${at}.models must be a non-empty object` };
     }
+    if (e.model !== undefined && !(e.model in e.models) && e.discover_models !== true) {
+      return { ok: false, error: `${at}.model "${e.model}" is not in models` };
+    }
     entries.push({
-      name: e.name.trim(),
+      name: e.name,
       mode: e.mode,
       base_url: e.base_url,
       key_env: e.key_env,
@@ -94,7 +129,7 @@ export function validateProviders(
 export interface RenderedProviders {
   customProviders: Record<string, unknown>[];
   env: Record<string, string>;
-  defaultModel: string | null;
+  candidates: ProviderCandidate[];
   warnings: string[];
 }
 
@@ -106,7 +141,7 @@ export function renderProviders(entries: GatewayProviderEntry[], aiApiToken: str
   const customProviders: Record<string, unknown>[] = [];
   const env: Record<string, string> = {};
   const warnings: string[] = [];
-  let defaultModel: string | null = null;
+  const candidates: ProviderCandidate[] = [];
   for (const e of entries) {
     if (e.mode === "api_token") {
       if (!aiApiToken) {
@@ -130,7 +165,7 @@ export function renderProviders(entries: GatewayProviderEntry[], aiApiToken: str
       ...(Object.keys(headers).length ? { extra_headers: headers } : {}),
       models: e.models,
     });
-    if (e.model && !defaultModel) defaultModel = e.model;
+    candidates.push({ provider: e.name, model: e.model ?? Object.keys(e.models)[0], key_env: e.key_env });
   }
-  return { customProviders, env, defaultModel, warnings };
+  return { customProviders, env, candidates, warnings };
 }

@@ -21,12 +21,17 @@ import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
 import { fetchAccessGroups, loadAssignments, loadTemplate, pickTemplate, templateSecrets } from "./templates";
 
-export const WEBAPP_PORT = 443;
+/**
+ * Hermes' default webapp port, inside the container only. Browsers reach it on 443 at Cloudflare; TLS
+ * ends there, and nothing but this Worker can address the container. Not 3000: that's the SDK's control port.
+ */
+export const WEBAPP_PORT = 9120;
 const RUN_DIR = "/run/agent-flare";
 const READY_FILE = `${RUN_DIR}/ready`;
 const IDENTITY_KEY = "identity";
 const SEALED_COPY_KEY = "sealed-files";
 const LAST_RESTORE_KEY = "last-restore";
+const CONFIG_STATUS_KEY = "config-status";
 const ACTIVE_PREFIX = "active/";
 const WEBAPP_START_TIMEOUT_MS = 120_000;
 /** After a failed hydration, keep reporting it for this long before trying again. */
@@ -38,6 +43,12 @@ export type ReadyState =
   | { state: "ready" }
   | { state: "starting"; step: string }
   | { state: "failed"; error: string };
+
+/** Names only: never a credential's value. */
+interface InferenceReport {
+  selected: string | null;
+  missing: string[];
+}
 
 export type SnapshotResult = { id: string } | { skipped: string };
 
@@ -157,6 +168,7 @@ export class HermesSandbox extends Sandbox<Env> {
 
     const providers = renderProviders(template?.providers ?? [], env.CLOUDFLARE_AI_API_TOKEN ?? "", identity.email);
     warnings.push(...providers.warnings);
+    const providerCount = (template?.providers ?? []).length;
 
     // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
     // secret changed just before a stop. KV stays the durable home for the value.
@@ -171,17 +183,17 @@ export class HermesSandbox extends Sandbox<Env> {
     // Platform keys come last so a template can never move the port or the public URL.
     const platformConfig = {
       webapp: { enabled: true, host: "0.0.0.0", port: WEBAPP_PORT, public_url: identity.publicUrl },
-      dashboard: { trusted_proxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1"] },
+      // Only the Worker can reach this listener, so whatever address it arrives from is the Worker's.
+      dashboard: { trusted_proxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.1", "::1", "fc00::/7"] },
     };
     const bundle = {
       sealed: sealed ?? {},
       template: template ? { name: template.name, files: template.files } : null,
       // Inside the home, so that what an agent makes is what gets snapshotted.
       platform_defaults: { terminal: { cwd: `${HERMES_HOME}/workspace` } },
-      config_defaults: {
-        ...(providers.defaultModel ? { model: providers.defaultModel } : {}),
-        ...template?.configDefaults,
-      },
+      config_defaults: template?.configDefaults ?? {},
+      // The container picks from these, because only it can see which credentials are in .env.
+      provider_candidates: providers.candidates,
       config_managed: {
         ...template?.configManaged,
         ...(providers.customProviders.length ? { custom_providers: providers.customProviders } : {}),
@@ -208,6 +220,11 @@ export class HermesSandbox extends Sandbox<Env> {
       console.error(`[config:${identity.sub}] ${(result.stderr || result.stdout).slice(0, 500)}`);
       throw new Error("applying configuration failed");
     }
+    const inference = (JSON.parse(result.stdout) as { inference?: InferenceReport }).inference;
+    if (providerCount && !inference?.selected) {
+      warnings.push(`no inference provider selected: missing ${inference?.missing?.join(", ") || "provider credentials"}`);
+    }
+    await this.ctx.storage.put(CONFIG_STATUS_KEY, { template: templateName, inference, warnings, at: Date.now() });
     if (warnings.length) console.warn(`[config:${identity.sub}] ${warnings.join("; ")}`);
     console.log(`[config:${identity.sub}] ${result.stdout}`);
   }
@@ -325,6 +342,7 @@ export class HermesSandbox extends Sandbox<Env> {
       lastSnapshotAt: this.lastSnapshotAt,
       lastSnapshotError: this.lastSnapshotError,
       lastRestore: (await this.ctx.storage.get<RestoreOutcome & { at: number }>(LAST_RESTORE_KEY)) ?? null,
+      config: (await this.ctx.storage.get(CONFIG_STATUS_KEY)) ?? null,
       lastUserActivity: this.lastUserActivity,
       inflight: (this as unknown as { inflightRequests?: number }).inflightRequests ?? 0,
     };

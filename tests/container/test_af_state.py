@@ -240,19 +240,19 @@ class Apply(Base):
 
     def test_a_broken_config_is_set_aside_not_fatal(self):
         (self.home / "config.yaml").write_text("a: [unclosed\n  b: :\n")
-        report = self.bundle(config_managed={"webapp": {"port": 443}})
+        report = self.bundle(config_managed={"webapp": {"port": 9120}})
         self.assertTrue(report["config_recovered"])
-        self.assertEqual(self.config()["webapp"]["port"], 443)
+        self.assertEqual(self.config()["webapp"]["port"], 9120)
         self.assertEqual(len(list(self.home.glob("config.yaml.corrupt.*"))), 1)
 
     def test_managed_keys_win_every_boot_and_keep_user_keys_and_comments(self):
         (self.home / "config.yaml").write_text("# my note\nmodel: mine\nwebapp:\n  port: 1\n  extra: keep\n")
-        self.bundle(config_managed={"webapp": {"port": 443, "enabled": True}})
+        self.bundle(config_managed={"webapp": {"port": 9120, "enabled": True}})
         text = (self.home / "config.yaml").read_text()
         self.assertIn("# my note", text)
         config = self.config()
         self.assertEqual(config["model"], "mine")
-        self.assertEqual(dict(config["webapp"]), {"port": 443, "extra": "keep", "enabled": True})
+        self.assertEqual(dict(config["webapp"]), {"port": 9120, "extra": "keep", "enabled": True})
 
     def test_named_lists_merge_by_name(self):
         (self.home / "config.yaml").write_text(
@@ -279,6 +279,68 @@ class Apply(Base):
         path = self.home / "webapp/session-token"
         self.assertEqual(path.read_text().strip(), token)
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    GW = {"provider": "gw", "model": "m1", "key_env": "GW_KEY"}
+    BYO = {"provider": "byo", "model": "m2", "key_env": "BYO_KEY"}
+
+    def test_first_launch_selects_the_first_provider_with_a_credential(self):
+        report = self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW, self.BYO])
+        self.assertEqual(dict(self.config()["model"]), {"default": "m1", "provider": "gw"})
+        self.assertEqual(report["inference"], {"selected": "gw", "missing": ["BYO_KEY"]})
+
+    def test_a_missing_secret_falls_through_to_the_next_provider(self):
+        report = self.bundle(env_defaults={"BYO_KEY": "mine"}, provider_candidates=[self.GW, self.BYO])
+        self.assertEqual(dict(self.config()["model"]), {"default": "m2", "provider": "byo"})
+        self.assertEqual(report["inference"], {"selected": "byo", "missing": ["GW_KEY"]})
+
+    def test_no_credential_selects_nothing_and_says_so_by_name_only(self):
+        report = self.bundle(provider_candidates=[self.GW])
+        self.assertNotIn("model", self.config())
+        self.assertEqual(report["inference"], {"selected": None, "missing": ["GW_KEY"]})
+
+    def test_a_secret_added_later_selects_on_the_next_boot(self):
+        self.bundle(provider_candidates=[self.GW])
+        report = self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        self.assertEqual(self.config()["model"]["provider"], "gw")
+        self.assertEqual(report["inference"]["selected"], "gw")
+
+    def test_a_user_key_in_env_counts(self):
+        (self.home / ".env").write_text("BYO_KEY=mine\n")
+        self.bundle(provider_candidates=[self.BYO])
+        self.assertEqual(self.config()["model"]["provider"], "byo")
+
+    def test_an_empty_value_is_not_a_credential(self):
+        (self.home / ".env").write_text("GW_KEY=\n")
+        self.bundle(provider_candidates=[self.GW])
+        self.assertNotIn("model", self.config())
+
+    def test_a_users_own_choice_is_never_replaced(self):
+        self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        (self.home / "config.yaml").write_text("model:\n  default: theirs\n  provider: other\n")
+        report = self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        self.assertEqual(dict(self.config()["model"]), {"default": "theirs", "provider": "other"})
+        self.assertEqual(report["inference"]["selected"], "other")
+        self.bundle(provider_candidates=[self.GW])
+        self.assertEqual(self.config()["model"]["provider"], "other")
+
+    def test_a_selection_whose_secret_is_withdrawn_moves_on(self):
+        self.bundle(env={"GW_KEY": "t", "BYO_KEY": "b"}, provider_candidates=[self.GW, self.BYO])
+        self.assertEqual(self.config()["model"]["provider"], "gw")
+        self.bundle(env={"BYO_KEY": "b"}, provider_candidates=[self.GW, self.BYO])
+        self.assertEqual(self.config()["model"]["provider"], "byo")
+        self.bundle(provider_candidates=[self.GW, self.BYO])
+        self.assertNotIn("model", self.config())
+
+    def test_a_provider_the_template_dropped_leaves_and_a_users_own_stays(self):
+        (self.home / "config.yaml").write_text("custom_providers:\n- name: mine\n  base_url: u\n")
+        self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "b"}]})
+        self.bundle(config_managed={})
+        self.assertEqual([p["name"] for p in self.config()["custom_providers"]], ["mine"])
+
+    def test_provider_credentials_stay_out_of_config_and_the_stage(self):
+        self.bundle(env={"GW_KEY": "s3cret-value"}, provider_candidates=[self.GW],
+                    config_managed={"custom_providers": [{"name": "gw", "base_url": "b", "key_env": "GW_KEY"}]})
+        self.assertNotIn("s3cret-value", (self.home / "config.yaml").read_text())
 
     def test_paths_cannot_escape_home(self):
         with self.assertRaises(ValueError):

@@ -1,7 +1,7 @@
 /**
  * Agent Flare Worker: one hostname behind Cloudflare Access, one container per Access user.
  *
- *   Browser -> Access -> this Worker -> the caller's own sandbox -> Hermes webapp :443
+ *   Browser -> Access -> this Worker -> the caller's own sandbox -> Hermes webapp :9120
  *
  * /__af/*   Agent Flare's own routes
  * anything else  proxied to the caller's Hermes webapp, HTTP and WebSocket
@@ -9,7 +9,6 @@
  * The container key comes only from a verified Access JWT, so no request parameter can reach
  * another user's container. Admin routes are the one exception, and they check ADMIN_EMAILS.
  */
-import { switchPort } from "@cloudflare/containers";
 import { getSandbox } from "@cloudflare/sandbox";
 import { Hono } from "hono";
 import { AccessError, verifyAccessJwt, type AccessIdentity } from "./access";
@@ -98,10 +97,13 @@ admin.use("*", async (c, next) => {
   await next();
 });
 
-/** Every user with an index, and what's known about each. */
+/** Every user with a backup or a running container, and what's known about each. */
 admin.get("/users", async (c) => {
   const listing = await c.env.BACKUP_BUCKET.list({ prefix: "users/", delimiter: "/" });
-  const subs = listing.delimitedPrefixes.map((p) => p.split("/")[1]);
+  const subs = [...new Set([
+    ...listing.delimitedPrefixes.map((p) => p.split("/")[1]),
+    ...(await activeUsers(c.env.BACKUP_BUCKET)),
+  ])];
   const users = await Promise.all(subs.map(async (sub) => {
     const backups = await getIndex(c.env.BACKUP_BUCKET, sub).catch(() => []);
     const details = await sandboxFor(c.env, sub).describe();
@@ -175,6 +177,11 @@ function forProxy(request: Request): Request {
   for (const name of [...headers.keys()]) {
     if (name.startsWith("x-sandbox-") || name === "cf-container-target-port") headers.delete(name);
   }
+  // Hermes trusts these from the Worker, so none of them can be the browser's own values.
+  headers.delete("x-forwarded-prefix");
+  const clientIp = headers.get("cf-connecting-ip");
+  if (clientIp) headers.set("x-forwarded-for", clientIp);
+  else headers.delete("x-forwarded-for");
   headers.set("x-forwarded-proto", "https");
   headers.set("x-forwarded-host", url.host);
   return new Request(request, { headers });
@@ -190,8 +197,7 @@ app.all("*", async (c) => {
   const upgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";
   const connection = request.headers.get("connection")?.toLowerCase().includes("upgrade");
   if (upgrade && connection) {
-    // Not sandbox.wsConnect: it refuses ports below 1024, and the webapp is on 443.
-    return sandbox.fetch(switchPort(request, WEBAPP_PORT));
+    return sandbox.wsConnect(request, WEBAPP_PORT);
   }
   // sandbox.fetch picks a port from the request unless both headers are present, and a half-formed
   // upgrade could land on the control port. So anything else goes to the webapp by explicit port.

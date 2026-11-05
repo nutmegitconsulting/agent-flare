@@ -3,5 +3,5 @@
 # Required. Root of all per-user secrets. Generate with: openssl rand -base64 48
 MASTER_KEY=
 
-# Optional. Cloudflare API token with Workers AI:Read, used by api_token providers in templates.
+# Credential for api_token providers in templates. Without it those providers are skipped.
 CLOUDFLARE_AI_API_TOKEN=

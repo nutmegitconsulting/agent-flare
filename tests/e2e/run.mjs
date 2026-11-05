@@ -31,10 +31,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --- simulated Access ---
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const jwks = JSON.stringify({ keys: [{ ...publicKey.export({ format: "jwk" }), kid: "e2e", alg: "RS256" }] });
-function jwt(sub, email, key = privateKey) {
+function jwt(sub, email, key = privateKey, claims = {}) {
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   const body = `${b64({ alg: "RS256", kid: "e2e" })}.${b64({
-    iss: `https://${TEAM}`, aud: [AUD], sub, email, exp: Math.floor(Date.now() / 1000) + 3600,
+    iss: `https://${TEAM}`, aud: [AUD], sub, email, exp: Math.floor(Date.now() / 1000) + 3600, ...claims,
   })}`;
   return `${body}.${createSign("RSA-SHA256").update(body).sign(key).toString("base64url")}`;
 }
@@ -124,19 +124,26 @@ writeFileSync(".dev.vars", [
   `MASTER_KEY=${MASTER}`, "CLOUDFLARE_AI_API_TOKEN=e2e-shared-token", "SHARED_FROM_SECRET=shared-secret-value", "TEMPLATE_SECRETS=SHARED_FROM_SECRET",
   "ALLOW_TEST_JWKS=1", `TEST_JWKS=${jwks}`, `SLEEP_AFTER=${SLEEP_AFTER_SECONDS}s`, "SNAPSHOT_INTERVAL_MINUTES=1",
 ].join("\n") + "\n");
-writeFileSync(join(persist, "assignments.json"), JSON.stringify({ users: { "alice@example.com": "team" } }));
+writeFileSync(join(persist, "assignments.json"), JSON.stringify({
+  users: { "alice@example.com": "team", "nokey@example.com": "bring-your-own" },
+}));
+writeFileSync(join(persist, "byo.json"), JSON.stringify({
+  env: { BYO_KEY: "$NOT_A_SET_SECRET" },
+  providers: [{ name: "byo", mode: "user_env", base_url: "https://y.example/v1", key_env: "BYO_KEY", models: { m2: {} } }],
+}));
 writeFileSync(join(persist, "template.json"), JSON.stringify({
   files: ["SOUL.md"],
   config_defaults: { display: { theme: "from-template" } },
   config_managed: { agent: { managed_key: "managed-value" } },
   env: { TEMPLATE_PLAIN: "plain-value", TEMPLATE_SECRET: "$SHARED_FROM_SECRET", STOLEN: "$MASTER_KEY" },
   providers: [{ name: "gw", mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY",
-    gateway_id: "slug", models: { m: { context_length: 1000 } } }],
+    gateway_id: "slug", model: "m", models: { m: { context_length: 1000 } } }],
 }));
 writeFileSync(join(persist, "SOUL.md"), "template soul\n");
 r2Put("config/assignments.json", join(persist, "assignments.json"));
 r2Put("templates/team/template.json", join(persist, "template.json"));
 r2Put("templates/team/files/SOUL.md", join(persist, "SOUL.md"));
+r2Put("templates/bring-your-own/template.json", join(persist, "byo.json"));
 
 const wrangler = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--persist-to", persist, "--test-scheduled"],
   { stdio: ["ignore", "pipe", "pipe"], detached: true });
@@ -151,6 +158,7 @@ process.on("exit", stopAll);
 const alice = new Browser("11111111-aaaa-4aaa-8aaa-111111111111", "alice@example.com");
 const bob = new Browser("22222222-bbbb-4bbb-8bbb-222222222222", "alice@other.example");
 const admin = new Browser("33333333-cccc-4ccc-8ccc-333333333333", "admin@example.com");
+const nokey = new Browser("44444444-dddd-4ddd-8ddd-444444444444", "nokey@example.com");
 
 try {
   for (let i = 0; ; i++) {
@@ -167,6 +175,27 @@ try {
   expect((await fetch(`${BASE}/`, { headers: { "Cf-Access-Jwt-Assertion": forged } })).status === 403, "forged token: 403");
   expect((await fetch(`${BASE}/`, { headers: { "Cf-Access-Token": "opaque", "Cf-Access-Authenticated-User-Email": alice.email } })).status === 401, "identity headers alone: 401");
   expect((await alice.fetch("/__af/admin/users")).status === 403, "non-admin on admin route: 403");
+  // Every kind of route, before any user has a container: nothing may answer without a verified token.
+  const routes = [["GET", "/"], ["GET", "/login"], ["GET", "/api/health"], ["GET", "/api/status"], ["GET", "/api/ws"],
+    ["GET", "/__af/status"], ["POST", "/__af/snapshot"], ["POST", "/__af/stop"], ["GET", "/__af/nope"],
+    ["GET", "/__af/admin/users"], ["POST", "/__af/admin/users/x/stop"], ["POST", "/__af/admin/users/x/snapshot"],
+    ["POST", "/__af/admin/users/x/prune"], ["PUT", "/__af/admin/prefill/a@example.com"]];
+  const tokens = {
+    none: [undefined, 401],
+    forged: [forged, 403],
+    "wrong audience": [jwt(alice.sub, alice.email, privateKey, { aud: ["other"] }), 403],
+    "wrong issuer": [jwt(alice.sub, alice.email, privateKey, { iss: "https://evil.cloudflareaccess.com" }), 403],
+    expired: [jwt(alice.sub, alice.email, privateKey, { exp: 1000 }), 403],
+  };
+  for (const [label, [token, want]] of Object.entries(tokens)) {
+    const wrong = [];
+    for (const [method, path] of routes) {
+      const r = await fetch(`${BASE}${path}`, { method, headers: token ? { "Cf-Access-Jwt-Assertion": token } : {} });
+      await r.body?.cancel();
+      if (r.status !== want) wrong.push(`${method} ${path}: ${r.status}`);
+    }
+    expect(wrong.length === 0, `${label} token: all ${routes.length} routes refuse with ${want}`, wrong.join("; "));
+  }
 
   console.log("== first launch");
   const t0 = Date.now();
@@ -206,6 +235,10 @@ try {
   expect(config.includes("from-template"), "template default applied", config);
   expect(config.includes("managed-value"), "managed key applied", config);
   expect(config.includes("cf-aig-metadata") && config.includes(alice.email), "provider tagged with the user", config);
+  const modelInfo = await alice.json("/api/model/info");
+  expect(modelInfo.provider === "gw" && modelInfo.model === "m", "first launch has the template's provider selected", JSON.stringify(modelInfo));
+  const aliceConfig = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).config;
+  expect(aliceConfig.inference.selected === "gw" && !aliceConfig.warnings.some((w) => w.includes("provider")), "admin sees the provider selected", JSON.stringify(aliceConfig));
   expect(!config.includes("e2e-shared-token"), "provider credential not in config.yaml");
   const env = inside(alice, `cat ${HOME}/.env`);
   expect(env.includes("TEMPLATE_PLAIN=plain-value") && env.includes("TEMPLATE_SECRET=shared-secret-value") && env.includes("GW_KEY=e2e-shared-token"), "template env and secrets applied", "(env withheld)");
@@ -213,6 +246,24 @@ try {
   expect(!env.includes("STOLEN=") && !env.includes(MASTER), "a template can't read MASTER_KEY");
   expect((await alice.fetch("/__af/stop", { method: "POST", headers: { origin: "https://evil.example" } })).status === 403, "cross-site stop refused");
   expect(inside(alice, `grep -c '^  cwd: ${HOME}/workspace' ${HOME}/config.yaml`) === "1", "agents work inside the snapshotted home");
+
+  console.log("== provider secret missing");
+  expect((await nokey.waitReady()).state === "ready", "a missing secret doesn't stop the container");
+  const noKeyInfo = await nokey.json("/api/model/info");
+  expect(noKeyInfo.provider === "" && noKeyInfo.model === "", "nothing selected that can't answer", JSON.stringify(noKeyInfo));
+  const noKeyConfig = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === nokey.sub).config;
+  expect(noKeyConfig.inference.missing.includes("BYO_KEY") && noKeyConfig.warnings.some((w) => w.includes("NOT_A_SET_SECRET")), "admin sees what's missing, by name", JSON.stringify(noKeyConfig));
+  const prefilled = await admin.fetch(`/__af/admin/prefill/${nokey.email}`, { method: "PUT", body: JSON.stringify({ BYO_KEY: "byo-prefill-secret" }) });
+  await prefilled.body?.cancel();
+  expect(prefilled.status === 200, "admin prefills the key");
+  await nokey.json("/__af/stop", { method: "POST" });
+  await sleep(3000);
+  expect((await nokey.waitReady()).state === "ready", "wakes with the key");
+  const byoInfo = await nokey.json("/api/model/info");
+  expect(byoInfo.provider === "byo" && byoInfo.model === "m2", "the key selects the provider at the next boot", JSON.stringify(byoInfo));
+  expect(!inside(nokey, `cat ${HOME}/config.yaml`).includes("byo-prefill-secret"), "the key isn't in config.yaml");
+  await nokey.json("/__af/stop", { method: "POST" });
+  await sleep(3000);
 
   console.log("== isolation");
   expect((await bob.waitReady()).state === "ready", "second user gets a container");
@@ -260,7 +311,9 @@ try {
   expect(sql(alice, "print(c.execute('select count(*) from e2e').fetchone()[0])") === "2", "live data untouched by further requests");
 
   console.log("== nothing secret in R2 or KV");
-  expect(grepTree(join(persist), "e2e-user-secret").filter((p) => !p.endsWith(".log")).length === 0, "user secret absent from all of local R2 and KV in plaintext");
+  for (const needle of ["e2e-user-secret", "e2e-shared-token", "byo-prefill-secret"]) {
+    expect(grepTree(join(persist), needle).filter((p) => !p.endsWith(".log")).length === 0, `${needle} absent from all of local R2 and KV in plaintext`);
+  }
 
   console.log("== bad backups");
   const adminUsers = await admin.json("/__af/admin/users");
@@ -358,7 +411,10 @@ try {
   process.exitCode = 1;
 } finally {
   stopAll();
-  for (const id of execFileSync("docker", ["ps", "-q", "--filter", "name=workerd"], { encoding: "utf8" }).split("\n").filter(Boolean)) {
+  // Only this project's: another project's wrangler dev has workerd containers too.
+  const ours = execFileSync("docker", ["ps", "--filter", "name=workerd", "--format", "{{.ID}} {{.Image}}"], { encoding: "utf8" })
+    .split("\n").filter((l) => l.includes("hermessandbox")).map((l) => l.split(" ")[0]);
+  for (const id of ours) {
     try { execFileSync("docker", ["rm", "-f", id], { stdio: "ignore" }); } catch {}
   }
   if (process.exitCode === 0) rmSync(persist, { recursive: true, force: true });

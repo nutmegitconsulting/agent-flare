@@ -25,7 +25,7 @@ npx wrangler kv namespace create agent-flare-credentials   # note the id
 
 ```bash
 openssl rand -base64 48 | npx wrangler secret put MASTER_KEY
-npx wrangler secret put CLOUDFLARE_AI_API_TOKEN            # optional: for api_token providers
+npx wrangler secret put CLOUDFLARE_AI_API_TOKEN            # for api_token providers; a token that can use your AI Gateway
 ```
 
 Store `MASTER_KEY` somewhere safe too. Without it, everything encrypted in KV is lost.
@@ -66,18 +66,37 @@ node scripts/render-wrangler.mjs
 npx wrangler deploy
 ```
 
-## 5. Add a template (optional)
+### From a machine behind TLS inspection
+
+`wrangler deploy` can't pass a build secret, and an image must never inherit a proxy's CA. Build by hand, and deploy the pushed image:
 
 ```bash
-cp -r templates/example templates/mine        # edit it; templates/* is gitignored
+TAG=agent-flare:$(git rev-parse --short HEAD)
+AF_NO_CACHE=1 AF_BUILD_CA=/path/to/ca-bundle.crt AF_FORBIDDEN_CA=/path/to/proxy-ca.crt scripts/build-image.sh "$TAG"   # stops if the guard fails
+npx wrangler containers push "$TAG"                                                                                    # prints the registry image
+AF_IMAGE=<that registry image> AF_WRANGLER_OUT=wrangler.prod.jsonc node scripts/render-wrangler.mjs
+npx wrangler deploy --config wrangler.prod.jsonc
+```
+
+The `Dockerfile` pins its base by digest, so a local image with the same tag can't become the base without an explicit `AF_BASE_IMAGE`. `scripts/check-image.sh` refuses an image with the CA or its settings in its env, history or files.
+
+## 5. Add a provider template
+
+Without one, users open Hermes with no inference provider.
+
+```bash
+cp -r templates/example templates/mine        # replace each YOUR_ value; templates/* is gitignored
+node scripts/templates.mjs check templates/mine   # lists the Worker secrets it needs
 node scripts/templates.mjs push templates/mine
 cp templates/assignments.example.json assignments.json   # edit it
 node scripts/templates.mjs assign assignments.json
 ```
 
+To fill in the example you need your account ID, gateway ID, and the model IDs your gateway serves. Delete the `own-key` provider if you don't want a per-user option. See [Providers](README.md#providers).
+
 ## 6. Open it
 
-Go to `https://agents.example.com`. Log in through Access, watch the starting page, and you're in Hermes.
+Go to `https://agents.example.com`. Log in through Access, watch the starting page, and you're in Hermes with the template's model selected. Send a message.
 
 ## Check it worked
 
@@ -102,5 +121,7 @@ Check `/__af/admin/users` for backup counts, and `npx wrangler tail` for logs.
 | Starting page never finishes | `wrangler tail`; also check `max_instances`. A user past the limit can't get a container |
 | Sent to `/login` instead of straight in | The webapp credential changed. Click Sign in with Cloudflare Access once |
 | User's settings reverted | The key is in the template's `config_managed` or `env`, which reapply on every boot |
+| Hermes asks to connect a provider | No provider has a credential. `/__af/admin/users` shows `config.inference.missing` and `config.warnings`. Set the secret and the user's next boot selects it |
+| Messages fail with 401 or 403 | The credential was refused: check the Worker secret can use that gateway |
 
 For a debug shell, set `containers[0].ssh.enabled` to true, add your `ssh-ed25519` key under `authorized_keys`, redeploy and use `wrangler containers ssh`.

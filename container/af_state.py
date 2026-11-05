@@ -306,6 +306,33 @@ def _update_env(path: Path, updates: dict[str, str]) -> None:
     _write(path, ("\n".join(lines) + "\n").encode(), PRIVATE_MODE)
 
 
+def _env_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    pairs = (line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
+    return {key.strip(): value.strip() for key, value in pairs if not key.lstrip().startswith("#")}
+
+
+def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], ours: str | None) -> str | None:
+    """Make the template's first provider with a credential the selected one. Hermes needs this: a
+    provider that's only listed leaves it reporting that nothing is connected. Runs on every boot, so a
+    secret added later takes effect, but it never overrides a choice the user made. A selection this
+    code made is replaced once its credential has gone. Returns what this code has selected, if anything."""
+    usable = [c for c in candidates if env.get(c["key_env"])]
+    model = config.get("model")
+    current = model.get("provider") if isinstance(model, dict) else None
+    # Anything that names a model is a choice; only an empty slot is ours to fill.
+    empty = not model or (isinstance(model, dict) and not model.get("default") and not model.get("model"))
+    stale = bool(ours) and current == ours and not any(c["provider"] == ours for c in usable)
+    if not empty and not stale:
+        return ours if current == ours else None
+    if usable:
+        config["model"] = {"default": usable[0]["model"], "provider": usable[0]["provider"]}
+        return usable[0]["provider"]
+    config.pop("model", None)
+    return None
+
+
 def apply(home: Path, bundle_path: Path) -> dict:
     from ruamel.yaml import YAML
     from ruamel.yaml.error import YAMLError
@@ -361,10 +388,14 @@ def apply(home: Path, bundle_path: Path) -> dict:
         _fill_defaults(config, bundle.get("platform_defaults") or {})
     if first_launch or new_template:
         _fill_defaults(config, bundle.get("config_defaults") or {})
-    _deep_merge(config, bundle.get("config_managed") or {})
-    buffer = StringIO()
-    yaml.dump(config, buffer)
-    _write(config_path, buffer.getvalue().encode())
+    managed_config = bundle.get("config_managed") or {}
+    # Providers the last boot managed and this one doesn't must leave, or Hermes keeps listing them.
+    current_providers = {p["name"] for p in managed_config.get("custom_providers", [])}
+    dropped_providers = set(marker.get("managed_providers", [])) - current_providers
+    if dropped_providers and isinstance(config.get("custom_providers"), list):
+        config["custom_providers"] = [p for p in config["custom_providers"]
+                                      if not (isinstance(p, dict) and p.get("name") in dropped_providers)]
+    _deep_merge(config, managed_config)
 
     env_path = home / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
@@ -381,8 +412,22 @@ def apply(home: Path, bundle_path: Path) -> dict:
     if env:
         _update_env(env_path, env)
 
+    candidates = bundle.get("provider_candidates") or []
+    env_values = _env_values(env_path)
+    selected = _select_provider(config, candidates, env_values, marker.get("selected_provider"))
+    model = config.get("model")
+    report["inference"] = {  # Names only: this goes to the logs.
+        "selected": model.get("provider") if isinstance(model, dict) else ("auto" if model else None),
+        "missing": sorted({c["key_env"] for c in candidates if not env_values.get(c["key_env"])}),
+    }
+
+    buffer = StringIO()
+    yaml.dump(config, buffer)
+    _write(config_path, buffer.getvalue().encode())
+
     _write(marker_path, json.dumps({
         "name": template.get("name"), "applied": int(time.time()), "managed_env": sorted(managed),
+        "managed_providers": sorted(current_providers), "selected_provider": selected,
     }).encode())
 
     session_token = bundle.get("session_token")
