@@ -130,7 +130,7 @@ class UserDataStays(Hydrated):
         (self.home / "logs/gateway.log").write_text("x")
         af_state.stage(self.home, self.stage)
         names = {str(p.relative_to(self.stage)) for p in self.stage.rglob("*") if p.is_file()}
-        self.assertEqual(names, {*keep, af_state.MANIFEST})
+        self.assertEqual(names, {*keep, "config.yaml", af_state.MANIFEST})
 
     def test_a_broken_project_database_does_not_block_snapshots_or_restores(self):
         (self.home / "workspace").mkdir()
