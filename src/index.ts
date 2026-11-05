@@ -12,6 +12,7 @@
 import { getSandbox } from "@cloudflare/sandbox";
 import { Hono } from "hono";
 import { AccessError, verifyAccessJwt, type AccessIdentity } from "./access";
+import { adminScreens } from "./admin";
 import type { Env } from "./env";
 import { startingPage } from "./pages";
 import { getIndex } from "./persistence";
@@ -61,7 +62,8 @@ app.use("/__af/*", async (c, next) => {
   if (c.req.method === "GET") return next();
   const origin = c.req.header("origin");
   const site = c.req.header("sec-fetch-site");
-  const crossOrigin = origin && new URL(origin).host !== new URL(c.req.url).host;
+  // An opaque origin, as from a sandboxed frame, sends the text "null", which is no origin of ours.
+  const crossOrigin = origin && URL.parse(origin)?.host !== new URL(c.req.url).host;
   if (crossOrigin || (site && !["same-origin", "none"].includes(site))) {
     return c.text("Cross-site request refused", 403);
   }
@@ -136,6 +138,7 @@ admin.put("/prefill/:email", async (c) => {
   return c.json({ ok: true, keys: Object.keys(body) });
 });
 
+adminScreens(admin, (env, sub) => sandboxFor(env, sub), (bucket) => activeUsers(bucket));
 app.route("/__af/admin", admin);
 app.all("/__af/*", (c) => c.text("Not found", 404));
 

@@ -16,10 +16,13 @@ import { Sandbox } from "@cloudflare/sandbox";
 import type { AccessIdentity } from "./access";
 import type { Env } from "./env";
 import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest, type RestoreOutcome } from "./persistence";
+import { keyStatuses, resolveProviderKey } from "./credentials";
+import { configFingerprint, resolveEffective } from "./effective";
+import { MODEL_TIERS } from "./model-tiers";
 import { renderProviders } from "./providers";
 import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
-import { fetchAccessGroups, loadAssignments, loadTemplate, pickTemplate, templateSecrets } from "./templates";
+import { fetchAccessGroups, loadAssignments, templateSecrets } from "./templates";
 
 /**
  * Hermes' default webapp port, inside the container only. Browsers reach it on 443 at Cloudflare; TLS
@@ -54,6 +57,7 @@ export type SnapshotResult = { id: string } | { skipped: string };
 
 interface StoredIdentity extends AccessIdentity {
   publicUrl: string;
+  groups?: string[];
 }
 
 export class HermesSandbox extends Sandbox<Env> {
@@ -102,7 +106,8 @@ export class HermesSandbox extends Sandbox<Env> {
           this.lastFailureAt = Date.now();
           this.status = { state: "failed", error };
           // A container that can't serve shouldn't hold an instance slot.
-          await this.stop().catch(() => undefined);
+          this.stopping = true;
+          await this.stop().catch(() => { this.stopping = false; });
         })
         .finally(() => {
           if (this.hydration === run) this.hydration = null;
@@ -161,16 +166,20 @@ export class HermesSandbox extends Sandbox<Env> {
     const groups = assignments?.groups && Object.keys(assignments.groups).length
       ? await fetchAccessGroups(identity.issuer, accessJwt)
       : [];
-    const templateName = pickTemplate(assignments, identity.email, groups);
-    const template = templateName
-      ? await loadTemplate(env.BACKUP_BUCKET, templateName, templateSecrets(env))
-      : null;
+    const effective = await resolveEffective(env.BACKUP_BUCKET, identity.email, groups, templateSecrets(env));
+    const templateName = effective.role;
+    const template = effective.template;
     if (templateName && !template) warnings.push(`template ${templateName} is not in R2`);
     warnings.push(...(template?.warnings ?? []));
 
-    const providers = renderProviders(template?.providers ?? [], env.CLOUDFLARE_AI_API_TOKEN ?? "", identity.email);
+    const keys = Object.fromEntries(await Promise.all(effective.providers.map(async (p) =>
+      [p.name, await resolveProviderKey(env, identity.email, templateName, p)] as const)));
+    const providers = renderProviders(effective.providers, keys, identity.email);
     warnings.push(...providers.warnings);
-    const providerCount = (template?.providers ?? []).length;
+    const providerCount = effective.providers.length;
+    const fingerprint = await configFingerprint(
+      effective, await keyStatuses(env, identity.email, templateName, effective.providers));
+    await this.ctx.storage.put(IDENTITY_KEY, { ...identity, groups });
 
     // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
     // secret changed just before a stop. KV stays the durable home for the value.
@@ -214,6 +223,7 @@ export class HermesSandbox extends Sandbox<Env> {
       sub: identity.sub, email: identity.email, name: identity.name ?? "", issuer: identity.issuer,
     }));
     await this.exec(`chmod 600 ${RUN_DIR}/auth.json`);
+    await this.writeFile(`${RUN_DIR}/model-tiers.json`, JSON.stringify(MODEL_TIERS));
     await this.writeFile(`${RUN_DIR}/bundle.json`, JSON.stringify(bundle));
     const result = await this.exec(`${AF_STATE} apply ${HERMES_HOME} ${RUN_DIR}/bundle.json`);
     await this.exec(`rm -f ${RUN_DIR}/bundle.json`);
@@ -226,7 +236,7 @@ export class HermesSandbox extends Sandbox<Env> {
     if (providerCount && !inference?.selected) {
       warnings.push(`no inference provider selected: missing ${inference?.missing?.join(", ") || "provider credentials"}`);
     }
-    await this.ctx.storage.put(CONFIG_STATUS_KEY, { template: templateName, inference, warnings, at: Date.now() });
+    await this.ctx.storage.put(CONFIG_STATUS_KEY, { template: templateName, inference, warnings, fingerprint, at: Date.now() });
     if (warnings.length) console.warn(`[config:${identity.sub}] ${warnings.join("; ")}`);
     console.log(`[config:${identity.sub}] ${result.stdout}`);
   }
@@ -341,6 +351,7 @@ export class HermesSandbox extends Sandbox<Env> {
     const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
     return {
       identity: identity?.email ?? null,
+      groups: identity?.groups ?? [],
       status: this.status,
       lastSnapshotAt: this.lastSnapshotAt,
       lastSnapshotError: this.lastSnapshotError,
@@ -358,6 +369,25 @@ export class HermesSandbox extends Sandbox<Env> {
       await this.clearActiveMarker();
       this.stopping = true;
       await this.stop();
+    });
+  }
+
+  /**
+   * Apply configuration changes by restarting. Stricter than a stop: if the snapshot fails the container
+   * stays up, so applying a setting can never cost a user their work.
+   */
+  async applyByRestart(): Promise<{ status: "stopped" | "not running" } | { error: string }> {
+    return this.serial(async () => {
+      if (!(await this.isRunning())) return { status: "not running" as const };
+      try {
+        await this.takeSnapshot();
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await this.stop();
+      return { status: "stopped" as const };
     });
   }
 

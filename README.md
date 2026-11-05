@@ -127,6 +127,18 @@ curl -X PUT https://agents.example.com/__af/admin/prefill/someone@example.com \
 
 It's used only while the user hasn't set that variable themselves.
 
+## Admin screens
+
+`/__af/admin`, for people in `ADMIN_EMAILS`: users with status and backups, a user's effective config, roles, per-user overrides, keys, and an audit trail.
+
+A role is a template, so the screens and `scripts/templates.mjs` work on the same thing. Precedence: per-user override, then assigned role, then group, domain and default assignments. Roles set which models appear in the picker, the default, and the provider settings. They make choosing easy and aren't access limits: a provider key is in each user's `.env`, so their agent can use whatever it allows.
+
+Keys are write-only, and sealed in KV. Screens show only whether one is set and when it changed. Order: user, then role, then the Worker secret the provider names.
+
+Every change applies at the user's next boot, and the Users screen shows who's waiting. A user's page can apply it now: that snapshots and then restarts, and if the snapshot fails, nothing changes. A role's default model follows a role change only if the user hasn't picked their own. `config_managed` reapplies every boot; `config_defaults` applies once and is then the user's.
+
+The picker shows a price tier, such as `●●○ / medium`, from `src/model-tiers.ts`.
+
 ## Routes
 
 Everything is behind Access. Anything not listed goes to the caller's Hermes webapp.
@@ -136,6 +148,7 @@ Everything is behind Access. Anything not listed goes to the caller's Hermes web
 | `GET /__af/status` | Wakes the caller's container; reports its state |
 | `POST /__af/snapshot` | Snapshots the caller's container |
 | `POST /__af/stop` | Final snapshot, then stop |
+| `/__af/admin` | Admins: the screens above |
 | `GET /__af/admin/users` | Admins: all users, their backups, and their selected inference provider |
 | `POST /__af/admin/users/:sub/{stop,snapshot,prune}` | Admins: act on a user |
 | `PUT /__af/admin/prefill/:email` | Admins: pre-set a user's `.env` values |

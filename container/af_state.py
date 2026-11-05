@@ -319,11 +319,13 @@ def _env_values(path: Path) -> dict[str, str]:
     return {key.strip(): value.strip() for key, value in pairs if not key.lstrip().startswith("#")}
 
 
-def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], ours: str | None) -> str | None:
+def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], ours: str | None,
+                     our_model: str | None = None) -> str | None:
     """Make the template's first provider with a credential the selected one. Hermes needs this: a
     provider that's only listed leaves it reporting that nothing is connected. Runs on every boot, so a
     secret added later takes effect, but it never overrides a choice the user made. A selection this
-    code made is replaced once its credential has gone. Returns what this code has selected, if anything."""
+    code made is replaced once its credential has gone, or when the role's default changes.
+    Returns what this code has selected, if anything."""
     usable = [c for c in candidates if env.get(c["key_env"])]
     model = config.get("model")
     current = model.get("provider") if isinstance(model, dict) else None
@@ -331,7 +333,13 @@ def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], 
     empty = not model or (isinstance(model, dict) and not model.get("default") and not model.get("model"))
     stale = bool(ours) and current == ours and not any(c["provider"] == ours for c in usable)
     if not empty and not stale:
-        return ours if current == ours else None
+        if current != ours or not ours:
+            return None
+        if our_model and model.get("default") != our_model:
+            return None  # Same provider, but the user picked another model.
+        if usable and our_model and usable[0]["provider"] == ours and usable[0]["model"] != our_model:
+            model["default"] = usable[0]["model"]
+        return ours
     if usable:
         config["model"] = {"default": usable[0]["model"], "provider": usable[0]["provider"]}
         return usable[0]["provider"]
@@ -420,7 +428,8 @@ def apply(home: Path, bundle_path: Path) -> dict:
 
     candidates = bundle.get("provider_candidates") or []
     env_values = _env_values(env_path)
-    selected = _select_provider(config, candidates, env_values, marker.get("selected_provider"))
+    selected = _select_provider(config, candidates, env_values, marker.get("selected_provider"),
+                                marker.get("selected_model"))
     model = config.get("model")
     report["inference"] = {  # Names only: this goes to the logs.
         "selected": model.get("provider") if isinstance(model, dict) else ("auto" if model else None),
@@ -434,6 +443,7 @@ def apply(home: Path, bundle_path: Path) -> dict:
     _write(marker_path, json.dumps({
         "name": template.get("name"), "applied": int(time.time()), "managed_env": sorted(managed),
         "managed_providers": sorted(current_providers), "selected_provider": selected,
+        "selected_model": model.get("default") if selected and isinstance(model, dict) else None,
     }).encode())
 
     session_token = bundle.get("session_token")

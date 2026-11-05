@@ -29,6 +29,8 @@ export interface GatewayProviderEntry {
   key_env: string;
   /** api_token mode: gateway slug for the cf-aig-gateway-id header. */
   gateway_id?: string;
+  /** Worker secret to use when no key is sealed for this user or role. api_token default: CLOUDFLARE_AI_API_TOKEN. */
+  credential?: string;
   /** chat_completions (default), responses, anthropic, bedrock_converse or auto. */
   api_mode?: string;
   discover_models?: boolean;
@@ -87,6 +89,9 @@ export function validateProviders(
     if (e.mode === "api_token" && (typeof e.gateway_id !== "string" || !e.gateway_id.trim())) {
       return { ok: false, error: `${at}.gateway_id is required for mode=api_token` };
     }
+    if (e.credential !== undefined && (typeof e.credential !== "string" || !ENV_VAR_RE.test(e.credential) || e.credential === "MASTER_KEY")) {
+      return { ok: false, error: `${at}.credential must name a Worker secret other than MASTER_KEY` };
+    }
     if (e.api_mode !== undefined && !API_MODES.has(e.api_mode)) {
       return { ok: false, error: `${at}.api_mode must be one of: ${[...API_MODES].join(", ")}` };
     }
@@ -116,6 +121,7 @@ export function validateProviders(
       base_url: e.base_url,
       key_env: e.key_env,
       ...(e.gateway_id ? { gateway_id: e.gateway_id.trim() } : {}),
+      ...(e.credential ? { credential: e.credential } : {}),
       ...(e.api_mode ? { api_mode: e.api_mode } : {}),
       ...(e.discover_models !== undefined ? { discover_models: e.discover_models } : {}),
       ...(e.extra_headers ? { extra_headers: e.extra_headers } : {}),
@@ -136,19 +142,22 @@ export interface RenderedProviders {
 /**
  * `user` tags api_token requests with the caller's identity (cf-aig-metadata), so AI Gateway
  * analytics and logs stay per user even though the credential is shared.
+ * `keys` holds the resolved credential per provider name (see credentials.ts). They reach .env only.
  */
-export function renderProviders(entries: GatewayProviderEntry[], aiApiToken: string, user: string): RenderedProviders {
+export function renderProviders(entries: GatewayProviderEntry[], keys: Record<string, string>, user: string): RenderedProviders {
   const customProviders: Record<string, unknown>[] = [];
   const env: Record<string, string> = {};
   const warnings: string[] = [];
   const candidates: ProviderCandidate[] = [];
   for (const e of entries) {
     if (e.mode === "api_token") {
-      if (!aiApiToken) {
-        warnings.push(`provider "${e.name}": Worker secret CLOUDFLARE_AI_API_TOKEN is not set; skipped`);
+      if (!keys[e.name]) {
+        warnings.push(`provider "${e.name}": no key is set, and Worker secret ${e.credential ?? "CLOUDFLARE_AI_API_TOKEN"} is not set; skipped`);
         continue;
       }
-      env[e.key_env] = aiApiToken;
+      env[e.key_env] = keys[e.name];
+    } else if (keys[e.name]) {
+      env[e.key_env] = keys[e.name];
     }
     const headers: Record<string, string> = { ...e.extra_headers };
     if (e.mode === "api_token" && e.gateway_id) {

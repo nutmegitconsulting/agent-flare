@@ -52,11 +52,11 @@ Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE`
 - wrangler's OAuth login also has Containers scope, but can't edit Access.
 - This token overrides OAuth whenever it's loaded.
 
-## Tests (2026-11-05, at the deployed code)
+## Tests (2026-11-05, at the latest local code, which is ahead of what's deployed)
 
-- Worker unit tests: 36 pass (`npm test`). `tsc` clean.
-- Container tests: 36 unit, 28 integration pass (`tests/container/run.sh`), including a real chat turn to a stub provider. On this host, set `AF_BUILD_CA` when it has to build.
-- End to end through `wrangler dev`: 77 pass (`node tests/e2e/run.mjs`), including 14 routes against 5 kinds of bad token.
+- Worker unit tests: 49 pass (`npm test`). `tsc` clean.
+- Container tests: 37 unit, 32 integration pass (`tests/container/run.sh`), including a real chat turn to a stub provider and the picker's tier marks.
+- End to end through `wrangler dev`: 107 pass (`node tests/e2e/run.mjs`), including 14 Worker routes against 5 kinds of bad token and 14 admin routes against non-admin, absent, forged and wrong-audience tokens.
 
 ## Found while deploying
 
@@ -69,6 +69,26 @@ Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE`
 ## First login, production (2026-11-05)
 
 Proven with Chris's real login on the phone: Access, the Worker accepting a real JWT, container start, hydration, silent Hermes sign-in, the webapp, the template's provider selected, automatic snapshots, and a chat turn through the production gateway. Chris's `/__af/admin/users` showed state ready, template `team`, `cloudflare-gateway` selected, nothing missing, no warnings, no snapshot error, 2 backups.
+
+## Built locally, waiting for Chris's approval to deploy (2026-11-05)
+
+The live Worker doesn't have these. Deploy needs Chris's go-ahead, because the admin screens write credentials in production.
+
+- **Admin screens** at `/__af/admin`, server-rendered with no script (`src/admin.ts`): users, a user's effective config, roles, per-user overrides, keys, audit.
+- **Roles are templates**, and assigning one is an entry in `assignments.users`. Precedence: per-user override (`config/overrides/<email>.json`) > role > group, domain and default assignments (`src/effective.ts`).
+- **Keys are write-only** (`src/credentials.ts`): sealed in KV, shown only as set/not set and last changed. Order: user > role > the Worker secret the provider names. At boot a key goes to that user's `.env`, as provider keys always have.
+- **Timing:** every change applies at the user's next boot. The Users screen shows who's waiting. "Apply now" snapshots and then restarts; if the snapshot fails, the container stays up and nothing changes.
+- **Default model:** a role's default follows a role change only if the user hasn't picked their own.
+- **Audit:** one new R2 object per change, under `audit/`, never with a key value.
+- **Price tier marks** in the picker, such as `●●○ / medium`. The one list to edit is `src/model-tiers.ts`, which holds tiers and no prices; the cutoffs are in its header. Our plugin fills the picker's existing price tag with the mark, and any failure shows no mark.
+  - Hermes's fixed tooltip stays, with no figures: "Input / Output price per million tokens" in the model dialog, and "Input ●●○/Mtok · Output medium/Mtok" in the in-chat menu. Removing them would need a UI patch.
+  - The in-chat menu hides the tag unless the user turns on Hermes's price setting.
+- Roles only set which models appear and the default. **Chris's decision (2026-11-05): usability, not security**, so there's no enforcement and no budgets. The screens say so.
+
+## Known limit, and a future option
+
+- The shared gateway key is in every user's `.env`, so their agent can read it and call any model it allows. Chris accepts this for now. It's also the key on Chris's own Hermes profile.
+- If real limits are wanted later, Containers outbound handlers look like the way: per the docs they run outside the container, with bindings, so the container could hold no key. The Worker would check each request's model against the user's role and set the user tag itself. Per-role keys wouldn't do it: Cloudflare's docs say `AI Gateway Run` can't be limited to one gateway. Not built and not spiked.
 
 ## Not proven yet
 

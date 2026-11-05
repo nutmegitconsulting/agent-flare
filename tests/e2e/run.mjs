@@ -265,6 +265,93 @@ try {
   await nokey.json("/__af/stop", { method: "POST" });
   await sleep(3000);
 
+  console.log("== admin screens");
+  const form = (fields) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin: BASE, "sec-fetch-site": "same-origin" }, body: new URLSearchParams(fields).toString() });
+  const adminRoutes = [["GET", "/__af/admin"], ["GET", `/__af/admin/u/${alice.sub}`], ["GET", "/__af/admin/roles"], ["GET", "/__af/admin/roles/new"], ["GET", "/__af/admin/roles/team"], ["GET", "/__af/admin/audit"], ["GET", "/__af/admin/users"],
+    ["POST", `/__af/admin/u/${alice.sub}/role`], ["POST", `/__af/admin/u/${alice.sub}/override`], ["POST", `/__af/admin/u/${alice.sub}/key`], ["POST", `/__af/admin/u/${alice.sub}/apply`],
+    ["POST", "/__af/admin/assign"], ["POST", "/__af/admin/roles/team"], ["POST", "/__af/admin/roles/team/key"]];
+  const adminForged = jwt(admin.sub, admin.email, generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey);
+  for (const [label, token, want] of [["non-admin", alice.token, 403], ["no token", null, 401], ["forged admin", adminForged, 403], ["admin email for another audience", jwt(admin.sub, admin.email, privateKey, { aud: ["other"] }), 403]]) {
+    const wrong = [];
+    for (const [method, path] of adminRoutes) {
+      const init = { method, redirect: "manual", headers: { ...(token ? { "Cf-Access-Jwt-Assertion": token } : {}), origin: BASE, "x-admin-email": admin.email, "cf-access-authenticated-user-email": admin.email, "content-type": "application/x-www-form-urlencoded" }, ...(method === "POST" ? { body: "role=team&value=x" } : {}) };
+      if (method === "GET") delete init.headers.origin;
+      const r = await fetch(BASE + path, init);
+      await r.body?.cancel();
+      if (r.status !== want) wrong.push(`${method} ${path}: ${r.status}`);
+    }
+    expect(wrong.length === 0, `${label}: all ${adminRoutes.length} admin screen routes refuse with ${want}`, wrong.join("; "));
+  }
+  for (const [label, headers] of [["another origin", { origin: "https://evil.example" }], ["an opaque origin", { origin: "null" }], ["a cross-site fetch", { "sec-fetch-site": "cross-site" }]]) {
+    const r = await admin.fetch(`/__af/admin/assign`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers }, body: "email=evil@example.com&role=team" });
+    await r.body?.cancel();
+    expect(r.status === 403, `a write from ${label} is refused`, String(r.status));
+  }
+  const usersPage = await admin.fetch("/__af/admin");
+  const usersHtml = await usersPage.text();
+  expect(usersPage.status === 200 && usersHtml.includes(alice.email) && usersPage.headers.get("content-security-policy").includes("default-src 'none'"), "users screen lists users, with a strict CSP", usersHtml.slice(0, 300));
+  expect(!usersHtml.includes("<script"), "the screens carry no script");
+
+  // A role with a hostile name in the fields: everything user-derived must come back escaped.
+  const hostile = '<img src=x onerror=alert(1)>';
+  const saved = await admin.fetch("/__af/admin/roles/engineers", form({ name: "gw", mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY", gateway_id: "eng-gw", credential: "", models: "m 1000\nbig 2000", model: "big" }));
+  await saved.body?.cancel();
+  expect(saved.status === 303, "admin creates a role", String(saved.status));
+  const badRole = await admin.fetch("/__af/admin/roles/bad", form({ name: hostile, mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY", gateway_id: "g", models: "m", model: "" }));
+  const badHtml = await badRole.text();
+  expect(badRole.status === 400 && !badHtml.includes("<img"), "a hostile role field is refused, and escaped", badHtml.slice(0, 300));
+  const overrideHostile = await admin.fetch(`/__af/admin/u/${alice.sub}/override`, form({ role: "", gateway_id: "", models: hostile, default_model: "" }));
+  const overrideHtml = await overrideHostile.text();
+  expect(overrideHostile.status === 400 && !overrideHtml.includes("<img") && overrideHtml.includes("&#60;img"), "a hostile override is refused, and escaped", overrideHtml.slice(0, 300));
+
+  const appliedBefore = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).config.fingerprint;
+  const assignedAlice = await admin.fetch(`/__af/admin/u/${alice.sub}/role`, form({ role: "engineers" }));
+  await assignedAlice.body?.cancel();
+  expect(assignedAlice.status === 303, "admin assigns a role");
+  const pendingHtml = await (await admin.fetch(`/__af/admin/u/${alice.sub}`)).text();
+  expect(pendingHtml.includes("Change waiting for next boot") && pendingHtml.includes("<strong>engineers</strong>"), "the screen shows the new effective role, waiting for next boot", pendingHtml.slice(0, 500));
+  expect((await alice.json("/api/model/info")).provider === "gw" && !inside(alice, `cat ${HOME}/config.yaml`).includes("eng-gw"), "a running container doesn't change until it restarts");
+
+  const adminKey = "e2e-admin-set-provider-key";
+  const setKey = await admin.fetch(`/__af/admin/u/${alice.sub}/key`, form({ provider: "gw", action: "set", value: adminKey }));
+  await setKey.body?.cancel();
+  expect(setKey.status === 303, "admin sets a key for the user");
+  const overridden = await admin.fetch(`/__af/admin/u/${alice.sub}/override`, form({ role: "", gateway_id: "alice-gw", models: "", default_model: "m" }));
+  await overridden.body?.cancel();
+  expect(overridden.status === 303, "admin sets per-user overrides");
+
+  for (const path of ["/__af/admin", `/__af/admin/u/${alice.sub}`, "/__af/admin/roles", "/__af/admin/roles/engineers", "/__af/admin/audit", "/__af/admin/users"]) {
+    const text = await (await admin.fetch(path)).text();
+    if (text.includes(adminKey)) fail(`a key appears at ${path}`);
+  }
+  ok("the key appears on no admin screen or API");
+  const auditHtml = await (await admin.fetch("/__af/admin/audit")).text();
+  expect(auditHtml.includes("key.set") && auditHtml.includes("role.assign") && auditHtml.includes(admin.email), "the audit shows who changed what");
+
+  const applied = await admin.fetch(`/__af/admin/u/${alice.sub}/apply`, form({}));
+  await applied.body?.cancel();
+  expect(applied.status === 303, "admin applies the change");
+  await sleep(3000);
+  expect(!containerOf(alice), "applying stops the container, after a snapshot");
+  expect((await alice.waitReady()).state === "ready", "the user wakes on their next visit");
+  const afterApply = inside(alice, `cat ${HOME}/config.yaml`);
+  expect(afterApply.includes("alice-gw") && afterApply.includes("big"), "the new role and the override are in place", afterApply.slice(0, 400));
+  expect(inside(alice, `cat ${HOME}/SOUL.md`) === "template soul", "the user's files are untouched by the change");
+  const keyInEnv = inside(alice, `grep -c '^GW_KEY=${adminKey}$' ${HOME}/.env`);
+  expect(keyInEnv === "1", "the user's key reaches .env at boot");
+  const roleInfo = await alice.json("/api/model/info");
+  expect(roleInfo.model === "m", "the override's default model is selected", JSON.stringify(roleInfo));
+  const upToDate = await (await admin.fetch(`/__af/admin/u/${alice.sub}`)).text();
+  expect(upToDate.includes("Running config is up to date") && (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).config.fingerprint !== appliedBefore, "pending clears after the restart");
+  // Back to the template the rest of this suite expects.
+  for (const [path, fields] of [[`/__af/admin/u/${alice.sub}/override`, { role: "", gateway_id: "", models: "", default_model: "" }], [`/__af/admin/u/${alice.sub}/role`, { role: "team" }], [`/__af/admin/u/${alice.sub}/key`, { provider: "gw", action: "clear" }]]) {
+    const r = await admin.fetch(path, form(fields));
+    await r.body?.cancel();
+  }
+  await alice.json("/__af/stop", { method: "POST" });
+  await sleep(3000);
+  expect((await alice.waitReady()).state === "ready", "wakes with the original role");
+
   console.log("== isolation");
   expect((await bob.waitReady()).state === "ready", "second user gets a container");
   expect(containerOf(alice) !== containerOf(bob), "same email local part, different containers");
@@ -311,7 +398,7 @@ try {
   expect(sql(alice, "print(c.execute('select count(*) from e2e').fetchone()[0])") === "2", "live data untouched by further requests");
 
   console.log("== nothing secret in R2 or KV");
-  for (const needle of ["e2e-user-secret", "e2e-shared-token", "byo-prefill-secret"]) {
+  for (const needle of ["e2e-user-secret", "e2e-shared-token", "byo-prefill-secret", "e2e-admin-set-provider-key"]) {
     expect(grepTree(join(persist), needle).filter((p) => !p.endsWith(".log")).length === 0, `${needle} absent from all of local R2 and KV in plaintext`);
   }
 
@@ -323,11 +410,12 @@ try {
   expect(!!second.id, "second snapshot");
   writeFileSync(join(persist, "junk"), randomBytes(200_000));
   r2Put(`backups/${second.id}/data.sqsh`, join(persist, "junk"));
+  const beforeStop = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).backups;
   await alice.json("/__af/stop", { method: "POST" });
   await sleep(3000);
-  // The stop above took a third snapshot, which is good; corrupt that too.
+  // The stop above took a further snapshot, which is good; corrupt that too.
   const third = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub);
-  expect(third.backups === 5, "stop added a final snapshot", JSON.stringify(third));
+  expect(third.backups === beforeStop + 1, "stop added a final snapshot", JSON.stringify(third));
   const index = execFileSync("npx", ["wrangler", "r2", "object", "get", `agent-flare-state/users/${alice.sub}/backups-index.json`, "--local", "--persist-to", persist, "--pipe"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   const entries = JSON.parse(index);
   r2Put(`backups/${entries.at(-1).id}/data.sqsh`, join(persist, "junk"));
@@ -347,7 +435,7 @@ try {
   const errorBody = await errorPage.text();
   expect(errorPage.status === 500 && errorBody.includes("couldn't start"), "user sees an honest error page", errorBody.slice(0, 300));
   const refused = await alice.json("/__af/snapshot", { method: "POST" });
-  expect(refused.skipped === "container not hydrated" || refused.skipped === "container not running", "snapshot refused when not hydrated", JSON.stringify(refused));
+  expect(["container not hydrated", "container not running", "container stopping"].includes(refused.skipped), "snapshot refused when not hydrated", JSON.stringify(refused));
   await sleep(3000);
   const bobContainer = containerOf(bob)?.slice(0, 12);
   const strays = execFileSync("docker", ["ps", "--filter", "name=workerd", "--format", "{{.ID}} {{.Image}}"], { encoding: "utf8" })
@@ -402,6 +490,7 @@ try {
   const burstRestore = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === bob.sub).lastRestore;
   expect(burstRestore.skipped.length === 0, "no snapshot from the burst was corrupt", JSON.stringify(burstRestore));
 
+  expect(!log.join("").includes("e2e-admin-set-provider-key"), "the admin-set key is in no Worker log");
   console.log(`PASS: ${passed} checks`);
   process.exitCode = 0;
 } catch (err) {

@@ -97,7 +97,7 @@ describe("providers", () => {
   it("renders the credential only into env, never config", () => {
     const parsed = validateProviders([entry]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, "tok", "a@b.com");
+    const rendered = renderProviders(parsed.entries, { gw: "tok", byo: "" }, "a@b.com");
     expect(rendered.env).toEqual({ GW_KEY: "tok" });
     expect(JSON.stringify(rendered.customProviders)).not.toContain("tok");
     expect(rendered.customProviders[0].extra_headers).toEqual({
@@ -108,14 +108,18 @@ describe("providers", () => {
   it("selects the first listed model when none is named", () => {
     const parsed = validateProviders([{ ...entry, model: undefined, models: { first: {}, second: {} } }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    expect(renderProviders(parsed.entries, "tok", "a@b.com").candidates[0].model).toBe("first");
+    expect(renderProviders(parsed.entries, { gw: "tok", byo: "" }, "a@b.com").candidates[0].model).toBe("first");
   });
   it("names a user_env provider without injecting anything", () => {
     const parsed = validateProviders([{ name: "byo", mode: "user_env", base_url: "https://x/v1", key_env: "BYO", models: { m: {} } }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, "tok", "a@b.com");
+    const rendered = renderProviders(parsed.entries, { gw: "tok", byo: "" }, "a@b.com");
     expect(rendered.env).toEqual({});
     expect(rendered.candidates).toEqual([{ provider: "byo", model: "m", key_env: "BYO" }]);
+  });
+  it("refuses a credential reference to MASTER_KEY", () => {
+    expect(validateProviders([{ ...entry, credential: "MASTER_KEY" }]).ok).toBe(false);
+    expect(validateProviders([{ ...entry, credential: "OTHER_SECRET" }]).ok).toBe(true);
   });
   it("refuses what Hermes wouldn't route, or what would put a secret in config.yaml", () => {
     const error = (e: unknown) => {
@@ -131,10 +135,17 @@ describe("providers", () => {
   it("skips api_token entries when the Worker secret is unset", () => {
     const parsed = validateProviders([entry]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, "", "a@b.com");
+    const rendered = renderProviders(parsed.entries, {}, "a@b.com");
     expect(rendered.customProviders).toEqual([]);
     expect(rendered.candidates).toEqual([]);
     expect(rendered.warnings).toHaveLength(1);
     expect(rendered.warnings[0]).toContain("CLOUDFLARE_AI_API_TOKEN");
+  });
+  it("uses a key an admin set for a user_env provider, in .env only", () => {
+    const parsed = validateProviders([{ name: "byo", mode: "user_env", base_url: "https://x/v1", key_env: "BYO", models: { m: {} } }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const rendered = renderProviders(parsed.entries, { byo: "sealed-value" }, "a@b.com");
+    expect(rendered.env).toEqual({ BYO: "sealed-value" });
+    expect(JSON.stringify(rendered.customProviders)).not.toContain("sealed-value");
   });
 });

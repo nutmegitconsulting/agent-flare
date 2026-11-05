@@ -352,6 +352,16 @@ class Apply(Base):
         self.bundle(provider_candidates=[self.GW, self.BYO])
         self.assertNotIn("model", self.config())
 
+    def test_a_role_change_moves_our_default_but_not_a_users_pick(self):
+        self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        moved = {**self.GW, "model": "m3"}
+        self.bundle(env={"GW_KEY": "t"}, provider_candidates=[moved])
+        self.assertEqual(self.config()["model"]["default"], "m3")
+        config = (self.home / "config.yaml").read_text().replace("default: m3", "default: picked")
+        (self.home / "config.yaml").write_text(config)
+        self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        self.assertEqual(self.config()["model"]["default"], "picked")
+
     def test_a_provider_the_template_dropped_leaves_and_a_users_own_stays(self):
         (self.home / "config.yaml").write_text("custom_providers:\n- name: mine\n  base_url: u\n")
         self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "b"}]})

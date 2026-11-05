@@ -1,6 +1,6 @@
 import type { ReadyState } from "./sandbox";
 
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
