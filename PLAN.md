@@ -27,9 +27,9 @@ See `README.md`. In short: Browser -> Access -> Worker -> per-user Sandbox -> He
 
 ## Live state (2026-11-05)
 
-- Hostname `agents.shipleybuilds.ai`, Worker `agent-flare`, image tag `3400815`. Access app "agents" (Chris's) covers it.
+- Hostname `agents.shipleybuilds.ai`, Worker `agent-flare`, image tag `9765e5d`, deployed from commit `4e1fd74`. Access app "agents" (Chris's) covers it, and that hostname only.
 - `workers_dev` and `preview_urls` are off. The Access app also lists a workers.dev name; nothing serves there.
-- R2 `agent-flare-state`, KV `agent-flare-credentials`, secrets `MASTER_KEY` and `CLOUDFLARE_AI_API_TOKEN`, two crons, template `team` assigned as the default.
+- R2 `agent-flare-state`, KV `agent-flare-credentials`, secrets `MASTER_KEY` and `CLOUDFLARE_AI_API_TOKEN`, two crons, template `team` assigned as the default, tiers in `config/model-tiers.json`.
 - Local, gitignored: `wrangler.prod.jsonc`, `templates/team/`, `templates/assignments.json`. `wrangler.jsonc` is the local test config, kept separate.
 - A copy of `MASTER_KEY` is in `~/.config/agent-flare-master-key`, mode 600. Losing the key loses everything sealed in KV.
 
@@ -52,11 +52,11 @@ Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE`
 - wrangler's OAuth login also has Containers scope, but can't edit Access.
 - This token overrides OAuth whenever it's loaded.
 
-## Tests (2026-11-05, at the latest local code, which is ahead of what's deployed)
+## Tests (2026-11-05, at the deployed code)
 
 - Worker unit tests: 49 pass (`npm test`). `tsc` clean.
-- Container tests: 37 unit, 32 integration pass (`tests/container/run.sh`), including a real chat turn to a stub provider.
-- End to end through `wrangler dev`: 107 pass (`node tests/e2e/run.mjs`), including 14 Worker routes against 5 kinds of bad token and 14 admin routes against non-admin, absent, forged and wrong-audience tokens.
+- Container tests: 38 unit, 37 integration pass (`tests/container/run.sh`), including a real chat turn to a stub provider for each tier mark.
+- End to end through `wrangler dev`: 111 pass (`node tests/e2e/run.mjs`), including 14 Worker routes against 5 kinds of bad token and 14 admin routes against non-admin, absent, forged and wrong-audience tokens.
 
 ## Found while deploying
 
@@ -70,9 +70,9 @@ Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE`
 
 Proven with Chris's real login on the phone: Access, the Worker accepting a real JWT, container start, hydration, silent Hermes sign-in, the webapp, the template's provider selected, automatic snapshots, and a chat turn through the production gateway. Chris's `/__af/admin/users` showed state ready, template `team`, `cloudflare-gateway` selected, nothing missing, no warnings, no snapshot error, 2 backups.
 
-## Built locally, waiting for Chris's approval to deploy (2026-11-05)
+## Admin screens, deployed 2026-11-05
 
-The live Worker doesn't have these. Deploy needs Chris's go-ahead, because the admin screens write credentials in production.
+Not yet used with a real login.
 
 - **Admin screens** at `/__af/admin`, server-rendered with no script (`src/admin.ts`): users, a user's effective config, roles, per-user overrides, keys, audit.
 - **Roles are templates**, and assigning one is an entry in `assignments.users`. Precedence: per-user override (`config/overrides/<email>.json`) > role > group, domain and default assignments (`src/effective.ts`).
@@ -98,6 +98,7 @@ Chris: vanilla Hermes, with no patch and no new plugin code. A plugin mark and a
 
 ## Not proven yet
 
+0. With a real login: the admin screens, "Apply now", tier marks in the picker, and dark mode
 1. Stop and restore in production. Chris plans to test from a desktop: `fetch('/__af/stop',{method:'POST'})` in the console, then reload. This also covers restore memory behavior on production Durable Objects (`SANDBOX_TRANSPORT=rpc`)
 2. The container's proxy peer address being in `trusted_proxies`. In browser dev tools, the session cookies should start `__Host-` and be `Secure`. If they don't, sign-in still works but the cookies are weaker
 3. `cf-aig-metadata` user tags showing in Gateway logs
