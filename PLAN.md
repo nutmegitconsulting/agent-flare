@@ -63,20 +63,21 @@ Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE`
 - The old example template never worked: a provider that's only listed leaves Hermes reporting nothing connected. A selected provider with no key sends `no-key-required` and gets refused. The container now selects only a provider that has a credential.
 - A snapshot taken as a container stopped could record 0 files, outrank every good backup and pass verification. It appeared once, under load, and it's fixed. It was older than this work.
 - A single 4 GB layer timed out pushing. The image is now multi-stage, 1.85 GB compressed. Pushing through inspection can still time out on one layer; retrying finishes it.
-- At deploy time, the gateway's default model answered 429 "at capacity" on every try, while another model answered 200. The credential is good. If it persists, change `model` in `templates/team/template.json` and push it; that affects only users with no model selected yet.
+- The first login landed on a workers.dev name instead of the app. That name was a second hostname on the Access app, and the request never reached the Worker. It stopped once Chris removed the hostname.
+- The profile's default model, `glm-5.3-flash`, answered 429 "at capacity" (code 4006) on all 10 direct calls across about 3 hours, while `qwen3.8-27b` answered 200 on all 7 with the same credential. A wrong key gets 401, so the 429 isn't an auth problem. The `team` template now selects `@cf/qwen/qwen3.8-27b`; glm stays listed. An existing user keeps the model they have until they pick another: the picker lists all 8 models.
+
+## First login, production (2026-11-05)
+
+Proven with Chris's real login on the phone: Access, the Worker accepting a real JWT, container start, hydration, silent Hermes sign-in, the webapp, the template's provider selected, automatic snapshots, and a chat turn through the production gateway. Chris's `/__af/admin/users` showed state ready, template `team`, `cloudflare-gateway` selected, nothing missing, no warnings, no snapshot error, 2 backups.
 
 ## Not proven yet
 
-Only a real login can test these:
-
-1. Real Access login, the JWKS fetch from the real team domain, and the Worker accepting a real JWT
-2. Whether Access's real JWT carries what `verifyAccessJwt` expects, for this app
-3. The container's proxy peer address being in `trusted_proxies`. If it isn't, cookies lose `__Host-` and `Secure`, though sign-in should still work
-4. A real chat turn through the production gateway from a container, and `cf-aig-metadata` tags in Gateway logs
-5. Restore memory behavior on production Durable Objects (`SANDBOX_TRANSPORT=rpc`)
-6. Transient-failure classification in `restoreNewest`: real failure messages may differ
-7. `get-identity` for group assignment (assignments don't use groups today)
-8. Workers Builds building this Dockerfile from GitHub
+1. Stop and restore in production. Chris plans to test from a desktop: `fetch('/__af/stop',{method:'POST'})` in the console, then reload. This also covers restore memory behavior on production Durable Objects (`SANDBOX_TRANSPORT=rpc`)
+2. The container's proxy peer address being in `trusted_proxies`. In browser dev tools, the session cookies should start `__Host-` and be `Secure`. If they don't, sign-in still works but the cookies are weaker
+3. `cf-aig-metadata` user tags showing in Gateway logs
+4. Transient-failure classification in `restoreNewest`: real failure messages may differ
+5. `get-identity` for group assignment (assignments don't use groups today)
+6. Workers Builds building this Dockerfile from GitHub
 
 ## Changes Chris should know about
 
