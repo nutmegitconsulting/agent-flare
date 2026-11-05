@@ -14,15 +14,18 @@ import type { Env } from "./env";
 import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest } from "./persistence";
 import { renderProviders } from "./providers";
 import { pruneSnapshots } from "./prune";
-import { deriveUserSecret, getSealed, prefillKey, putSealed, sealedFilesKey } from "./secrets";
+import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
 import { fetchAccessGroups, loadAssignments, loadTemplate, pickTemplate } from "./templates";
 
 export const WEBAPP_PORT = 443;
 const RUN_DIR = "/run/agent-flare";
 const READY_FILE = `${RUN_DIR}/ready`;
 const IDENTITY_KEY = "identity";
+const SEALED_COPY_KEY = "sealed-files";
 const ACTIVE_PREFIX = "active/";
 const WEBAPP_START_TIMEOUT_MS = 120_000;
+/** After a failed hydration, keep reporting it for this long before trying again. */
+const HYDRATION_RETRY_MS = 30_000;
 
 export type ReadyState =
   | { state: "ready" }
@@ -40,12 +43,16 @@ export class HermesSandbox extends Sandbox<Env> {
   private lastUserActivity = 0;
   private lastSnapshotAt = 0;
   private finalSnapshotRunning = false;
+  private lastFailureAt = 0;
 
   /** Current state. Starts hydration if needed and returns without waiting for it. */
   async ensureReady(identity: AccessIdentity, publicUrl: string, accessJwt: string): Promise<ReadyState> {
     this.lastUserActivity = Date.now();
     if (this.ready && (await this.isRunning())) return { state: "ready" };
     this.ready = false;
+    if (this.status.state === "failed" && Date.now() - this.lastFailureAt < HYDRATION_RETRY_MS) {
+      return this.status;
+    }
     if (!this.hydration) {
       this.status = { state: "starting", step: "starting container" };
       const run = this.hydrate({ ...identity, publicUrl }, accessJwt)
@@ -56,6 +63,7 @@ export class HermesSandbox extends Sandbox<Env> {
         .catch((err) => {
           const error = err instanceof Error ? err.message : String(err);
           console.error(`[hydrate:${identity.sub}] ${error}`);
+          this.lastFailureAt = Date.now();
           this.status = { state: "failed", error };
         })
         .finally(() => {
@@ -118,8 +126,13 @@ export class HermesSandbox extends Sandbox<Env> {
     const providers = renderProviders(template?.providers ?? [], env.CLOUDFLARE_AI_API_TOKEN ?? "", identity.email);
     warnings.push(...providers.warnings);
 
-    const sealed = await getSealed<Record<string, string>>(
-      env.CREDENTIALS_KV, env.MASTER_KEY, sealedFilesKey(identity.sub));
+    // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
+    // secret changed just before a stop. KV stays the durable home for the value.
+    const filesKey = sealedFilesKey(identity.sub);
+    const sealedRaw = (await this.ctx.storage.get<string>(SEALED_COPY_KEY)) ?? (await env.CREDENTIALS_KV.get(filesKey));
+    const sealed = sealedRaw
+      ? (JSON.parse(await unseal(env.MASTER_KEY, filesKey, sealedRaw)) as Record<string, string>)
+      : null;
     const prefill = await getSealed<Record<string, string>>(
       env.CREDENTIALS_KV, env.MASTER_KEY, prefillKey(identity.email));
 
@@ -175,6 +188,8 @@ export class HermesSandbox extends Sandbox<Env> {
       try {
         const response = await this.containerFetch(
           new Request("http://localhost/api/health"), WEBAPP_PORT);
+        // Unread bodies count as in-flight requests, which would keep the container awake forever.
+        await response.body?.cancel();
         if (response.ok) return;
         lastError = `status ${response.status}`;
       } catch (err) {
@@ -198,8 +213,10 @@ export class HermesSandbox extends Sandbox<Env> {
 
     const secrets = await this.exec(`${AF_STATE} seal-read ${HERMES_HOME}`);
     if (secrets.exitCode !== 0) throw new Error(`reading secret files failed: ${secrets.stderr.slice(0, 500)}`);
-    await putSealed(this.env.CREDENTIALS_KV, this.env.MASTER_KEY, sealedFilesKey(identity.sub),
-      JSON.parse(secrets.stdout));
+    const filesKey = sealedFilesKey(identity.sub);
+    const sealedValue = await seal(this.env.MASTER_KEY, filesKey, secrets.stdout);
+    await this.env.CREDENTIALS_KV.put(filesKey, sealedValue);
+    await this.ctx.storage.put(SEALED_COPY_KEY, sealedValue);
 
     const entry = await createSnapshot(this, this.env.BACKUP_BUCKET, identity.sub);
     this.lastSnapshotAt = Date.now();
@@ -230,11 +247,12 @@ export class HermesSandbox extends Sandbox<Env> {
     return identity ? pruneSnapshots(this.env.BACKUP_BUCKET, identity.sub) : null;
   }
 
-  async describe(): Promise<{ identity: string | null; status: ReadyState; lastSnapshotAt: number; lastUserActivity: number }> {
+  async describe(): Promise<{ identity: string | null; status: ReadyState; lastSnapshotAt: number; lastUserActivity: number; inflight: number }> {
     const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
     return {
       identity: identity?.email ?? null, status: this.status,
       lastSnapshotAt: this.lastSnapshotAt, lastUserActivity: this.lastUserActivity,
+      inflight: (this as unknown as { inflightRequests?: number }).inflightRequests ?? 0,
     };
   }
 

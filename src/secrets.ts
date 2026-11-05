@@ -4,7 +4,8 @@
  * per-user is either derived from it or stored in KV encrypted with a key derived from it.
  *
  * KV layout (values are "v1.<iv>.<ciphertext>", base64url, AES-256-GCM):
- *   sealed:files:<sub>     the user's secret files from their container (.env, auth.json, ...)
+ *   sealed:files:<sub>     the user's secret files from their container (.env, auth.json, ...).
+ *                          The user's Durable Object keeps a copy for strongly consistent reads.
  *   sealed:prefill:<email> values an admin set before the user's first login
  *
  * The KV key is bound into the ciphertext as additional data, so a value copied to another

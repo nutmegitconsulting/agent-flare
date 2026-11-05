@@ -9,6 +9,7 @@
  * The container key comes only from a verified Access JWT, so no request parameter can reach
  * another user's container. Admin routes are the one exception, and they check ADMIN_EMAILS.
  */
+import { switchPort } from "@cloudflare/containers";
 import { getSandbox } from "@cloudflare/sandbox";
 import { Hono } from "hono";
 import { AccessError, verifyAccessJwt, type AccessIdentity } from "./access";
@@ -171,7 +172,8 @@ app.all("*", async (c) => {
 
   const request = forProxy(c.req.raw);
   if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-    return sandbox.wsConnect(request, WEBAPP_PORT);
+    // Not sandbox.wsConnect: it refuses ports below 1024, and the webapp is on 443.
+    return sandbox.fetch(switchPort(request, WEBAPP_PORT));
   }
   return sandbox.containerFetch(request, WEBAPP_PORT);
 });

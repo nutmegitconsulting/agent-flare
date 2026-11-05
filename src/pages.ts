@@ -25,7 +25,7 @@ export function startingPage(status: ReadyState): string {
 </style></head>
 <body><main>
 ${failed
-    ? `<h1>Your agent couldn't start</h1><p>${escapeHtml(status.error)}</p><p>Your saved state hasn't been changed. Reload to try again.</p>`
+    ? `<h1>Your agent couldn't start</h1><p>${escapeHtml(status.error)}</p><p>Your saved state hasn't been changed. Reload in a minute to try again.</p>`
     : `<h1>Starting your agent</h1><p id="step">${escapeHtml(message)}…</p><div class="bar"></div>
 <script>
   async function poll() {
