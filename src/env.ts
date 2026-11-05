@@ -1,34 +1,31 @@
-import type { R2Bucket, KVNamespace, DurableObjectNamespace } from "@cloudflare/workers-types";
-import type { Sandbox } from "@cloudflare/sandbox";
+import type { HermesSandbox } from "./sandbox";
 
 export interface Env {
-  Sandbox: DurableObjectNamespace<Sandbox>;
+  Sandbox: DurableObjectNamespace<HermesSandbox>;
+  /** Snapshots, indexes, templates and assignments. No secrets. */
   BACKUP_BUCKET: R2Bucket;
-  /** Credentials store (V9): tunnel token, dashboard session token, gateway
-   *  JWT. Kept OUT of the R2 backup bucket so third-party R2 backups never
-   *  carry usable credentials. Write-once/read-many fits KV's eventual
-   *  consistency (~60s propagation) — credentials are written at provision
-   *  time and read on wake, never rewritten mid-flight. */
+  /** Per-user secrets, always encrypted with MASTER_KEY. See secrets.ts. */
   CREDENTIALS_KV: KVNamespace;
+
+  /** Access application audience tag. */
   ACCESS_AUD_TAG: string;
-  CF_ACCOUNT_ID: string;
-  CF_ZONE_ID: string;
-  CF_API_TOKEN: string;
-  SNAPSHOT_INTERVAL_MINUTES: string;
-  /** Per-user tunnel hostnames are `<TUNNEL_NAME_PREFIX>-<userId>.<TUNNEL_BASE_DOMAIN>`.
-   *  TUNNEL_BASE_DOMAIN is required (fail-fast at client-init when absent);
-   *  TUNNEL_NAME_PREFIX defaults to "hermes". Both live in wrangler vars —
-   *  they are tenant-specific, not code. */
-  TUNNEL_BASE_DOMAIN: string;
-  TUNNEL_NAME_PREFIX?: string;
-  /** Access team domain (e.g. "myteam.cloudflareaccess.com") that issues the
-   *  Access JWTs this worker validates. Required: JWT validation fetches
-   *  signing certs from https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs and
-   *  rejects tokens whose iss doesn't match. */
+  /** e.g. "myteam.cloudflareaccess.com". */
   ACCESS_TEAM_DOMAIN: string;
-  /** V8: CF API token with Workers AI:Read — credential for mode=api_token
-   *  provider entries (account-scoped AI Gateway REST endpoint). Optional at
-   *  type level so jwt-only setups don't need it; unset entries are skipped
-   *  with a logged error. */
+  /** Comma-separated emails allowed on /__af/admin/*. Empty means no admins. */
+  ADMIN_EMAILS?: string;
+  /** Idle time before a container sleeps, e.g. "30m". */
+  SLEEP_AFTER?: string;
+  SNAPSHOT_INTERVAL_MINUTES?: string;
+
+  /** Worker secret, 32+ characters. Root of all per-user secrets. Rotating it invalidates them. */
+  MASTER_KEY: string;
+  /** Optional Worker secret: credential for api_token providers. */
   CLOUDFLARE_AI_API_TOKEN?: string;
+
+  /**
+   * Local tests only. When ALLOW_TEST_JWKS is "1", Access keys come from TEST_JWKS instead of
+   * Cloudflare. Set in .dev.vars for `wrangler dev`; never set these on a deployed Worker.
+   */
+  ALLOW_TEST_JWKS?: string;
+  TEST_JWKS?: string;
 }

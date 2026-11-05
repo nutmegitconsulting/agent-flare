@@ -1,0 +1,5 @@
+name: cloudflare-access
+version: 1.0.0
+description: "Dashboard auth provider: signs in with the Cloudflare Access identity the Agent Flare Worker already verified, so users never see a second login."
+author: Agent Flare
+kind: backend

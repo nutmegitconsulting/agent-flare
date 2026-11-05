@@ -7,16 +7,10 @@ dist/
 .dev.vars
 .dev.vars.*
 !.dev.vars.example
-users/
-active-users.json
 wrangler.jsonc
 .hermes/
-
-# Local copies of the script templates (contain your deployment's URLs)
-scripts/setup-client.ps1
-scripts/hermes-client.ps1
-scripts/stop-instance.ps1
-scripts/destroy-instance.ps1
-scripts/stop-instance.sh
-scripts/destroy-instance.sh
-scripts/reference-providers.json
+__pycache__/
+# Your real templates can name people and internal settings. templates/example is the only tracked one.
+templates/*
+!templates/example/
+!templates/assignments.example.json

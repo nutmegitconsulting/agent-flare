@@ -1,9 +1,12 @@
 {
+  // Copy to wrangler.jsonc (gitignored), or let scripts/render-wrangler.mjs generate it.
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "hermes-cloudflare-v6",
+  "name": "agent-flare",
   "main": "src/index.ts",
+  // No workers.dev route: every request must arrive through Access on your hostname.
   "workers_dev": false,
-  "routes": [{ "pattern": "hermes-agent.example.com", "custom_domain": true }],
+  "preview_urls": false,
+  "routes": [{ "pattern": "agents.example.com", "custom_domain": true }],
   "compatibility_date": "2026-08-03",
   "compatibility_flags": ["nodejs_compat"],
   "containers": [
@@ -11,61 +14,37 @@
       "class_name": "HermesSandbox",
       "image": "./Dockerfile",
       "instance_type": "standard-2",
-      "max_instances": 3,
-      // ssh.enabled is TROUBLESHOOTING-ONLY (debug shell via
-      // `wrangler containers ssh <INSTANCE_ID>`). Notes for anyone reading:
-      //  - Wrangler defaults this to true when omitted — the explicit true
-      //    is documentation, not a functional change. Set false to fully
-      //    disable the wrangler SSH tunnel.
-      //  - This flag only opens the wrangler-side tunnel. It grants nothing
-      //    by itself: connecting requires (a) sshd actually running inside
-      //    the sandbox image — here that's openssh-server in the Dockerfile,
-      //    launched by start-hermes.sh — and (b) your ssh-ed25519 public key
-      //    hydrated via authorized_keys below. Without both, SSH goes
-      //    nowhere.
-      //  - authorized_keys is intentionally left commented out. See the
-      //    Cloudflare Containers SSH docs before enabling:
-      //    https://developers.cloudflare.com/containers/
-      "ssh": {
-        "enabled": true
-      }
-      // SSH access (debugging): a running sandbox can be reached with
-      // `wrangler containers ssh <INSTANCE_ID>`, but it must first be
-      // hydrated with your ssh-ed25519 public key (the only supported type).
-      // Uncomment and fill in your own key — read the Cloudflare Containers
-      // docs on SSH before enabling: https://developers.cloudflare.com/containers/
-      // "authorized_keys": [
-      //   {
-      //     "name": "<your-name>",
-      //     "public_key": "ssh-ed25519 <your-public-key>"
-      //   }
-      // ]
+      // One container per active user.
+      "max_instances": 10,
+      // Debug shell via `wrangler containers ssh`. Needs an ssh-ed25519 key under
+      // authorized_keys to work at all; set false to close it entirely.
+      "ssh": { "enabled": false }
     }
   ],
   "durable_objects": {
-    "bindings": [
-      { "name": "Sandbox", "class_name": "HermesSandbox" }
-    ]
+    "bindings": [{ "name": "Sandbox", "class_name": "HermesSandbox" }]
   },
   "migrations": [
-    { "new_sqlite_classes": ["HermesSandbox", "HermesAgent"], "tag": "v1" },
-    { "deleted_classes": ["HermesAgent"], "tag": "v2" }
+    { "new_sqlite_classes": ["HermesSandbox"], "tag": "v1" }
   ],
   "r2_buckets": [
-    { "binding": "BACKUP_BUCKET", "bucket_name": "hermes-agent-state" }
+    { "binding": "BACKUP_BUCKET", "bucket_name": "agent-flare-state" }
   ],
   "kv_namespaces": [
     { "binding": "CREDENTIALS_KV", "id": "YOUR_KV_NAMESPACE_ID" }
   ],
-  // Plain-text vars (ACCESS_AUD_TAG, CF_ACCOUNT_ID, CF_ZONE_ID) are set in the
-  // dashboard; without keep_vars, `wrangler deploy` deletes every var not
-  // listed here. keep_vars: true also preserves dashboard-managed secrets.
+  // Keeps secrets set with `wrangler secret put` across deploys.
   "keep_vars": true,
   "vars": {
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    "ACCESS_AUD_TAG": "your-access-application-aud",
+    "ADMIN_EMAILS": "",
+    "SLEEP_AFTER": "30m",
     "SNAPSHOT_INTERVAL_MINUTES": "10",
-    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com"
+    // Streams restores instead of loading the whole archive into Durable Object memory.
+    "SANDBOX_TRANSPORT": "rpc"
   },
   "triggers": {
-    "crons": ["*/10 * * * *", "0 */2 * * *"]
+    "crons": ["*/5 * * * *", "0 */2 * * *"]
   }
 }

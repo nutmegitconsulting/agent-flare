@@ -5,7 +5,6 @@ export interface BackupEntry {
   id: string;
   dir: string;
   createdAt: string;
-  /** Full SDK restore handle (always present in V8+ entries) */
   handle: DirectoryBackup;
 }
 

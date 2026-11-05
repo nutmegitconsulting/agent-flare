@@ -1,0 +1,20 @@
+{
+  "files": ["SOUL.md"],
+  "config_defaults": {
+    "model": "@gateway/@cf/meta/llama-3.3-70b-instruct-fp16"
+  },
+  "config_managed": {},
+  "env": {},
+  "providers": [
+    {
+      "name": "gateway",
+      "mode": "api_token",
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1",
+      "key_env": "CLOUDFLARE_AI_API_TOKEN",
+      "gateway_id": "YOUR_GATEWAY_SLUG",
+      "models": {
+        "@cf/meta/llama-3.3-70b-instruct-fp16": { "context_length": 24000 }
+      }
+    }
+  ]
+}
