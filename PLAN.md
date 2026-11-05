@@ -1,48 +1,82 @@
 # Agent Flare: webapp and state overhaul
 
-Branch: `webapp-and-state`. Local only: no pushes or deploys until Chris says so.
-Started 2026-11-04. Keep this file current; secrets never go in it.
+Branch: `webapp-and-state`. Deployed from this machine 2026-11-05. Not pushed to GitHub: Chris hasn't asked for that yet.
+Started 2026-11-04. Keep this file current; secrets, the account ID and the Access AUD never go in it.
 
 ## Goal
 
 1. Replace Hermes Desktop, per-user cloudflared tunnels and PowerShell with the Hermes webapp, behind Cloudflare Access, routed by Access user ID.
 2. Make state reliable: restores that complete, and snapshots that can't destroy good data.
-3. Config templates assigned to users, so their files are filled in on first launch.
+3. Config templates assigned to users, whose real job is pre-filling inference providers.
 4. Eventually: deploy straight from GitHub, so people can clone and go.
 
-## Decisions from Chris (2026-11-04)
+## Decisions from Chris
 
-- Local branch; no deploys tonight.
-- Port 443 in the container. Plain HTTP on the internal Worker-to-container hop, no certificate (TLS ends at Cloudflare). To be revisited if Chris meant real TLS in the container.
-- Hermes auth plugin trusting the Access identity is approved. None ships with Hermes (bundled: basic, drain, nous, self_hosted, session_token).
+- **Port (changed 2026-11-05):** only the browser's endpoint needs 443. Hermes stays on its default port, 9120, in the container. This replaces the earlier "443 in the container" decision. TLS ends at Cloudflare; the internal hop is plain HTTP, and only the Worker can reach it.
+- **Templates (2026-11-05):** pre-fill inference providers. Production uses the Cloudflare gateway from Chris's default Hermes profile, and only that one.
+- **Clean image (2026-11-05):** this host inspects TLS. A CA reaches the build only as a BuildKit secret; the base is pinned by digest; `scripts/check-image.sh` must pass before any push.
+- **First deploy approved 2026-11-05**, for this project's resources only. No GitHub push.
+- Hermes auth plugin trusting the Access identity is approved. None ships with Hermes.
 - All existing user state is disposable. No migration.
-- Nobody uses Desktop. Remove tunnel code and PowerShell client scripts.
-- Shared secrets move to Worker Secrets. Per-user secrets stay in KV, encrypted with a master key held in Secrets. Reason: Worker limit is 128 secrets + vars on paid (64 on free), per Worker, so per-user Secrets would cap at about 100 users.
+- Nobody uses Desktop. Tunnel code and PowerShell client scripts are gone.
+- Shared secrets are Worker Secrets. Per-user secrets stay in KV, encrypted with a master key held in Secrets. Reason: Worker limit is 128 secrets + vars on paid (64 on free), per Worker, so per-user Secrets would cap at about 100 users.
 
 ## Design
 
-See `README.md`. In short: Browser -> Access -> Worker -> per-user Sandbox -> Hermes webapp :443, keyed on the Access `sub`.
+See `README.md`. In short: Browser -> Access -> Worker -> per-user Sandbox -> Hermes webapp :9120, keyed on the Access `sub`.
 
-## Status (2026-11-05)
+## Live state (2026-11-05)
 
-Built and tested locally, on this branch. Not pushed, not deployed.
+- Hostname `agents.shipleybuilds.ai`, Worker `agent-flare`, image tag `3400815`. Access app "agents" (Chris's) covers it.
+- `workers_dev` and `preview_urls` are off. The Access app also lists a workers.dev name; nothing serves there.
+- R2 `agent-flare-state`, KV `agent-flare-credentials`, secrets `MASTER_KEY` and `CLOUDFLARE_AI_API_TOKEN`, two crons, template `team` assigned as the default.
+- Local, gitignored: `wrangler.prod.jsonc`, `templates/team/`, `templates/assignments.json`. `wrangler.jsonc` is the local test config, kept separate.
+- A copy of `MASTER_KEY` is in `~/.config/agent-flare-master-key`, mode 600. Losing the key loses everything sealed in KV.
 
-- Worker unit tests: 28 pass (`npm test`)
-- Container tests: 24 unit, 16 integration pass (`tests/container/run.sh`)
-- End to end through `wrangler dev`: 61 pass (`node tests/e2e/run.mjs`; `E2E_BIG_MB=400` adds a large-state run)
-- An independent review found 10 problems. All are fixed; see the "Fix problems from independent review" commit.
+### Redeploying from this host
 
-## Not proven locally
+```bash
+set -a; . ~/.config/cf-shipleybuilds.env; set +a; export CLOUDFLARE_ACCOUNT_ID=<account>
+TAG=agent-flare:$(git rev-parse --short HEAD)
+AF_NO_CACHE=1 AF_BUILD_CA=/etc/ssl/certs/ca-certificates.crt AF_FORBIDDEN_CA=/usr/local/share/ca-certificates/Cloudflare_CA.crt scripts/build-image.sh "$TAG"
+npx wrangler containers push "$TAG"     # retry on a timeout: finished layers aren't re-sent
+# Render with the AF_* values, AF_IMAGE=<pushed image> and AF_WRANGLER_OUT=wrangler.prod.jsonc, then:
+npx wrangler deploy --config wrangler.prod.jsonc
+```
 
-These go first at the first real deploy, with `ONBOARDING.md`:
+Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE` set to the local base. That base carries this host's Gateway CA.
 
-1. Real Access login, and the JWKS fetch from a real team domain
-2. `get-identity` for group assignment
-3. Port 443 through production Containers: local dev allowed it; the SDK blocks ports below 1024 only in `wsConnect`
-4. Restore memory behavior on production Durable Objects. Local workerd doesn't enforce the memory limit, so `SANDBOX_TRANSPORT=rpc` fixing the old size failures is reasoned from SDK code, not measured
-5. Workers Builds building this Dockerfile from GitHub. Docs say Dockerfile builds work; the Deploy button's docs don't mention Containers, so no button yet
+### Credentials
+
+- `CLOUDFLARE_API_TOKEN` in `~/.config/cf-shipleybuilds.env` deployed this. It gained Containers on 2026-11-05. **It expires 2026-11-08 04:59 UTC.** It can't read AI Gateway or `/access/organizations`.
+- wrangler's OAuth login also has Containers scope, but can't edit Access.
+- This token overrides OAuth whenever it's loaded.
+
+## Tests (2026-11-05, at the deployed code)
+
+- Worker unit tests: 36 pass (`npm test`). `tsc` clean.
+- Container tests: 36 unit, 28 integration pass (`tests/container/run.sh`), including a real chat turn to a stub provider. On this host, set `AF_BUILD_CA` when it has to build.
+- End to end through `wrangler dev`: 77 pass (`node tests/e2e/run.mjs`), including 14 routes against 5 kinds of bad token.
+
+## Found while deploying
+
+- The old example template never worked: a provider that's only listed leaves Hermes reporting nothing connected. A selected provider with no key sends `no-key-required` and gets refused. The container now selects only a provider that has a credential.
+- A snapshot taken as a container stopped could record 0 files, outrank every good backup and pass verification. It appeared once, under load, and it's fixed. It was older than this work.
+- A single 4 GB layer timed out pushing. The image is now multi-stage, 1.85 GB compressed. Pushing through inspection can still time out on one layer; retrying finishes it.
+- At deploy time, the gateway's default model answered 429 "at capacity" on every try, while another model answered 200. The credential is good. If it persists, change `model` in `templates/team/template.json` and push it; that affects only users with no model selected yet.
+
+## Not proven yet
+
+Only a real login can test these:
+
+1. Real Access login, the JWKS fetch from the real team domain, and the Worker accepting a real JWT
+2. Whether Access's real JWT carries what `verifyAccessJwt` expects, for this app
+3. The container's proxy peer address being in `trusted_proxies`. If it isn't, cookies lose `__Host-` and `Secure`, though sign-in should still work
+4. A real chat turn through the production gateway from a container, and `cf-aig-metadata` tags in Gateway logs
+5. Restore memory behavior on production Durable Objects (`SANDBOX_TRANSPORT=rpc`)
 6. Transient-failure classification in `restoreNewest`: real failure messages may differ
-7. `cf-aig-metadata` per-user tagging reaching AI Gateway
+7. `get-identity` for group assignment (assignments don't use groups today)
+8. Workers Builds building this Dockerfile from GitHub
 
 ## Changes Chris should know about
 
@@ -52,10 +86,4 @@ These go first at the first real deploy, with `ONBOARDING.md`:
 - `max_instances` caps users awake at once. Default 10.
 - `@cloudflare/sandbox` is 0.12.14; 1.0.3 is current. Not upgraded, to change one thing at a time.
 - Cloudflare's own Container Snapshots aren't a replacement for R2: tied to one image version, 30-day expiry.
-- Local image builds on this host need a base image trusting its TLS inspection CA. That's a local workaround, not in the repo.
-
-## Open questions for Chris
-
-- Which settings should templates pre-fill? `templates/example` is a placeholder until answered.
-- Port 443 in the container is plain HTTP on the internal hop. Confirm that's what was meant.
-- Admin emails, hostname and Access application for the first deploy.
+- The whole shared gateway credential is in each user's `.env`, so each user's agent can read it. Keep its scope narrow.
