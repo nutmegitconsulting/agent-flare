@@ -123,9 +123,9 @@ describe("providers", () => {
     if (!parsed.ok) throw new Error(parsed.error);
     const rendered = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com",
       { "@cf/a/low-one": "low", "@cf/b/mid": "medium", "@cf/c/high": "high" });
-    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["\u2212 low-one", "| mid", "+ high", "@cf/d/unscored"]);
-    expect((rendered.customProviders[0].models as Record<string, unknown>)["\u2212 low-one"]).toEqual({ context_length: 1 });
-    expect(rendered.modelAliases["+ high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
+    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["\u2212low-one", "|mid", "+high", "@cf/d/unscored"]);
+    expect((rendered.customProviders[0].models as Record<string, unknown>)["\u2212low-one"]).toEqual({ context_length: 1 });
+    expect(rendered.modelAliases["+high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
     expect(rendered.candidates[0].model).toBe("@cf/a/low-one");
     expect(rendered.customProviders[0].model).toBe("@cf/a/low-one");
   });

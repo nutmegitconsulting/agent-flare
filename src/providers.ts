@@ -51,13 +51,16 @@ export type ModelTier = "low" | "medium" | "high";
 export type ModelTiers = Record<string, ModelTier>;
 /**
  * Our score for each model, shown as the first character of its name in Hermes's picker. Low is U+2212, the
- * minus sign, because Hermes's name formatting removes a leading hyphen.
+ * minus sign, because the webapp removes a leading hyphen from names and refuses to switch to one.
  */
 export const TIER_MARKS: Record<ModelTier, string> = { low: "\u2212", medium: "|", high: "+" };
 
-/** The name a tiered model has in the picker. A Hermes model alias maps it back to the real ID. */
+/**
+ * The name a tiered model has in the picker. A Hermes model alias maps it back to the real ID. No space: the
+ * webapp splits a pick on whitespace, so a name with a space can't be picked in a running session.
+ */
 export function modelLabel(id: string, tier: ModelTier): string {
-  return `${TIER_MARKS[tier]} ${id.split("/").pop()}`;
+  return `${TIER_MARKS[tier]}${id.split("/").pop()}`;
 }
 
 const API_MODES = new Set(["chat_completions", "responses", "anthropic", "bedrock_converse", "auto"]);

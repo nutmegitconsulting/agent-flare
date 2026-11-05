@@ -7,8 +7,6 @@ import uuid
 import websockets
 
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 9120
-# Optional: a picker row to choose first, as `<label> --provider <slug>`, the way the webapp sends it.
-PICK = sys.argv[3] if len(sys.argv) > 3 else ""
 
 
 async def main(host, ticket):
@@ -35,13 +33,8 @@ async def main(host, ticket):
                 result = frame.get("result", frame.get("error"))
                 out[method] = result if method != "session.create" else {"ok": "session_id" in (result or {}), "error": frame.get("error")}
                 if method == "session.create" and "error" not in frame:
-                    session = frame["result"]["session_id"]
-                    if PICK:
-                        await call("config.set", {"session_id": session, "key": "model", "value": PICK}, 4)
-                    else:
-                        await call("prompt.submit", {"session_id": session, "text": "say hi", "submission_id": uuid.uuid4().hex}, 3)
-                elif method == "config.set":
-                    await call("prompt.submit", {"session_id": session, "text": "say hi", "submission_id": uuid.uuid4().hex}, 3)
+                    await call("prompt.submit", {"session_id": frame["result"]["session_id"], "text": "say hi",
+                                                 "submission_id": uuid.uuid4().hex}, 3)
                 elif method == "session.create" and frame["error"].get("message") == "storage_unavailable":
                     # The browser retries this too: the store opens just after the socket does.
                     await asyncio.sleep(1)

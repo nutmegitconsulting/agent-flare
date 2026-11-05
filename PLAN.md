@@ -86,7 +86,7 @@ The live Worker doesn't have these. Deploy needs Chris's go-ahead, because the a
 
 Chris: vanilla Hermes, with no patch and no new plugin code. A plugin mark and a webapp patch were both built and removed. The Access auth plugin stays, because login depends on it.
 
-- **Tier marks are plain config:** `model_aliases` maps a shown name such as `+ glm-5.3` to its real ID. Chris chose `-` low, `|` medium, `+` high. Hermes's name formatting strips a leading hyphen, so low uses the minus sign U+2212, which looks the same; the role form also accepts a typed hyphen.
+- **Tier marks are plain config:** `model_aliases` maps a shown name such as `+glm-5.3` to its real ID. Chris chose `-` low, `|` medium, `+` high. The webapp strips a leading hyphen and refuses to switch to one, so low uses the minus sign U+2212, which looks the same; the role form also accepts a typed hyphen. Names have no space after the mark, because the webapp can't switch to a name with a space in a running session.
 - **One list:** `config/model-tiers.json` in R2, shared by all roles. Source: `templates/model-tiers.example.json`. Cutoffs: blended = (3 x input + output) / 4 per million tokens; low under 0.50, medium up to 1.50, high above. Pricing page updated 2026-10-20.
 - **Limit:** the model in use shows under its real name, with no mark, in the pill and in an extra top row of the menu.
 - **Dark mode:** seeded into Hermes's own `ui-preferences.json` when the key is absent. It's the user's afterwards.

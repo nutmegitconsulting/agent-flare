@@ -137,7 +137,7 @@ Keys are write-only, and sealed in KV. Screens show only whether one is set and 
 
 Every change applies at the user's next boot, and the Users screen shows who's waiting. A user's page can apply it now: that snapshots and then restarts, and if the snapshot fails, nothing changes. A role's default model follows a role change only if the user hasn't picked their own. `config_managed` reapplies every boot; `config_defaults` applies once and is then the user's.
 
-The picker shows our score for agent work as the first character of a model's name: `−` low, `|` medium, `+` high. It's ordinary Hermes config: a model alias maps the shown name to the real ID. The list is `config/model-tiers.json`, shared by every role; edit it with `scripts/templates.mjs tiers` or by typing the mark in a role's model list. A model with no entry shows no mark. Low is the minus sign U+2212, because Hermes's name formatting removes a leading hyphen. The model in use shows under its real name.
+The picker shows our score for agent work as the first character of a model's name: `−` low, `|` medium, `+` high. It's ordinary Hermes config: a model alias maps the shown name to the real ID. The list is `config/model-tiers.json`, shared by every role; edit it with `scripts/templates.mjs tiers` or by typing the mark in a role's model list. A model with no entry shows no mark. The mark has no space after it, because the webapp can't switch to a name containing a space in a running session. Low is the minus sign U+2212, because it removes a leading hyphen and won't switch to one. The model in use shows under its real name.
 
 New homes start in dark mode, through Hermes's own preferences file. A user can change it, and a choice they've made is never replaced.
 
