@@ -15,9 +15,9 @@ import { configFingerprint, overrideKey, resolveEffective, type Effective, type 
 import type { Env } from "./env";
 import { escapeHtml as e } from "./pages";
 import { getIndex } from "./persistence";
-import { validateProviders, type GatewayProviderEntry } from "./providers";
+import { TIER_MARKS, validateProviders, type GatewayProviderEntry, type ModelTier, type ModelTiers } from "./providers";
 import type { HermesSandbox } from "./sandbox";
-import { loadAssignments, templateSecrets, type Assignments, type TemplateDefinition } from "./templates";
+import { loadAssignments, loadTiers, templateSecrets, TIERS_KEY, type Assignments, type TemplateDefinition } from "./templates";
 
 type Vars = { identity: AccessIdentity; jwt: string };
 type App = Hono<{ Bindings: Env; Variables: Vars }>;
@@ -30,6 +30,15 @@ const GATEWAY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MODEL_RE = /^[A-Za-z0-9@][A-Za-z0-9@._:/+-]{0,127}$/;
 const AUDIT_PREFIX = "audit/";
 const MAX_KEY_LENGTH = 4096;
+/** What a line of models may start with. The hyphen and en dash are how people type the low mark. */
+const MARK_INPUT: Record<string, ModelTier> = { "-": "low", "\u2013": "low", [TIER_MARKS.low]: "low", [TIER_MARKS.medium]: "medium", [TIER_MARKS.high]: "high" };
+
+function splitMark(line: string): { tier?: ModelTier; rest: string } {
+  const tier = MARK_INPUT[line[0]];
+  return tier && /\s/.test(line[1] ?? "") ? { tier, rest: line.slice(1).trim() } : { rest: line };
+}
+
+const mark = (tiers: ModelTiers, id: string) => (tiers[id] ? `${TIER_MARKS[tiers[id]]} ` : "");
 
 // ---------------------------------------------------------------------------
 // Audit: one new object per change, never rewritten. Holds names and fields, never a value of a key.
@@ -121,6 +130,7 @@ interface UserView {
   backups: number;
   effective: Effective | null;
   keys: Record<string, KeyStatus>;
+  tiers: ModelTiers;
   pending: boolean;
 }
 
@@ -128,11 +138,12 @@ async function readUser(c: Ctx, sandboxFor: SandboxFor, sub: string): Promise<Us
   const details = await sandboxFor(c.env, sub).describe();
   const backups = (await getIndex(c.env.BACKUP_BUCKET, sub).catch(() => [])).length;
   const email = details.identity;
-  if (!email) return { sub, email, details, backups, effective: null, keys: {}, pending: false };
+  if (!email) return { sub, email, details, backups, effective: null, keys: {}, tiers: {}, pending: false };
   const effective = await resolveEffective(c.env.BACKUP_BUCKET, email, details.groups ?? [], templateSecrets(c.env));
   const keys = await keyStatuses(c.env, email, effective.role, effective.providers);
+  const tiers = await loadTiers(c.env.BACKUP_BUCKET);
   const applied = (details.config as { fingerprint?: string } | null)?.fingerprint;
-  return { sub, email, details, backups, effective, keys, pending: !!applied && applied !== await configFingerprint(effective, keys) };
+  return { sub, email, details, backups, effective, keys, tiers, pending: !!applied && applied !== await configFingerprint(effective, keys, tiers) };
 }
 
 const PENDING = `<span class="warn">Change waiting for next boot</span>`;
@@ -150,9 +161,9 @@ const SOURCE_TEXT: Record<Effective["source"], string> = {
   none: "nothing assigned",
 };
 
-function modelList(provider: GatewayProviderEntry): string {
+function modelList(provider: GatewayProviderEntry, tiers: ModelTiers): string {
   const selected = provider.model ?? Object.keys(provider.models)[0];
-  return `<ul>${Object.keys(provider.models).map((m) => `<li><code>${e(m)}</code>${m === selected ? " <span class=muted>(default)</span>" : ""}</li>`).join("")}</ul>`;
+  return `<ul>${Object.keys(provider.models).map((m) => `<li><code>${e(mark(tiers, m))}${e(m)}</code>${m === selected ? " <span class=muted>(default)</span>" : ""}</li>`).join("")}</ul>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +197,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const assigned = Object.entries(assignments?.users ?? {}).find(([k]) => k.toLowerCase() === user.email!.toLowerCase())?.[1];
     const providers = eff.providers.map((p) => `<h3><code>${e(p.name)}</code></h3>
       <p>Gateway: <code>${e(p.gateway_id ?? "none")}</code>. Key: ${keyText(user.keys[p.name])}</p>
-      <p>Models in the picker:</p>${modelList(p)}
+      <p>Models in the picker:</p>${modelList(p, user.tiers)}
       <form method="post" action="${base}/key"><input type="hidden" name="provider" value="${e(p.name)}">
         <label for="key-${e(p.name)}">New key for this user only</label>
         <input id="key-${e(p.name)}" type="password" name="value" autocomplete="off">
@@ -245,7 +256,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const role = String(body.role ?? "").trim();
     const gateway_id = String(body.gateway_id ?? "").trim();
     const default_model = String(body.default_model ?? "").trim();
-    const models = String(body.models ?? "").split("\n").map((m) => m.trim()).filter(Boolean);
+    const models = String(body.models ?? "").split("\n").map((m) => splitMark(m.trim()).rest).filter(Boolean);
     if (role && !(await readDefinition(c.env.BACKUP_BUCKET, role))) return problem("That role doesn't exist.", back);
     if (gateway_id && !GATEWAY_RE.test(gateway_id)) return problem("Gateway names are letters, digits, dashes and underscores.", back);
     const badModel = [...models, ...(default_model ? [default_model] : [])].find((m) => !MODEL_RE.test(m));
@@ -327,7 +338,8 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const providers = Array.isArray(definition?.providers) ? (definition.providers as GatewayProviderEntry[]) : [];
     const provider = providers[0];
     const statuses = provider ? await keyStatuses(c.env, "", role, [provider]) : {};
-    const lines = provider ? Object.entries(provider.models ?? {}).map(([m, i]) => (i.context_length ? `${m} ${i.context_length}` : m)).join("\n") : "";
+    const tiers = await loadTiers(c.env.BACKUP_BUCKET);
+    const lines = provider ? Object.entries(provider.models ?? {}).map(([m, i]) => `${mark(tiers, m)}${m}${i.context_length ? ` ${i.context_length}` : ""}`).join("\n") : "";
     const base = `/__af/admin/roles/${encodeURIComponent(role)}`;
     return page(`Role: ${role}`, `
       ${definition ? "" : `<p class="muted">New role. It's created when you save.</p>`}
@@ -342,10 +354,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
         <label for="p-cred">Worker secret to use if no key is set below</label>
         <input id="p-cred" type="text" name="credential" value="${e(provider?.credential ?? "")}" placeholder="CLOUDFLARE_AI_API_TOKEN">
         <label for="p-env">Variable name in the user's .env</label><input id="p-env" type="text" name="key_env" value="${e(provider?.key_env ?? "")}">
-        <label for="p-models">Models in the picker, one per line, with an optional context length after a space</label>
+        <label for="p-models">Models in the picker, one per line, as <code>mark model-id context-length</code>. The mark and context length are optional.</label>
         <textarea id="p-models" name="models" rows="12">${e(lines)}</textarea>
         <label for="p-default">Default model</label><input id="p-default" type="text" name="model" value="${e(provider?.model ?? "")}">
-        <br><button>Save role</button></form>
+        <p class="muted">Marks: <code>${e(TIER_MARKS.low)}</code> low, <code>|</code> medium, <code>+</code> high. They're our score for agent work, shown at the start of the model's name in the picker. A model has one mark across all roles, so changing it here changes it everywhere.</p>
+        <button>Save role</button></form>
       ${provider ? `<h2>Key for this role</h2><p>${keyText(statuses[provider.name])}</p>
       <form method="post" action="${base}/key"><input type="hidden" name="provider" value="${e(provider.name)}">
         <label for="r-key">New key</label><input id="r-key" type="password" name="value" autocomplete="off">
@@ -361,8 +374,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const body = await c.req.parseBody();
     const field = (name: string) => String(body[name] ?? "").trim();
     const models: GatewayProviderEntry["models"] = {};
+    const marked: ModelTiers = {};
     for (const line of field("models").split("\n").map((l) => l.trim()).filter(Boolean)) {
-      const [id, length] = line.split(/\s+/);
+      const { tier, rest } = splitMark(line);
+      const [id, length] = rest.split(/\s+/);
+      if (tier) marked[id] = tier;
       if (!MODEL_RE.test(id)) return problem(`That isn't a model ID: ${id}`, back);
       if (length && !/^\d{1,9}$/.test(length)) return problem(`That isn't a context length: ${length}`, back);
       models[id] = length ? { context_length: Number(length) } : {};
@@ -384,6 +400,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     if (!parsed.ok) return problem(parsed.error.replace(/^entry\[0\]\./, ""), back);
     if (/YOUR_[A-Z0-9_]+/.test(JSON.stringify(entry))) return problem("Replace the YOUR_ placeholders first.", back);
     await c.env.BACKUP_BUCKET.put(`templates/${role}/template.json`, JSON.stringify({ ...definition, providers: parsed.entries }, null, 2));
+    const tiers = await loadTiers(c.env.BACKUP_BUCKET);
+    if (Object.entries(marked).some(([id, tier]) => tiers[id] !== tier)) {
+      await c.env.BACKUP_BUCKET.put(TIERS_KEY, JSON.stringify({ ...tiers, ...marked }, null, 2));
+      await audit(c, "tiers.save", role, { ...marked });
+    }
     await audit(c, "role.save", role, {
       provider: entry.name, gateway: entry.gateway_id, models: Object.keys(models), default: entry.model, credential: entry.credential, mode: entry.mode,
     });

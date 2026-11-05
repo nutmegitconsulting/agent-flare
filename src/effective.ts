@@ -7,7 +7,7 @@
  *
  * Non-secret only. R2 holds no key values; those are sealed in KV (see credentials.ts).
  */
-import type { GatewayProviderEntry } from "./providers";
+import type { GatewayProviderEntry, ModelTiers } from "./providers";
 import { loadAssignments, loadTemplate, pickTemplate, type ResolvedTemplate } from "./templates";
 
 export interface UserOverride {
@@ -80,10 +80,12 @@ export async function resolveEffective(
 }
 
 /** Changes when something that only applies at boot changes. Holds no secret values. */
-export async function configFingerprint(effective: Effective, keys: unknown = null): Promise<string> {
+export async function configFingerprint(effective: Effective, keys: unknown = null, tiers: ModelTiers = {}): Promise<string> {
   const t = effective.template;
+  const shown = effective.providers.flatMap((p) => Object.keys(p.models)).sort().map((id) => [id, tiers[id] ?? null]);
   const text = JSON.stringify({
     keys,
+    tiers: shown,
     role: effective.role,
     providers: effective.providers,
     managed: t?.configManaged ?? null,

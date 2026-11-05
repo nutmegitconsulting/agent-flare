@@ -82,9 +82,14 @@ The live Worker doesn't have these. Deploy needs Chris's go-ahead, because the a
 - **Audit:** one new R2 object per change, under `audit/`, never with a key value.
 - Roles only set which models appear and the default. **Chris's decision (2026-11-05): usability, not security**, so there's no enforcement and no budgets. The screens say so.
 
-## Decided against: a price tier mark in the picker (2026-11-05)
+## Tier marks and dark mode (2026-11-05)
 
-Chris: this stays vanilla Hermes, with no patch and no new plugin code. A plugin mark and a webapp patch were both built and removed. The approved Access auth plugin stays, because login depends on it.
+Chris: vanilla Hermes, with no patch and no new plugin code. A plugin mark and a webapp patch were both built and removed. The Access auth plugin stays, because login depends on it.
+
+- **Tier marks are plain config:** `model_aliases` maps a shown name such as `+ glm-5.3` to its real ID. Chris chose `-` low, `|` medium, `+` high. Hermes's name formatting strips a leading hyphen, so low uses the minus sign U+2212, which looks the same; the role form also accepts a typed hyphen.
+- **One list:** `config/model-tiers.json` in R2, shared by all roles. Source: `templates/model-tiers.example.json`. Cutoffs: blended = (3 x input + output) / 4 per million tokens; low under 0.50, medium up to 1.50, high above. Pricing page updated 2026-10-20.
+- **Limit:** the model in use shows under its real name, with no mark, in the pill and in an extra top row of the menu.
+- **Dark mode:** seeded into Hermes's own `ui-preferences.json` when the key is absent. It's the user's afterwards.
 
 ## Known limit, and a future option
 

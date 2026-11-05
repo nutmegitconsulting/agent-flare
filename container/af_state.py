@@ -14,6 +14,7 @@ import base64
 import fnmatch
 import json
 import os
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -347,6 +348,30 @@ def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], 
     return None
 
 
+def _seed_ui_preferences(home: Path, defaults: dict[str, str]) -> list[str]:
+    """Add webapp preferences the store lacks, in the document Hermes's own ui_preferences module writes.
+    Never changes one that's there: that's the user's. An unreadable store is Hermes's to deal with."""
+    path = home / "ui-preferences.json"
+    document: dict = {}
+    if path.exists():
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(document, dict):
+            return []
+    values = document.get("values") if isinstance(document.get("values"), dict) else {}
+    added = [key for key in defaults if key not in values]
+    if not added:
+        return []
+    revision = document.get("revision") if isinstance(document.get("revision"), int) else 0
+    _write(path, json.dumps({
+        "version": 1, "generation": document.get("generation") or secrets.token_hex(8), "revision": revision + 1,
+        "values": {**values, **{key: defaults[key] for key in added}},
+    }).encode())
+    return added
+
+
 def apply(home: Path, bundle_path: Path) -> dict:
     from ruamel.yaml import YAML
     from ruamel.yaml.error import YAMLError
@@ -450,6 +475,8 @@ def apply(home: Path, bundle_path: Path) -> dict:
     if session_token:
         _write(home / "webapp" / "session-token", (session_token + "\n").encode(), PRIVATE_MODE)
         os.chmod(home / "webapp", 0o700)
+
+    report["ui_defaults"] = _seed_ui_preferences(home, bundle.get("ui_defaults") or {})
 
     for rel in (".env", "auth.json"):
         path = home / rel

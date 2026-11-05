@@ -18,7 +18,7 @@
  *
  * No secret values belong in R2. Use "$NAME" for shared ones and prefill for per-user ones.
  */
-import { validateProviders, type GatewayProviderEntry } from "./providers";
+import { validateProviders, type GatewayProviderEntry, type ModelTiers } from "./providers";
 
 export interface Assignments {
   /** Template for anyone not matched below. Omit for no template. */
@@ -142,6 +142,14 @@ export async function loadAssignments(bucket: R2Bucket): Promise<Assignments | n
   const object = await bucket.get("config/assignments.json");
   if (!object) return null;
   return (await object.json()) as Assignments;
+}
+
+/** The one list of model tiers, shared by every role: config/model-tiers.json. */
+export const TIERS_KEY = "config/model-tiers.json";
+
+export async function loadTiers(bucket: R2Bucket): Promise<ModelTiers> {
+  const object = await bucket.get(TIERS_KEY);
+  return object ? ((await object.json()) as ModelTiers) : {};
 }
 
 export async function loadTemplate(

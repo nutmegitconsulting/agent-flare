@@ -21,7 +21,7 @@ import { configFingerprint, resolveEffective } from "./effective";
 import { renderProviders } from "./providers";
 import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
-import { fetchAccessGroups, loadAssignments, templateSecrets } from "./templates";
+import { fetchAccessGroups, loadAssignments, loadTiers, templateSecrets } from "./templates";
 
 /**
  * Hermes' default webapp port, inside the container only. Browsers reach it on 443 at Cloudflare; TLS
@@ -40,6 +40,8 @@ const WEBAPP_START_TIMEOUT_MS = 120_000;
 const HYDRATION_RETRY_MS = 30_000;
 /** Idle cycles to keep a container up when its final snapshot keeps failing. */
 const FINAL_SNAPSHOT_RETRIES = 3;
+/** Webapp preferences a home starts with. Hermes's own store; once there, they're the user's to change. */
+const UI_DEFAULTS = { "hermes-desktop-mode-v1": "dark" };
 
 export type ReadyState =
   | { state: "ready" }
@@ -173,11 +175,12 @@ export class HermesSandbox extends Sandbox<Env> {
 
     const keys = Object.fromEntries(await Promise.all(effective.providers.map(async (p) =>
       [p.name, await resolveProviderKey(env, identity.email, templateName, p)] as const)));
-    const providers = renderProviders(effective.providers, keys, identity.email);
+    const tiers = await loadTiers(env.BACKUP_BUCKET);
+    const providers = renderProviders(effective.providers, keys, identity.email, tiers);
     warnings.push(...providers.warnings);
     const providerCount = effective.providers.length;
     const fingerprint = await configFingerprint(
-      effective, await keyStatuses(env, identity.email, templateName, effective.providers));
+      effective, await keyStatuses(env, identity.email, templateName, effective.providers), tiers);
     await this.ctx.storage.put(IDENTITY_KEY, { ...identity, groups });
 
     // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
@@ -207,12 +210,16 @@ export class HermesSandbox extends Sandbox<Env> {
       config_managed: {
         ...template?.configManaged,
         ...(providers.customProviders.length ? { custom_providers: providers.customProviders } : {}),
+        ...(Object.keys(providers.modelAliases).length
+          ? { model_aliases: { ...(template?.configManaged.model_aliases as object | undefined), ...providers.modelAliases } }
+          : {}),
         ...platformConfig,
       },
       // A prefill is the user's own value: it applies only while they haven't set one. Template and
       // provider values are managed and apply on every boot.
       env_defaults: prefill ?? {},
       env: { ...template?.env, ...providers.env },
+      ui_defaults: UI_DEFAULTS,
       session_token: await deriveUserSecret(env.MASTER_KEY, "webapp-browser", identity.sub),
     };
 

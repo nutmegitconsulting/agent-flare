@@ -362,6 +362,24 @@ class Apply(Base):
         self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
         self.assertEqual(self.config()["model"]["default"], "picked")
 
+    def test_a_ui_default_fills_an_empty_store_and_never_replaces_a_choice(self):
+        store = self.home / "ui-preferences.json"
+        mode = "hermes-desktop-mode-v1"
+        self.assertEqual(self.bundle(ui_defaults={mode: "dark"})["ui_defaults"], [mode])
+        first = json.loads(store.read_text())
+        self.assertEqual((first["version"], first["values"][mode]), (1, "dark"))
+        self.assertTrue(first["generation"])
+        store.write_text(json.dumps({"version": 1, "generation": "g", "revision": 7, "values": {mode: "light", "k": "v"}}))
+        self.assertEqual(self.bundle(ui_defaults={mode: "dark"})["ui_defaults"], [])
+        self.assertEqual(json.loads(store.read_text())["values"][mode], "light")
+        store.write_text(json.dumps({"version": 1, "generation": "g", "revision": 7, "values": {"k": "v"}}))
+        self.bundle(ui_defaults={mode: "dark"})
+        kept = json.loads(store.read_text())
+        self.assertEqual((kept["generation"], kept["revision"], kept["values"]), ("g", 8, {"k": "v", mode: "dark"}))
+        store.write_text("not json")
+        self.assertEqual(self.bundle(ui_defaults={mode: "dark"})["ui_defaults"], [])
+        self.assertEqual(store.read_text(), "not json")
+
     def test_a_provider_the_template_dropped_leaves_and_a_users_own_stays(self):
         (self.home / "config.yaml").write_text("custom_providers:\n- name: mine\n  base_url: u\n")
         self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "b"}]})

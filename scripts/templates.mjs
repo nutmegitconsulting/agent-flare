@@ -3,6 +3,7 @@
 //
 //   node scripts/templates.mjs push <dir> [--bucket NAME]   templates/<name>/ -> templates/<name>/ in R2
 //   node scripts/templates.mjs assign <file> [--bucket NAME]  a JSON file -> config/assignments.json
+//   node scripts/templates.mjs tiers <file> [--bucket NAME]   a JSON file -> config/model-tiers.json
 //   node scripts/templates.mjs check <dir>                  validate without uploading; lists secrets it needs
 //
 // Uses wrangler, so it runs with your wrangler login. Refuses anything that looks like a secret:
@@ -89,6 +90,11 @@ if (command === "check" && target) {
 } else if (command === "assign" && target) {
   JSON.parse(readFileSync(target, "utf8"));
   put(bucket, "config/assignments.json", target);
+} else if (command === "tiers" && target) {
+  for (const [model, tier] of Object.entries(JSON.parse(readFileSync(target, "utf8")))) {
+    if (!["low", "medium", "high"].includes(tier)) fail(`${model}: tier must be low, medium or high`);
+  }
+  put(bucket, "config/model-tiers.json", target);
 } else {
-  fail("usage: templates.mjs push <dir> | assign <file> | check <dir> [--bucket NAME]");
+  fail("usage: templates.mjs push <dir> | assign <file> | tiers <file> | check <dir> [--bucket NAME]");
 }

@@ -47,6 +47,19 @@ export interface ProviderCandidate {
   key_env: string;
 }
 
+export type ModelTier = "low" | "medium" | "high";
+export type ModelTiers = Record<string, ModelTier>;
+/**
+ * Our score for each model, shown as the first character of its name in Hermes's picker. Low is U+2212, the
+ * minus sign, because Hermes's name formatting removes a leading hyphen.
+ */
+export const TIER_MARKS: Record<ModelTier, string> = { low: "\u2212", medium: "|", high: "+" };
+
+/** The name a tiered model has in the picker. A Hermes model alias maps it back to the real ID. */
+export function modelLabel(id: string, tier: ModelTier): string {
+  return `${TIER_MARKS[tier]} ${id.split("/").pop()}`;
+}
+
 const API_MODES = new Set(["chat_completions", "responses", "anthropic", "bedrock_converse", "auto"]);
 const ENV_VAR_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -135,6 +148,8 @@ export function validateProviders(
 export interface RenderedProviders {
   customProviders: Record<string, unknown>[];
   env: Record<string, string>;
+  /** config.yaml `model_aliases`: label -> the real model. */
+  modelAliases: Record<string, { model: string; provider: string; base_url: string }>;
   candidates: ProviderCandidate[];
   warnings: string[];
 }
@@ -144,10 +159,13 @@ export interface RenderedProviders {
  * analytics and logs stay per user even though the credential is shared.
  * `keys` holds the resolved credential per provider name (see credentials.ts). They reach .env only.
  */
-export function renderProviders(entries: GatewayProviderEntry[], keys: Record<string, string>, user: string): RenderedProviders {
+export function renderProviders(
+  entries: GatewayProviderEntry[], keys: Record<string, string>, user: string, tiers: ModelTiers = {},
+): RenderedProviders {
   const customProviders: Record<string, unknown>[] = [];
   const env: Record<string, string> = {};
   const warnings: string[] = [];
+  const modelAliases: RenderedProviders["modelAliases"] = {};
   const candidates: ProviderCandidate[] = [];
   for (const e of entries) {
     if (e.mode === "api_token") {
@@ -164,6 +182,13 @@ export function renderProviders(entries: GatewayProviderEntry[], keys: Record<st
       headers["cf-aig-gateway-id"] = e.gateway_id;
       headers["cf-aig-metadata"] = JSON.stringify({ user });
     }
+    const models: Record<string, ProviderModelInfo> = {};
+    for (const [id, info] of Object.entries(e.models)) {
+      const tier = tiers[id];
+      const label = tier && TIER_MARKS[tier] ? modelLabel(id, tier) : id;
+      models[label in modelAliases ? id : label] = info;
+      if (label !== id && !(label in modelAliases)) modelAliases[label] = { model: id, provider: e.name, base_url: e.base_url };
+    }
     customProviders.push({
       name: e.name,
       base_url: e.base_url,
@@ -172,9 +197,9 @@ export function renderProviders(entries: GatewayProviderEntry[], keys: Record<st
       api_mode: e.api_mode ?? "chat_completions",
       discover_models: e.discover_models === true,
       ...(Object.keys(headers).length ? { extra_headers: headers } : {}),
-      models: e.models,
+      models,
     });
     candidates.push({ provider: e.name, model: e.model ?? Object.keys(e.models)[0], key_env: e.key_env });
   }
-  return { customProviders, env, candidates, warnings };
+  return { customProviders, env, modelAliases, candidates, warnings };
 }
