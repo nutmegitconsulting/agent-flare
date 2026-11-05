@@ -102,6 +102,22 @@ Chris: vanilla Hermes, with no patch and no new plugin code. A plugin mark and a
 - The shared gateway key is in every user's `.env`, so their agent can read it and call any model it allows. Chris accepts this for now. It's also the key on Chris's own Hermes profile.
 - If real limits are wanted later, Containers outbound handlers look like the way: per the docs they run outside the container, with bindings, so the container could hold no key. The Worker would check each request's model against the user's role and set the user tag itself. Per-role keys wouldn't do it: Cloudflare's docs say `AI Gateway Run` can't be limited to one gateway. Not built and not spiked.
 
+## To do when Chris is home
+
+**Why most gateway models return 429.** Chris's hypothesis: it comes from the difference between free and paid access to AI Gateway.
+
+- **For:** Cloudflare marks `glm-5.3-flash`, `glm-5.3` and the DeepSeek and Kimi k2.6 and k2.7 models as paid access required, and all of them return 429. `qwen3.8-27b` and `gpt-oss-20b` aren't marked paid, and they answer. The same docs offer prepaid AI Gateway credits as a way to use paid models.
+- **Against:**
+  - `gemma-4-26b` and `kimi-k2.5` aren't marked paid and also return 429, and `gemma-4-26b` answered once earlier.
+  - The error says "Service temporarily at capacity", not anything about billing. Its code, 4006, isn't in Cloudflare's error table. The account's analytics record these calls as 4006 with 0 neurons.
+  - The same 429 comes back without AI Gateway, on the REST routes, so the gateway path alone doesn't explain it.
+  - Containers run on this account, which needs Workers Paid. The plan itself couldn't be read, though, and nothing checked the gateway's billing setting or credits.
+- **Next:**
+  1. Try `glm-5.3-flash` in the Workers AI playground on this account. If it answers there, look at this key and path; if not, the account or upstream.
+  2. If it still fails, open a Cloudflare ticket quoting code 4006, the 0-neuron analytics and a request ID.
+
+Details are under "Found while deploying".
+
 ## Not proven yet
 
 0. With a real login: the admin screens, "Apply now", tier marks in the picker, and dark mode
