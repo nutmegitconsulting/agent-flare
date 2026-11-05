@@ -1,6 +1,7 @@
 """Run with the image's Python: see tests/container/run.sh."""
 import base64
 import json
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -96,9 +97,64 @@ class Stage(Base):
         self.assertEqual(copy.execute("SELECT n FROM t").fetchone()[0], 42)
 
 
+class UserDataStays(Base):
+    def test_names_like_logs_or_cache_are_excluded_only_where_hermes_puts_them(self):
+        keep = ["skills/x/cache/data.json", "skills/x/logs/notes.md", "memories/tmp/plan.md",
+                "workspace/app/uv.lock", "workspace/app/venv/keep.txt", "workspace/app/sandboxes/a.txt"]
+        for rel in keep:
+            path = self.home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x")
+        (self.home / "logs").mkdir()
+        (self.home / "logs/gateway.log").write_text("x")
+        af_state.stage(self.home, self.stage)
+        names = {str(p.relative_to(self.stage)) for p in self.stage.rglob("*") if p.is_file()}
+        self.assertEqual(names, {*keep, af_state.MANIFEST})
+
+    def test_a_broken_project_database_does_not_block_snapshots_or_restores(self):
+        (self.home / "workspace").mkdir()
+        (self.home / "workspace/trunc.sqlite").write_bytes(b"SQLite format 3\x00" + b"\x01" * 50)
+        sqlite3.connect(self.home / "state.db").executescript("CREATE TABLE t (n); INSERT INTO t VALUES (1);")
+        manifest = af_state.stage(self.home, self.stage)
+        self.assertEqual(manifest["databases"], ["state.db"])
+        self.assertTrue((self.stage / "workspace/trunc.sqlite").exists())
+        self.assertTrue(af_state.verify(self.stage)["ok"])
+
+    def test_a_corrupt_state_database_refuses_the_snapshot(self):
+        (self.home / "state.db").write_bytes(b"SQLite format 3\x00" + b"\x01" * 5000)
+        with self.assertRaises(RuntimeError):
+            af_state.stage(self.home, self.stage)
+
+
 class Verify(Base):
     def test_no_manifest_is_untrusted(self):
         self.assertFalse(af_state.verify(self.home)["ok"])
+
+    def test_a_snapshot_of_a_restored_home_verifies(self):
+        (self.home / "a.md").write_text("hello")
+        for _ in range(3):
+            af_state.stage(self.home, self.stage)
+            self.assertTrue(af_state.verify(self.stage)["ok"])
+            shutil.rmtree(self.home)
+            shutil.copytree(self.stage, self.home)
+
+    def test_missing_or_truncated_files_are_untrusted(self):
+        sqlite3.connect(self.home / "state.db").executescript("CREATE TABLE t (n); INSERT INTO t VALUES (1);")
+        (self.home / "a.md").write_text("hello")
+        (self.home / "b.md").write_text("hello")
+        af_state.stage(self.home, self.stage)
+        self.assertTrue(af_state.verify(self.stage)["ok"])
+        (self.stage / "a.md").write_text("he")
+        self.assertFalse(af_state.verify(self.stage)["ok"])
+        (self.stage / "a.md").write_text("hello")
+        (self.stage / "b.md").unlink()
+        self.assertFalse(af_state.verify(self.stage)["ok"])
+
+    def test_an_emptied_database_is_untrusted(self):
+        sqlite3.connect(self.home / "state.db").executescript("CREATE TABLE t (n); INSERT INTO t VALUES (1);")
+        manifest = af_state.stage(self.home, self.stage)
+        (self.stage / "state.db").write_bytes(b"")
+        self.assertFalse(af_state.verify(self.stage)["ok"], manifest)
 
     def test_missing_or_corrupt_database_is_untrusted(self):
         sqlite3.connect(self.home / "state.db").executescript("CREATE TABLE t (n); INSERT INTO t VALUES (1);")
@@ -117,9 +173,32 @@ class SealRead(Base):
         (self.home / "config.yaml").write_text("a: 1\n")
         (self.home / "mcp-tokens").mkdir()
         (self.home / "mcp-tokens/x.json").write_text("{}")
-        sealed = af_state.seal_read(self.home)
+        sealed = af_state.seal_read(self.home)["files"]
         self.assertEqual(set(sealed), {".env", "mcp-tokens/x.json"})
         self.assertEqual(base64.b64decode(sealed[".env"]), b"K=v\n")
+
+    def test_every_hermes_store_is_sealed_and_kept_out_of_the_stage(self):
+        stores = [".anthropic_oauth.json", "google_token.json", "slack_tokens.json", ".op.env",
+                  "auth/google_oauth.json", "google_chat_user_tokens/a.json", "auth.json.bak", ".env.bak",
+                  "browser-profiles/a/Cookies", "vault/vault.key", "home/.ssh/id_ed25519", "pairing/x.json",
+                  "whatsapp/session/creds.json", "profiles/work/.env", "profiles/work/auth.json"]
+        for rel in stores:
+            path = self.home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("TOKEN-VALUE")
+        (self.home / "config.yaml").write_text("a: 1\n")
+        af_state.stage(self.home, self.stage)
+        staged = [p for p in self.stage.rglob("*") if p.is_file() and b"TOKEN-VALUE" in p.read_bytes()]
+        self.assertEqual(staged, [])
+        self.assertEqual(set(af_state.seal_read(self.home)["files"]), set(stores))
+
+    def test_oversized_stores_drop_the_largest_and_say_so(self):
+        (self.home / ".env").write_text("K=v\n")
+        (self.home / "browser-profiles/a").mkdir(parents=True)
+        (self.home / "browser-profiles/a/Cache").write_bytes(b"x" * (af_state.MAX_SEALED_BYTES + 1))
+        result = af_state.seal_read(self.home)
+        self.assertEqual(set(result["files"]), {".env"})
+        self.assertEqual(result["dropped"], ["browser-profiles/a/Cache"])
 
 
 class Apply(Base):
@@ -142,6 +221,29 @@ class Apply(Base):
         self.assertEqual(report["template_files"], 0)
         self.assertEqual((self.home / "SOUL.md").read_text(), "mine")
         self.assertEqual(self.config()["model"], "mine")
+
+    def test_a_template_assigned_later_still_fills_in(self):
+        self.bundle(config_defaults={})
+        (self.home / "config.yaml").write_text("model: mine\n")
+        report = self.bundle(template={"name": "new", "files": [{"path": "SOUL.md", "content": b64("t")}]},
+                             config_defaults={"model": "tmpl", "other": 1})
+        self.assertEqual(report["template_files"], 1)
+        self.assertEqual(self.config()["model"], "mine")
+        self.assertEqual(self.config()["other"], 1)
+
+    def test_a_managed_env_value_leaves_when_the_template_drops_it(self):
+        self.bundle(env={"SHARED_TOKEN": "t", "KEEP": "k"})
+        (self.home / ".env").write_text((self.home / ".env").read_text() + "MINE=m\n")
+        self.bundle(env={"KEEP": "k"})
+        lines = dict(l.split("=", 1) for l in (self.home / ".env").read_text().splitlines())
+        self.assertEqual(lines, {"KEEP": "k", "MINE": "m"})
+
+    def test_a_broken_config_is_set_aside_not_fatal(self):
+        (self.home / "config.yaml").write_text("a: [unclosed\n  b: :\n")
+        report = self.bundle(config_managed={"webapp": {"port": 443}})
+        self.assertTrue(report["config_recovered"])
+        self.assertEqual(self.config()["webapp"]["port"], 443)
+        self.assertEqual(len(list(self.home.glob("config.yaml.corrupt.*"))), 1)
 
     def test_managed_keys_win_every_boot_and_keep_user_keys_and_comments(self):
         (self.home / "config.yaml").write_text("# my note\nmodel: mine\nwebapp:\n  port: 1\n  extra: keep\n")

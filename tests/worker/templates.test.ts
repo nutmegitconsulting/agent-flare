@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderProviders, validateProviders } from "../../src/providers";
-import { fetchAccessGroups, loadTemplate, pickTemplate, resolveEnv } from "../../src/templates";
+import { fetchAccessGroups, loadTemplate, pickTemplate, resolveEnv, templateSecrets } from "../../src/templates";
 
 function fakeBucket(objects: Record<string, string>) {
   return {
@@ -35,12 +35,20 @@ describe("resolveEnv", () => {
     const warnings: string[] = [];
     const out = resolveEnv({ A: "plain", B: "$SHARED", C: "$MISSING" }, { SHARED: "s3cret" }, warnings);
     expect(out).toEqual({ A: "plain", B: "s3cret" });
-    expect(warnings).toEqual(["env C: Worker secret MISSING is not set; skipped"]);
+    expect(warnings).toEqual(["env C: Worker secret MISSING is not set or not in TEMPLATE_SECRETS; skipped"]);
   });
   it("rejects values that could inject extra .env lines", () => {
     const warnings: string[] = [];
     expect(resolveEnv({ A: "x\nEVIL=1", "B C": "y" }, {}, warnings)).toEqual({});
     expect(warnings).toHaveLength(2);
+  });
+});
+
+describe("templateSecrets", () => {
+  it("exposes only listed secrets, and never MASTER_KEY", () => {
+    const env = { TEMPLATE_SECRETS: "A, MASTER_KEY", A: "a", B: "b", MASTER_KEY: "m" };
+    expect(templateSecrets(env)).toEqual({ A: "a" });
+    expect(templateSecrets({})).toEqual({});
   });
 });
 

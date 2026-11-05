@@ -16,6 +16,8 @@ export interface Env {
   /** Idle time before a container sleeps, e.g. "30m". */
   SLEEP_AFTER?: string;
   SNAPSHOT_INTERVAL_MINUTES?: string;
+  /** Comma-separated Worker secret names that templates may reference as "$NAME". */
+  TEMPLATE_SECRETS?: string;
 
   /** Worker secret, 32+ characters. Root of all per-user secrets. Rotating it invalidates them. */
   MASTER_KEY: string;

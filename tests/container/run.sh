@@ -32,7 +32,7 @@ dx() { docker exec -i "$NAME" bash -c "$1"; }
 http() { dx "curl -s -H 'Host: $HOST' -H 'X-Forwarded-Proto: https' $1"; }
 
 sleep 6
-dx "pgrep -f '[h]ermes gateway' >/dev/null" && die "Hermes started before hydration" || ok "boot gate holds Hermes until hydrated"
+dx "pgrep -f '[r]unpy.*hermes' >/dev/null" && die "Hermes started before hydration" || ok "boot gate holds Hermes until hydrated"
 dx "curl -s -m 2 http://127.0.0.1:443/api/health" >/dev/null 2>&1 && die "port 443 open before hydration" || ok "nothing on 443 before hydration"
 
 dx "mkdir -p /run/agent-flare && cat > /run/agent-flare/auth.json" <<'J'
@@ -67,6 +67,19 @@ field() { echo "$sim" | "$PYHOST" -c "import json,sys;print(eval(sys.argv[1],jso
 ws=$(dx "$PY /t/ws_sim.py $HOST" 2>&1 | tail -1)
 echo "     $ws" | cut -c1-200
 echo "$ws" | grep -q connected && ok "websocket connects through the public origin" || die "websocket: $ws"
+
+echo "== supervision"
+gateway_pid() { dx "$PY -c \"import json;print(json.load(open('$HOME_DIR/gateway.pid'))['pid'])\""; }
+before=$(gateway_pid)
+dx "kill -9 $before"
+sleep 3
+for i in $(seq 1 90); do
+    [ "$(http "-m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:443/api/health" || true)" = 200 ] && break
+    [ "$i" = 90 ] && die "webapp did not come back after the gateway died"
+    sleep 1
+done
+after=$(gateway_pid)
+[ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ] && ok "webapp comes back after the gateway dies (${i}s)" || die "gateway process did not change: $before $after"
 
 echo "== state round trip"
 dx "ls -la $HOME_DIR; du -sh $HOME_DIR" | cut -c1-100

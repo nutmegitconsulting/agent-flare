@@ -21,16 +21,18 @@ Container disks are ephemeral, so a user's Hermes home (`/home/hermes/.hermes`) 
 
 **Boot.** Hermes waits behind a gate while the Worker hydrates the home:
 
-1. Restore the newest backup that verifies: squashfs extraction, then a manifest check and SQLite `quick_check`. A corrupt backup falls back to the next oldest.
+1. Restore the newest backup into a scratch directory, verify it (file count, bytes, SQLite `quick_check` on Hermes' own databases), and swap it into place. Only proof of corruption falls back to an older backup. A transient failure retries the newest, because falling back would let a new snapshot outrank it for good.
 2. Decrypt the user's secret files from KV.
 3. Apply their template (first launch), managed config and environment.
 4. Open the gate. Hermes starts, and snapshots are allowed from this point on.
 
 If backups exist and none can be restored, **the container doesn't start**. The user sees an error, and the backups stay as they are. Starting empty would soon snapshot an empty home over their history.
 
-**Snapshot.** `container/af_state.py` builds a staged copy first: SQLite through its backup API (consistent even while Hermes writes), without logs and caches, without secrets. The SDK archives that copy. Secret files (`.env`, `auth.json`, `mcp-tokens/`) are encrypted into KV separately, so the bucket is safe to replicate.
+**Snapshot.** `container/af_state.py` builds a staged copy first: SQLite through its backup API (consistent even while Hermes writes), without Hermes' logs and caches, without secrets. The SDK archives that copy. What counts as a secret is Hermes' own list of credential stores, at the home's root and inside each profile. Those files are encrypted into KV separately, so the bucket is safe to replicate. KV holds about 12 MB per user; past that the largest files, usually browser data, are left out and logged.
 
-**Sleep.** When a container idles past `SLEEP_AFTER`, it takes a final snapshot and stops. The snapshot cron skips containers with no activity since their last snapshot, so it doesn't hold them awake. An open browser tab holds a WebSocket and counts as activity.
+Hydration, snapshots and pruning for a user run one at a time inside their Durable Object.
+
+**Sleep.** When a container idles past `SLEEP_AFTER`, it takes a final snapshot and stops. If the snapshot fails it stays up and retries, up to three idle cycles. The snapshot cron skips containers with no activity since their last snapshot, so it doesn't hold them awake. An open browser tab holds a WebSocket and counts as activity.
 
 R2 layout:
 
@@ -49,7 +51,7 @@ Retention (`src/prune.ts`) keeps recent snapshots densely and older ones sparsel
 
 | Where | What |
 |---|---|
-| Worker Secrets | `MASTER_KEY`, `CLOUDFLARE_AI_API_TOKEN`, anything a template references as `$NAME` |
+| Worker Secrets | `MASTER_KEY`, `CLOUDFLARE_AI_API_TOKEN`, and secrets listed in the `TEMPLATE_SECRETS` var, which templates can reference as `$NAME` |
 | KV, encrypted | Each user's secret files; admin prefills. AES-256-GCM, key derived from `MASTER_KEY` and bound to the KV key |
 | Derived, never stored | Per-user sign-in secrets, via HKDF from `MASTER_KEY` |
 
@@ -66,10 +68,10 @@ templates/<name>/files/...         files copied into the Hermes home on first la
 
 | Key | Applies | Who wins |
 |---|---|---|
-| `files` | First launch, if the file doesn't exist | The user, afterwards |
-| `config_defaults` | First launch | The user, afterwards |
+| `files` | First time the user gets this template, if the file doesn't exist | The user, afterwards |
+| `config_defaults` | First launch, or when first assigned this template | The user, afterwards |
 | `config_managed` | Every boot | The template |
-| `env` | Every boot; `"$NAME"` reads Worker secret `NAME` | The template |
+| `env` | Every boot; `"$NAME"` reads Worker secret `NAME` if `TEMPLATE_SECRETS` lists it. Removed from `.env` when dropped from the template | The template |
 | `providers` | Every boot | The template, per provider name |
 
 Agent Flare's own `webapp` and `dashboard.trusted_proxies` keys always win, so a template can't change the port or public URL.
@@ -128,6 +130,7 @@ The Hermes version is pinned in the `Dockerfile` (`HERMES_COMMIT`), because the 
 
 - A container sleeping means Hermes' own scheduled jobs and messaging gateways don't run. Raise `SLEEP_AFTER` for those, at higher cost.
 - A forgotten open tab keeps a container running.
+- Only the Hermes home survives a restart. Agents default to working in `<home>/workspace` for that reason. Files elsewhere in the container, such as `~/.gitconfig` for the OS user, are lost; `terminal.home_mode: profile` in `config.yaml` keeps those under the home too.
 - `sandbox.wsConnect` refuses ports below 1024, so the Worker switches ports itself for WebSockets (`src/index.ts`).
 
 ## License

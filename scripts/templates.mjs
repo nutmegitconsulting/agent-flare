@@ -36,6 +36,9 @@ export function check(dir) {
       fail(`env ${key} looks like a secret. Use "$WORKER_SECRET_NAME" instead of a value.`);
     }
   }
+  for (const [key, value] of Object.entries(definition.env ?? {})) {
+    if (value === "$MASTER_KEY") fail(`env ${key}: templates can't read MASTER_KEY`);
+  }
   const filesDir = join(dir, "files");
   const onDisk = existsSync(filesDir) ? walk(filesDir).map((p) => relative(filesDir, p)) : [];
   for (const path of definition.files ?? []) {

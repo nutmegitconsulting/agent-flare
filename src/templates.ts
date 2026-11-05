@@ -12,7 +12,8 @@
  *   mode               optional map of path -> POSIX mode
  *   config_defaults    config.yaml values set on first launch; the user can change them later
  *   config_managed     config.yaml values reapplied on every boot; these always win
- *   env                .env values reapplied on every boot. "$NAME" reads Worker secret NAME.
+ *   env                .env values reapplied on every boot. "$NAME" reads Worker secret NAME, which
+ *                      must be listed in the TEMPLATE_SECRETS var.
  *   providers          AI Gateway custom providers (see providers.ts)
  *
  * No secret values belong in R2. Use "$NAME" for shared ones and prefill for per-user ones.
@@ -93,7 +94,19 @@ function isSafePath(path: string): boolean {
   return !!path && !path.startsWith("/") && !path.split("/").includes("..") && !path.includes("\0");
 }
 
-/** Replace "$NAME" with the Worker secret NAME. Unset secrets are dropped and reported. */
+/**
+ * The secrets templates may reference. An allowlist because R2 is documented as secret-free, so write
+ * access to it must not be a way to read MASTER_KEY into a container.
+ */
+export function templateSecrets(env: { TEMPLATE_SECRETS?: string }): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const name of (env.TEMPLATE_SECRETS ?? "").split(",").map((n) => n.trim()).filter(Boolean)) {
+    if (name !== "MASTER_KEY") out[name] = (env as Record<string, unknown>)[name];
+  }
+  return out;
+}
+
+/** Replace "$NAME" with the Worker secret NAME. Unset or unlisted secrets are dropped and reported. */
 export function resolveEnv(
   env: Record<string, string>, secrets: Record<string, unknown>, warnings: string[],
 ): Record<string, string> {
@@ -106,7 +119,7 @@ export function resolveEnv(
     if (value.startsWith("$")) {
       const secret = secrets[value.slice(1)];
       if (typeof secret !== "string" || !secret) {
-        warnings.push(`env ${key}: Worker secret ${value.slice(1)} is not set; skipped`);
+        warnings.push(`env ${key}: Worker secret ${value.slice(1)} is not set or not in TEMPLATE_SECRETS; skipped`);
         continue;
       }
       out[key] = secret;

@@ -41,6 +41,8 @@
     "ADMIN_EMAILS": "",
     "SLEEP_AFTER": "30m",
     "SNAPSHOT_INTERVAL_MINUTES": "10",
+    // Worker secrets templates may reference as "$NAME". Comma-separated.
+    "TEMPLATE_SECRETS": "",
     // Streams restores instead of loading the whole archive into Durable Object memory.
     "SANDBOX_TRANSPORT": "rpc"
   },

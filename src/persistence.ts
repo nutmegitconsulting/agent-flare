@@ -10,7 +10,8 @@
  *   backups/<id>/data.sqsh           SDK-written archive
  *   backups/<id>/meta.json           SDK-written metadata
  *
- * Callers run these inside the user's Durable Object, which serializes access to the index.
+ * Callers run these inside the user's Durable Object, through its serial queue. Durable Object
+ * input gates don't cover R2 or container calls, so nothing else keeps these from interleaving.
  */
 import type { DirectoryBackup, Sandbox } from "@cloudflare/sandbox";
 import { removeFromIndex } from "./prune";
@@ -18,7 +19,9 @@ import { removeFromIndex } from "./prune";
 export const HERMES_HOME = "/home/hermes/.hermes";
 const STAGE_DIR = "/home/.agent-flare-stage";
 export const AF_STATE = "/usr/local/bin/af-python /usr/local/lib/af_state.py";
-const BACKUP_TTL_SECONDS = 365 * 86_400;
+const RESTORE_DIR = "/home/hermes/.hermes-restore";
+/** The SDK refuses to restore past this age. Retention decides when a backup goes, not this. */
+const BACKUP_TTL_SECONDS = 10 * 365 * 86_400;
 
 export interface BackupEntry {
   id: string;
@@ -47,54 +50,84 @@ async function run(sandbox: Sandbox, command: string, label: string): Promise<st
 }
 
 export type RestoreOutcome =
-  | { kind: "fresh" }
+  | { kind: "fresh"; skipped: string[] }
   | { kind: "restored"; id: string; skipped: string[] };
 
+/** Proof the archive itself is bad, as opposed to the container or network failing while reading it. */
+function isCorruptArchive(message: string): boolean {
+  return /unsquashfs extraction failed/i.test(message) && !/no space left/i.test(message);
+}
+
 /**
- * Restore the newest backup that passes verification, into an empty home. Only blobs that are
- * truly gone are dropped from the index. Throws when backups exist but none can be trusted: the
- * caller must not start Hermes then, because an empty home would soon be snapshotted over the
- * user's history. That's the failure this design exists to prevent.
+ * Restore the newest good backup into a scratch directory, verify it, then swap it into place.
+ *
+ * Falls back to an older backup only on proof of corruption. A transient failure must not: the older
+ * restore would succeed, a new snapshot would soon outrank the newest backup, and that good backup
+ * would never be chosen again. So transient failures throw, and hydration retries from the top.
+ * Throws too when backups exist but none can be trusted: starting empty would soon snapshot an
+ * empty home over the user's history.
+ *
+ * `assertCurrent` throws if the container this hydration started on has gone.
  */
-export async function restoreNewest(sandbox: Sandbox, bucket: R2Bucket, sub: string): Promise<RestoreOutcome> {
+export async function restoreNewest(
+  sandbox: Sandbox, bucket: R2Bucket, sub: string, readyFile: string, assertCurrent: () => void,
+): Promise<RestoreOutcome> {
   const index = await getIndex(bucket, sub);
   const newestFirst = [...index].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
   const skipped: string[] = [];
-  let anyUntrusted = false;
+  let anyCorrupt = false;
+
+  // The READY check makes this refuse, in the shell, to touch a live home.
+  const swapIn = (from: string | null) => run(
+    sandbox,
+    `test ! -f ${readyFile} && rm -rf ${HERMES_HOME} && ` +
+      (from ? `mv ${from} ${HERMES_HOME}` : `mkdir -p ${HERMES_HOME}`),
+    "swap home",
+  );
 
   for (const entry of newestFirst) {
+    assertCurrent();
     const t0 = Date.now();
+    await run(sandbox, `rm -rf ${RESTORE_DIR} && mkdir -p ${RESTORE_DIR}`, "clear restore dir");
     try {
-      await run(sandbox, `rm -rf ${HERMES_HOME} && mkdir -p ${HERMES_HOME}`, "clear home");
-      await sandbox.restoreBackup({ ...entry.handle, dir: HERMES_HOME });
+      await sandbox.restoreBackup({ ...entry.handle, dir: RESTORE_DIR });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (/BACKUP_NOT_FOUND|BackupNotFound|Backup not found|archive not found/i.test(message)) {
         console.warn(`[restore:${sub}] ${entry.id} is gone from R2; removing from index`);
         await removeFromIndex(bucket, sub, entry.id);
-      } else {
-        console.error(`[restore:${sub}] ${entry.id} failed: ${message}`);
-        anyUntrusted = true;
+        skipped.push(entry.id);
+        continue;
       }
+      if (isCorruptArchive(message)) {
+        console.error(`[restore:${sub}] ${entry.id} is corrupt: ${message.slice(0, 300)}`);
+        anyCorrupt = true;
+        skipped.push(entry.id);
+        continue;
+      }
+      throw err;
+    }
+    assertCurrent();
+    const check = await sandbox.exec(`${AF_STATE} verify ${RESTORE_DIR}`);
+    if (check.exitCode === 1) {
+      console.error(`[restore:${sub}] ${entry.id} failed verification: ${check.stdout}`);
+      anyCorrupt = true;
       skipped.push(entry.id);
       continue;
     }
-    const check = await sandbox.exec(`${AF_STATE} verify ${HERMES_HOME}`);
-    if (check.exitCode !== 0) {
-      console.error(`[restore:${sub}] ${entry.id} failed verification: ${check.stdout || check.stderr}`);
-      anyUntrusted = true;
-      skipped.push(entry.id);
-      continue;
-    }
+    if (check.exitCode !== 0) throw new Error(`verify could not run (exit ${check.exitCode}): ${check.stderr.slice(0, 300)}`);
+    assertCurrent();
+    await swapIn(RESTORE_DIR);
     console.log(`[restore:${sub}] restored ${entry.id} in ${Date.now() - t0}ms: ${check.stdout}`);
     return { kind: "restored", id: entry.id, skipped };
   }
 
-  if (anyUntrusted) {
+  if (anyCorrupt) {
     throw new Error(`${skipped.length} backup(s) exist but none could be restored and verified`);
   }
-  await run(sandbox, `rm -rf ${HERMES_HOME} && mkdir -p ${HERMES_HOME}`, "clear home");
-  return { kind: "fresh" };
+  assertCurrent();
+  await swapIn(null);
+  return { kind: "fresh", skipped };
 }
 
 /** Stage, archive to R2, and only then record in the index. */

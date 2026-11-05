@@ -19,56 +19,43 @@ Started 2026-11-04. Keep this file current; secrets never go in it.
 - Nobody uses Desktop. Remove tunnel code and PowerShell client scripts.
 - Shared secrets move to Worker Secrets. Per-user secrets stay in KV, encrypted with a master key held in Secrets. Reason: Worker limit is 128 secrets + vars on paid (64 on free), per Worker, so per-user Secrets would cap at about 100 users.
 
-## Target design
+## Design
 
-```
-Browser (HTTPS 443) -> Cloudflare Access -> Worker -> per-user Sandbox -> Hermes webapp :443
-```
+See `README.md`. In short: Browser -> Access -> Worker -> per-user Sandbox -> Hermes webapp :443, keyed on the Access `sub`.
 
-- One hostname. Worker verifies the Access JWT signature, `aud`, `iss` and `exp`; container key = Access `sub`, never the email local part.
-- Any request can wake a container, so the Worker ensures hydration before proxying HTTP and WebSockets.
-- Hermes sign-in: auth plugin that verifies the forwarded Access identity. Fallback: Access for SaaS as the OIDC provider (self_hosted plugin needs a public PKCE client).
+## Status (2026-11-05)
 
-## Findings in the current code (from reading; not yet reproduced)
+Built and tested locally, on this branch. Not pushed, not deployed.
 
-State:
-- [ ] `/api/wake` restores unconditionally, including over a running container, which can roll back live work (`src/index.ts`).
-- [ ] `start-hermes.sh` sleeps a fixed 15s and starts `hermes serve` whether or not the restore finished.
-- [ ] A failed restore boots empty, and the next cron snapshot can become the newest backup. Guards are weak: injected `config.yaml` counts as real content, and `MIN_VALID_BACKUP_BYTES` is 8KB.
-- [ ] Non-rpc restore loads the whole archive into Durable Object memory as base64 (SDK `doRestoreBackupLocal`). Check the size limit; `SANDBOX_TRANSPORT=rpc` streams it.
-- [ ] `localBucket: true` is documented in the SDK as the local-dev flow. Decide whether to keep it or use the production presigned flow.
-- [ ] No `excludes` passed to `createBackup`.
-- [ ] Live SQLite snapshotted with no checkpoint.
-- [ ] `unsquashfs -f` merges into the target rather than replacing it, so stale files survive.
-- [ ] No final snapshot on idle sleep; `/api/admin/stop` and `destroy` are the only final snapshots.
-- [ ] Cron snapshot `exec` may renew the activity timer and keep containers awake. Verify.
-- [ ] `active-users.json` is an unlocked read-modify-write and is never cleared on idle sleep.
-- [ ] `chmod -R a+rX` makes `.env` world-readable, and `.env` goes into R2 snapshots.
+- Worker unit tests: 28 pass (`npm test`)
+- Container tests: 24 unit, 16 integration pass (`tests/container/run.sh`)
+- End to end through `wrangler dev`: 61 pass (`node tests/e2e/run.mjs`; `E2E_BIG_MB=400` adds a large-state run)
+- An independent review found 10 problems. All are fixed; see the "Fix problems from independent review" commit.
 
-Security:
-- [ ] JWT signature is never verified: the cert is looked up but not checked. Opaque tokens are trusted outright.
-- [ ] User ID is the email local part, so different domains collide into one container.
-- [ ] Any Access user can act on another user via `?userId=` on admin routes, and `/api/debug/exec` runs commands.
-- [ ] Dockerfile enables `PermitRootLogin` and sshd; review for production.
+## Not proven locally
 
-## Work order
+These go first at the first real deploy, with `ONBOARDING.md`:
 
-1. [ ] Spike in Docker: run the webapp in the image on 443 behind a simulated proxy. Confirm config keys, bind address (0.0.0.0 vs loopback), Host/Origin handling and WebSocket paths.
-2. [ ] Spike the Hermes auth plugin. Confirm one login, cookies, `/api/ws` tickets.
-3. [ ] Access JWT verification and `sub` routing, with tests.
-4. [ ] Worker proxy for HTTP and WebSockets; hydrate-before-proxy.
-5. [ ] State rewrite: single hydration per container generation, boot gate, consistent SQLite capture, excludes, secrets out of snapshots, snapshot guard tied to confirmed hydration, final snapshot on idle.
-6. [ ] Config templates and assignments.
-7. [ ] Secrets: encrypted per-user KV; shared values in Worker Secrets.
-8. [ ] Remove tunnels, cloudflared, PowerShell; lock down admin routes.
-9. [ ] Local round-trip test: write state, snapshot, kill, restore, compare.
-10. [ ] Clone-and-go: check that GitHub-based deploy handles containers; provide config template and setup docs.
-11. [ ] Rewrite README and ONBOARDING; deploy checklist for the morning.
+1. Real Access login, and the JWKS fetch from a real team domain
+2. `get-identity` for group assignment
+3. Port 443 through production Containers: local dev allowed it; the SDK blocks ports below 1024 only in `wsConnect`
+4. Restore memory behavior on production Durable Objects. Local workerd doesn't enforce the memory limit, so `SANDBOX_TRANSPORT=rpc` fixing the old size failures is reasoned from SDK code, not measured
+5. Workers Builds building this Dockerfile from GitHub. Docs say Dockerfile builds work; the Deploy button's docs don't mention Containers, so no button yet
+6. Transient-failure classification in `restoreNewest`: real failure messages may differ
+7. `cf-aig-metadata` per-user tagging reaching AI Gateway
 
-## Can't be proven locally
+## Changes Chris should know about
 
-Real Access login, production R2, real container sleep and wake timing. Goes on the deploy checklist.
+- `jwt` provider mode is gone. It relied on the desktop client fetching a gateway JWT. `api_token` mode with `cf-aig-metadata` tagging replaces it, and `user_env` lets a user bring a key.
+- An open browser tab keeps a container running, and so costs money.
+- A sleeping container runs no Hermes cron jobs or messaging gateways.
+- `max_instances` caps users awake at once. Default 10.
+- `@cloudflare/sandbox` is 0.12.14; 1.0.3 is current. Not upgraded, to change one thing at a time.
+- Cloudflare's own Container Snapshots aren't a replacement for R2: tied to one image version, 30-day expiry.
+- Local image builds on this host need a base image trusting its TLS inspection CA. That's a local workaround, not in the repo.
 
 ## Open questions for Chris
 
-- Which settings should templates pre-fill? Placeholders until answered.
+- Which settings should templates pre-fill? `templates/example` is a placeholder until answered.
+- Port 443 in the container is plain HTTP on the internal hop. Confirm that's what was meant.
+- Admin emails, hostname and Access application for the first deploy.

@@ -27,5 +27,16 @@ while [ ! -f "$READY_FILE" ]; do
     sleep 0.25
 done
 
-echo "[agent-flare] hydrated; starting gateway"
-exec hermes gateway run
+# Hermes expects a supervisor: it exits to restart itself, and can crash. The webapp must come back
+# without the container having to restart, or every request fails until someone stops it.
+child=""
+trap 'stop=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT
+stop=0
+while [ "$stop" = 0 ]; do
+    echo "[agent-flare] hydrated; starting gateway"
+    hermes gateway run &
+    child=$!
+    wait "$child"
+    code=$?
+    [ "$stop" = 0 ] && echo "[agent-flare] gateway exited ($code); restarting" && sleep 2
+done

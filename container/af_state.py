@@ -19,37 +19,71 @@ import sqlite3
 import stat
 import sys
 import time
+from io import StringIO
 from pathlib import Path
 
 MANIFEST = ".agent-flare-manifest.json"
 TEMPLATE_MARKER = ".agent-flare-template.json"
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
-# Secrets never enter a snapshot: the bucket may be replicated. They're sealed into KV instead.
-SECRET_PATHS = (".env", "auth.json", "auth.lock", "mcp-tokens", "webapp")
-# Rebuildable or process-bound files. Keeping them out is what keeps snapshots small.
-EXCLUDED_DIRS = {
-    "logs", "cache", "image_cache", "audio_cache", "document_cache", "browser_screenshots",
-    "sandboxes", "tmp", "node_modules", "__pycache__", ".cache", ".npm", ".venv", "venv",
+# Hermes' own definition of its credential stores decides what is secret. Secrets never enter a
+# snapshot, because the bucket may be replicated. They're sealed into KV instead.
+HERMES_SOURCE = "/opt/hermes-install/hermes-agent"
+# Stores that are never sealed: rebuildable (webapp's credential is re-derived on every boot) or
+# Hermes' own recovery copies of other stores.
+NOT_SEALED_STORES = ("webapp", "backups", "state-snapshots")
+# KV holds 25 MB per value, and sealing grows data by about 1.8x.
+MAX_SEALED_BYTES = 12_000_000
+
+# Rebuildable or process-bound, and only where Hermes itself puts them. Names like "logs" or "cache"
+# inside a skill or a project are the user's data.
+EXCLUDED_TOP_LEVEL = {
+    "logs", "cache", "image_cache", "audio_cache", "document_cache", "browser_screenshots", "sandboxes",
+    "tmp", "hermes-agent", "source-checks", "telemetry", "runtime", "plugin-update-checks",
 }
-EXCLUDED_FILES = ("*.db-wal", "*.db-shm", "*.db-journal", "*.pid", "*.lock", "*.sock", "*.tmp",
-                  "*.pyc", ".startup-status", "gateway_state.json")
+EXCLUDED_TOP_LEVEL_FILES = ("*.lock", ".startup-status", "gateway_state.json", "gateway.pid", "gateway.sock")
+# Never meaningful, anywhere.
+EXCLUDED_DIRS = {"__pycache__", "node_modules"}
+EXCLUDED_FILES = ("*.db-wal", "*.db-shm", "*.db-journal", "*.pid", "*.sock", "*.pyc")
 # Hermes keeps its dependency state and Python under the home root, but the install lives in the
 # image, outside the snapshot. These links bridge the two; apply recreates them after a restore.
 INSTALL_ROOT = Path("/opt/hermes-install")
 INSTALL_LINKS = ("installs", "tools")
-EXCLUDED_TOP_LEVEL = {*INSTALL_LINKS, "hermes-agent", "source-checks", "telemetry", "backups", "runtime",
-                      "plugin-update-checks"}
-# Files holding secrets get these modes, whatever a restore or template left behind.
+# Agents work here by default, because it's inside what gets snapshotted.
+WORKSPACE = "workspace"
 PRIVATE_MODE = 0o600
 
 
+def _credential_check():
+    """Hermes' own test for "is this path a credential store". Importing it can't be optional: a
+    guess here puts tokens in the bucket, so a failed import fails the snapshot."""
+    if HERMES_SOURCE not in sys.path:
+        sys.path.insert(0, HERMES_SOURCE)
+    from hermes_cli.profiles import profile_path_is_private  # noqa: PLC0415
+    return profile_path_is_private
+
+
 def _is_secret(rel: str) -> bool:
-    return any(rel == p or rel.startswith(p + "/") for p in SECRET_PATHS)
+    parts = tuple(Path(rel).parts)
+    # A profile is a home of its own, with the same stores.
+    if len(parts) >= 3 and parts[0] == "profiles":
+        parts = parts[2:]
+    return _credential_check()(parts)
 
 
-def _is_excluded_file(name: str) -> bool:
-    return any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_FILES)
+def _is_critical_db(rel: str) -> bool:
+    """Databases Hermes can't run without. Others are the user's project files: copied as well as
+    possible, and never a reason to refuse a snapshot or distrust a restore."""
+    parts = Path(rel).parts
+    if len(parts) >= 3 and parts[0] == "profiles":
+        parts = parts[2:]
+    return parts in (("state.db",), ("cron", "executions.db"))
+
+
+def _is_excluded_file(rel: str, name: str) -> bool:
+    if any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_FILES):
+        return True
+    return "/" not in rel and any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_TOP_LEVEL_FILES)
 
 
 def _is_sqlite(path: Path) -> bool:
@@ -76,6 +110,7 @@ def _copy_sqlite(src: Path, dst: Path) -> None:
 
 
 def stage(home: Path, stage_dir: Path) -> dict:
+    _credential_check()
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
     stage_dir.mkdir(parents=True)
@@ -89,10 +124,11 @@ def stage(home: Path, stage_dir: Path) -> dict:
         kept = []
         for name in dirs:
             rel = os.path.join(rel_root, name)
-            if name in EXCLUDED_DIRS or _is_secret(rel) or (not rel_root and name in EXCLUDED_TOP_LEVEL):
+            if name in EXCLUDED_DIRS or _is_secret(rel) or (not rel_root and (name in EXCLUDED_TOP_LEVEL or name in INSTALL_LINKS)):
                 continue
             if os.path.islink(os.path.join(root, name)):
                 os.symlink(os.readlink(os.path.join(root, name)), stage_dir / rel)
+                files += 1
                 continue
             kept.append(name)
             target = stage_dir / rel
@@ -103,26 +139,36 @@ def stage(home: Path, stage_dir: Path) -> dict:
             rel = os.path.join(rel_root, name)
             src = Path(root) / name
             dst = stage_dir / rel
-            if _is_secret(rel) or _is_excluded_file(name):
+            # The manifest restored from the previous snapshot describes that one, not this one.
+            if rel == MANIFEST or _is_secret(rel) or _is_excluded_file(rel, name):
                 continue
+            critical = _is_critical_db(rel)
             try:
                 info = src.lstat()
                 if stat.S_ISLNK(info.st_mode):
                     os.symlink(os.readlink(src), dst)
                 elif not stat.S_ISREG(info.st_mode):
                     continue
-                elif _is_sqlite(src):
-                    _copy_sqlite(src, dst)
-                    databases.append(rel)
+                elif critical or _is_sqlite(src):
+                    try:
+                        _copy_sqlite(src, dst)
+                    except sqlite3.Error:
+                        if critical:
+                            raise
+                        dst.unlink(missing_ok=True)
+                        shutil.copy2(src, dst)
+                    if critical:
+                        _check_database(dst, rel)
+                        databases.append(rel)
                 else:
                     shutil.copy2(src, dst)
                 files += 1
                 bytes_total += dst.lstat().st_size
             except (OSError, sqlite3.Error) as exc:
-                # A database we can't copy consistently must fail the snapshot. Any other file can
-                # vanish mid-walk (Hermes rotates temp files), so note it and carry on.
-                if _is_sqlite(src):
-                    raise RuntimeError(f"could not copy database {rel}: {exc}") from exc
+                # A critical database we can't capture must fail the snapshot, not produce a backup
+                # that replaces a good one. Any other file can vanish mid-walk; note it and carry on.
+                if critical:
+                    raise RuntimeError(f"could not capture database {rel}: {exc}") from exc
                 skipped.append(rel)
     manifest = {"created": int(time.time()), "files": files, "bytes": bytes_total,
                 "databases": databases, "skipped": skipped}
@@ -130,21 +176,48 @@ def stage(home: Path, stage_dir: Path) -> dict:
     return manifest
 
 
+def _check_database(path: Path, rel: str) -> None:
+    if path.stat().st_size == 0:
+        raise RuntimeError(f"database is empty: {rel}")
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    try:
+        result = connection.execute("PRAGMA quick_check").fetchone()
+    finally:
+        connection.close()
+    if not result or result[0] != "ok":
+        raise RuntimeError(f"database failed quick_check: {rel}")
+
+
 def seal_read(home: Path) -> dict:
-    out: dict[str, str] = {}
-    for rel in SECRET_PATHS:
-        path = home / rel
-        if path.is_file():
-            out[rel] = base64.b64encode(path.read_bytes()).decode()
-        elif path.is_dir():
-            for sub in path.rglob("*"):
-                if sub.is_file() and not sub.is_symlink() and not _is_excluded_file(sub.name):
-                    out[str(sub.relative_to(home))] = base64.b64encode(sub.read_bytes()).decode()
-    return out
+    """Secret files as base64, for the Worker to encrypt. Smallest first, so if there's more than
+    fits, what's dropped is the bulky browser data rather than API keys. Dropped paths are reported."""
+    _credential_check()
+    candidates: list[tuple[int, str]] = []
+    for root, dirs, names in os.walk(home, followlinks=False):
+        rel_root = os.path.relpath(root, home)
+        rel_root = "" if rel_root == "." else rel_root
+        dirs[:] = [d for d in dirs if not (not rel_root and (d in EXCLUDED_TOP_LEVEL or d in INSTALL_LINKS or d in NOT_SEALED_STORES))
+                   and d not in EXCLUDED_DIRS]
+        for name in names:
+            rel = os.path.join(rel_root, name)
+            path = Path(root) / name
+            if _is_excluded_file(rel, name) or path.is_symlink() or not path.is_file() or not _is_secret(rel):
+                continue
+            candidates.append((path.stat().st_size, rel))
+    files: dict[str, str] = {}
+    dropped: list[str] = []
+    total = 0
+    for size, rel in sorted(candidates):
+        if total + size > MAX_SEALED_BYTES:
+            dropped.append(rel)
+            continue
+        total += size
+        files[rel] = base64.b64encode((home / rel).read_bytes()).decode()
+    return {"files": files, "dropped": dropped, "bytes": total}
 
 
 def verify(home: Path) -> dict:
-    """Trust a restored tree only if it matches what its manifest promised."""
+    """Trust a restored tree only if it holds everything its manifest promised."""
     problems: list[str] = []
     manifest_path = home / MANIFEST
     if not manifest_path.is_file():
@@ -153,23 +226,33 @@ def verify(home: Path) -> dict:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except ValueError as exc:
         return {"ok": False, "problems": [f"manifest unreadable: {exc}"]}
+
+    files = bytes_total = 0
+    for root, dirs, names in os.walk(home, followlinks=False):
+        linked = [d for d in dirs if os.path.islink(os.path.join(root, d))]
+        files += len(linked)
+        dirs[:] = [d for d in dirs if d not in linked]
+        for name in names:
+            path = Path(root) / name
+            if path == manifest_path:
+                continue
+            files += 1
+            bytes_total += path.lstat().st_size
+    if files != manifest.get("files"):
+        problems.append(f"expected {manifest.get('files')} files, found {files}")
+    if bytes_total != manifest.get("bytes"):
+        problems.append(f"expected {manifest.get('bytes')} bytes, found {bytes_total}")
+
     for rel in manifest.get("databases", []):
         path = home / rel
         if not path.is_file():
             problems.append(f"database missing: {rel}")
             continue
         try:
-            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-            try:
-                result = connection.execute("PRAGMA quick_check").fetchone()
-            finally:
-                connection.close()
-            if not result or result[0] != "ok":
-                problems.append(f"database failed quick_check: {rel}")
-        except sqlite3.Error as exc:
-            problems.append(f"database unreadable: {rel}: {exc}")
-    return {"ok": not problems, "problems": problems, "files": manifest.get("files"),
-            "bytes": manifest.get("bytes")}
+            _check_database(path, rel)
+        except (RuntimeError, sqlite3.Error) as exc:
+            problems.append(f"{rel}: {exc}")
+    return {"ok": not problems, "problems": problems, "files": files, "bytes": bytes_total}
 
 
 def _safe_path(home: Path, rel: str) -> Path:
@@ -225,10 +308,11 @@ def _update_env(path: Path, updates: dict[str, str]) -> None:
 
 def apply(home: Path, bundle_path: Path) -> dict:
     from ruamel.yaml import YAML
+    from ruamel.yaml.error import YAMLError
 
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
     home.mkdir(parents=True, exist_ok=True)
-    report = {"sealed": 0, "template_files": 0, "template": None}
+    report = {"sealed": 0, "template_files": 0, "template": None, "config_recovered": False}
     if INSTALL_ROOT.is_dir():
         for name in INSTALL_LINKS:
             link = home / name
@@ -236,46 +320,70 @@ def apply(home: Path, bundle_path: Path) -> dict:
                 if link.exists():
                     shutil.rmtree(link)
                 link.symlink_to(INSTALL_ROOT / name)
+    (home / WORKSPACE).mkdir(exist_ok=True)
 
     for rel, content in bundle.get("sealed", {}).items():
         _write(_safe_path(home, rel), base64.b64decode(content), PRIVATE_MODE)
         report["sealed"] += 1
 
+    marker_path = home / TEMPLATE_MARKER
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        marker = {}
+    first_launch = not marker
     template = bundle.get("template") or {}
-    marker = home / TEMPLATE_MARKER
-    first_launch = not marker.exists()
-    if template and first_launch:
+    # A template's defaults and files apply the first time a user gets that template, which may be
+    # long after their first launch: assigning someone a template later still fills them in.
+    new_template = bool(template) and marker.get("name") != template.get("name")
+    if new_template:
         for entry in template.get("files", []):
             path = _safe_path(home, entry["path"])
             if not path.exists():
                 _write(path, base64.b64decode(entry["content"]), entry.get("mode"))
                 report["template_files"] += 1
-    if template:
-        report["template"] = template.get("name")
-        _write(marker, json.dumps(
-            {"name": template.get("name"), "applied": int(time.time())}).encode())
+    report["template"] = template.get("name")
 
     yaml = YAML()
     yaml.preserve_quotes = True
     config_path = home / "config.yaml"
-    config = yaml.load(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
+    config = None
+    if config_path.exists():
+        try:
+            config = yaml.load(config_path.read_text(encoding="utf-8"))
+        except (YAMLError, UnicodeDecodeError):
+            # A user's broken config must not stop their agent booting. It's kept, not lost.
+            os.replace(config_path, home / f"config.yaml.corrupt.{int(time.time())}")
+            report["config_recovered"] = True
+            first_launch = True
     config = config if isinstance(config, dict) else {}
     if first_launch:
+        _fill_defaults(config, bundle.get("platform_defaults") or {})
+    if first_launch or new_template:
         _fill_defaults(config, bundle.get("config_defaults") or {})
     _deep_merge(config, bundle.get("config_managed") or {})
-    from io import StringIO
     buffer = StringIO()
     yaml.dump(config, buffer)
     _write(config_path, buffer.getvalue().encode())
 
     env_path = home / ".env"
-    existing = set()
-    if env_path.exists():
-        existing = {line.split("=", 1)[0].strip() for line in env_path.read_text(encoding="utf-8").splitlines()}
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    existing = {line.split("=", 1)[0].strip() for line in lines}
+    managed = bundle.get("env") or {}
+    # Values the last template managed and this one doesn't must leave, or a removed shared token
+    # would stay in .env and be resealed on every snapshot.
+    removed = set(marker.get("managed_env", [])) - set(managed)
+    if removed:
+        lines = [line for line in lines if line.split("=", 1)[0].strip() not in removed]
+        _write(env_path, ("\n".join(lines) + "\n").encode(), PRIVATE_MODE)
     env = {k: v for k, v in (bundle.get("env_defaults") or {}).items() if k not in existing}
-    env.update(bundle.get("env") or {})
+    env.update(managed)
     if env:
         _update_env(env_path, env)
+
+    _write(marker_path, json.dumps({
+        "name": template.get("name"), "applied": int(time.time()), "managed_env": sorted(managed),
+    }).encode())
 
     session_token = bundle.get("session_token")
     if session_token:

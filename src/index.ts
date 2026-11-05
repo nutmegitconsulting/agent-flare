@@ -57,6 +57,18 @@ app.use("*", async (c, next) => {
 // The caller's own container
 // ---------------------------------------------------------------------------
 
+// The Worker's own writes can't rely on the Access cookie's SameSite setting to stop cross-site POSTs.
+app.use("/__af/*", async (c, next) => {
+  if (c.req.method === "GET") return next();
+  const origin = c.req.header("origin");
+  const site = c.req.header("sec-fetch-site");
+  const crossOrigin = origin && new URL(origin).host !== new URL(c.req.url).host;
+  if (crossOrigin || (site && !["same-origin", "none"].includes(site))) {
+    return c.text("Cross-site request refused", 403);
+  }
+  await next();
+});
+
 app.get("/__af/status", async (c) => {
   const { sub, email } = c.get("identity");
   const sandbox = sandboxFor(c.env, sub);
@@ -159,6 +171,10 @@ function forProxy(request: Request): Request {
     if (kept.length) headers.set("cookie", kept.join("; "));
     else headers.delete("cookie");
   }
+  // Addressing is ours to decide; the SDK would act on these.
+  for (const name of [...headers.keys()]) {
+    if (name.startsWith("x-sandbox-") || name === "cf-container-target-port") headers.delete(name);
+  }
   headers.set("x-forwarded-proto", "https");
   headers.set("x-forwarded-host", url.host);
   return new Request(request, { headers });
@@ -171,10 +187,14 @@ app.all("*", async (c) => {
   if (status.state !== "ready") return notReady(c.req.raw, status);
 
   const request = forProxy(c.req.raw);
-  if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+  const upgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";
+  const connection = request.headers.get("connection")?.toLowerCase().includes("upgrade");
+  if (upgrade && connection) {
     // Not sandbox.wsConnect: it refuses ports below 1024, and the webapp is on 443.
     return sandbox.fetch(switchPort(request, WEBAPP_PORT));
   }
+  // sandbox.fetch picks a port from the request unless both headers are present, and a half-formed
+  // upgrade could land on the control port. So anything else goes to the webapp by explicit port.
   return sandbox.containerFetch(request, WEBAPP_PORT);
 });
 

@@ -121,7 +121,7 @@ function grepTree(dir, needle) {
 // --- start ---
 const MASTER = randomBytes(36).toString("base64");
 writeFileSync(".dev.vars", [
-  `MASTER_KEY=${MASTER}`, "CLOUDFLARE_AI_API_TOKEN=e2e-shared-token", "SHARED_FROM_SECRET=shared-secret-value",
+  `MASTER_KEY=${MASTER}`, "CLOUDFLARE_AI_API_TOKEN=e2e-shared-token", "SHARED_FROM_SECRET=shared-secret-value", "TEMPLATE_SECRETS=SHARED_FROM_SECRET",
   "ALLOW_TEST_JWKS=1", `TEST_JWKS=${jwks}`, `SLEEP_AFTER=${SLEEP_AFTER_SECONDS}s`, "SNAPSHOT_INTERVAL_MINUTES=1",
 ].join("\n") + "\n");
 writeFileSync(join(persist, "assignments.json"), JSON.stringify({ users: { "alice@example.com": "team" } }));
@@ -129,7 +129,7 @@ writeFileSync(join(persist, "template.json"), JSON.stringify({
   files: ["SOUL.md"],
   config_defaults: { display: { theme: "from-template" } },
   config_managed: { agent: { managed_key: "managed-value" } },
-  env: { TEMPLATE_PLAIN: "plain-value", TEMPLATE_SECRET: "$SHARED_FROM_SECRET" },
+  env: { TEMPLATE_PLAIN: "plain-value", TEMPLATE_SECRET: "$SHARED_FROM_SECRET", STOLEN: "$MASTER_KEY" },
   providers: [{ name: "gw", mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY",
     gateway_id: "slug", models: { m: { context_length: 1000 } } }],
 }));
@@ -210,6 +210,10 @@ try {
   const env = inside(alice, `cat ${HOME}/.env`);
   expect(env.includes("TEMPLATE_PLAIN=plain-value") && env.includes("TEMPLATE_SECRET=shared-secret-value") && env.includes("GW_KEY=e2e-shared-token"), "template env and secrets applied", "(env withheld)");
 
+  expect(!env.includes("STOLEN=") && !env.includes(MASTER), "a template can't read MASTER_KEY");
+  expect((await alice.fetch("/__af/stop", { method: "POST", headers: { origin: "https://evil.example" } })).status === 403, "cross-site stop refused");
+  expect(inside(alice, `grep -c '^  cwd: ${HOME}/workspace' ${HOME}/config.yaml`) === "1", "agents work inside the snapshotted home");
+
   console.log("== isolation");
   expect((await bob.waitReady()).state === "ready", "second user gets a container");
   expect(containerOf(alice) !== containerOf(bob), "same email local part, different containers");
@@ -242,6 +246,13 @@ try {
   expect(inside(alice, `stat -c %a ${HOME}/.env`) === "600", ".env is private");
   expect((await alice.load()).status === 200, "webapp loads again after restore");
 
+  console.log("== a snapshot of a restored home restores cleanly");
+  await alice.json("/__af/stop", { method: "POST" });
+  await sleep(3000);
+  expect((await alice.waitReady()).state === "ready", "woke a second time");
+  const lastRestore = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).lastRestore;
+  expect(lastRestore.kind === "restored" && lastRestore.skipped.length === 0, "no backup was skipped", JSON.stringify(lastRestore));
+
   console.log("== wake on a running container must not roll back");
   sql(alice, "c.execute(\\\"INSERT INTO e2e VALUES ('after-snapshot')\\\");c.commit()");
   const again = await alice.json("/__af/status");
@@ -263,7 +274,7 @@ try {
   await sleep(3000);
   // The stop above took a third snapshot, which is good; corrupt that too.
   const third = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub);
-  expect(third.backups === 4, "stop added a final snapshot", JSON.stringify(third));
+  expect(third.backups === 5, "stop added a final snapshot", JSON.stringify(third));
   const index = execFileSync("npx", ["wrangler", "r2", "object", "get", `agent-flare-state/users/${alice.sub}/backups-index.json`, "--local", "--persist-to", persist, "--pipe"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   const entries = JSON.parse(index);
   r2Put(`backups/${entries.at(-1).id}/data.sqsh`, join(persist, "junk"));
@@ -272,6 +283,7 @@ try {
   expect(sql(alice, "print(c.execute('select v from e2e').fetchone()[0])") === "survived", "older backup's data is there");
 
   console.log("== every backup bad: fail closed");
+  // Backups that fail verify and backups that fail extraction both count as corrupt.
   await alice.json("/__af/stop", { method: "POST" });
   await sleep(3000);
   const allEntries = JSON.parse(execFileSync("npx", ["wrangler", "r2", "object", "get", `agent-flare-state/users/${alice.sub}/backups-index.json`, "--local", "--persist-to", persist, "--pipe"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
@@ -282,11 +294,17 @@ try {
   const errorBody = await errorPage.text();
   expect(errorPage.status === 500 && errorBody.includes("couldn't start"), "user sees an honest error page", errorBody.slice(0, 300));
   const refused = await alice.json("/__af/snapshot", { method: "POST" });
-  expect(refused.skipped === "container not hydrated", "snapshot refused on an unhydrated container", JSON.stringify(refused));
+  expect(refused.skipped === "container not hydrated" || refused.skipped === "container not running", "snapshot refused when not hydrated", JSON.stringify(refused));
+  await sleep(3000);
+  const bobContainer = containerOf(bob)?.slice(0, 12);
+  const strays = execFileSync("docker", ["ps", "--filter", "name=workerd", "--format", "{{.ID}} {{.Image}}"], { encoding: "utf8" })
+    .split("\n").filter((l) => l.includes("hermessandbox") && !l.startsWith(bobContainer ?? "none"));
+  expect(strays.length === 0, "failed container released its slot", strays.join("; "));
   const count = JSON.parse(execFileSync("npx", ["wrangler", "r2", "object", "get", `agent-flare-state/users/${alice.sub}/backups-index.json`, "--local", "--persist-to", persist, "--pipe"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).length;
   expect(count === allEntries.length, "index untouched: nothing was deleted or overwritten");
 
   console.log("== idle: final snapshot, then sleep");
+  await bob.waitReady();
   const before = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === bob.sub);
   sql(bob, "c.execute('CREATE TABLE IF NOT EXISTS idle (v TEXT)');c.execute(\\\"INSERT INTO idle VALUES ('kept')\\\");c.commit()");
   await fetch(`${BASE}/cdn-cgi/handler/scheduled?cron=*/5+*+*+*+*`).catch(() => {});
@@ -317,6 +335,19 @@ try {
     expect((await bob.waitReady()).state === "ready", `${mb} MB restore and boot in ${Math.round((Date.now() - t) / 1000)}s`);
     expect(inside(bob, `sha256sum ${HOME}/memories/big/blob`) === sum, "large file intact");
   }
+
+  console.log("== concurrent snapshots");
+  await bob.waitReady();
+  const beforeBurst = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === bob.sub).backups;
+  const burst = await Promise.all([1, 2, 3].map(() => bob.json("/__af/snapshot", { method: "POST" })));
+  expect(burst.every((r) => r.id), "three at once all succeed", JSON.stringify(burst));
+  const afterBurst = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === bob.sub).backups;
+  expect(afterBurst === beforeBurst + 3, "all three are in the index", `${beforeBurst} -> ${afterBurst}`);
+  await bob.json("/__af/stop", { method: "POST" });
+  await sleep(3000);
+  expect((await bob.waitReady()).state === "ready", "restores after the burst");
+  const burstRestore = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === bob.sub).lastRestore;
+  expect(burstRestore.skipped.length === 0, "no snapshot from the burst was corrupt", JSON.stringify(burstRestore));
 
   console.log(`PASS: ${passed} checks`);
   process.exitCode = 0;
