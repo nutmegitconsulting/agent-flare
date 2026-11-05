@@ -64,7 +64,13 @@ Never `wrangler deploy` a config that builds `./Dockerfile` with `AF_BASE_IMAGE`
 - A snapshot taken as a container stopped could record 0 files, outrank every good backup and pass verification. It appeared once, under load, and it's fixed. It was older than this work.
 - A single 4 GB layer timed out pushing. The image is now multi-stage, 1.85 GB compressed. Pushing through inspection can still time out on one layer; retrying finishes it.
 - The first login landed on a workers.dev name instead of the app. That name was a second hostname on the Access app, and the request never reached the Worker. It stopped once Chris removed the hostname.
-- The profile's default model, `glm-5.3-flash`, answered 429 "at capacity" (code 4006) on all 10 direct calls across about 3 hours, while `qwen3.8-27b` answered 200 on all 7 with the same credential. A wrong key gets 401, so the 429 isn't an auth problem. The `team` template now selects `@cf/qwen/qwen3.8-27b`; glm stays listed. An existing user keeps the model they have until they pick another: the picker lists all 8 models.
+- **Most gateway models answer 429 (2026-11-05), and we don't know exactly why.** `AiError: Service temporarily at capacity`, code 4006, 0 neurons. Over the day `glm-5.3-flash` never answered, on every path, and neither did `kimi-k2.5`, `kimi-k2.6`, `kimi-k2.7-code`, `glm-5.2`, `glm-5.3`, or any of the 3 DeepSeek models. `gemma-4-26b` answered once and then stopped. These answered every time: `qwen3.8-27b`, `gpt-oss-20b`, `gpt-oss-120b`, `glm-4.7-flash`, `llama-4-scout`.
+  - **Not a wrong reference:** IDs match Cloudflare's catalog; a bad ID gets 400 (5007 or 2008), never 429. Adding the `workers-ai/` prefix from the compat docs changes nothing, and the bare `@cf/` form works on `qwen3.8-27b`. The same 429 comes back without AI Gateway, on the REST `/ai/run` route from the model page and on `/ai/v1`.
+  - **Not a label bug:** all 11 names map to their own ID in the deployed files. A pick sent the right ID in tests and in a real session against a stub.
+  - **Not settled:** code 4006 isn't in Cloudflare's error table (capacity is 3040, free allocation is 3036). A second credential couldn't test it, so upstream capacity and a limit on this account or key can't be told apart from here. Next: try the Workers AI playground on this account, then a Cloudflare ticket quoting 4006 and the request IDs.
+  - `moondream3.1` is an image-to-text model: 502 through the gateway's chat route, 200 direct. It probably doesn't belong in a chat list; Chris's call.
+- The `team` template selects `@cf/qwen/qwen3.8-27b`, which works. glm stays listed. An existing user keeps the model they have until they pick another.
+- **A deploy restarts running containers.** The rollout signals them to exit with no final snapshot, so a user can lose work since the last 10-minute snapshot. Deploy when nobody's active, or stop them first.
 
 ## First login, production (2026-11-05)
 

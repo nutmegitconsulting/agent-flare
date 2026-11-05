@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { renderProviders, validateProviders } from "../../src/providers";
 import { fetchAccessGroups, loadTemplate, pickTemplate, resolveEnv, templateSecrets } from "../../src/templates";
@@ -128,6 +129,15 @@ describe("providers", () => {
     expect(rendered.modelAliases["+high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
     expect(rendered.candidates[0].model).toBe("@cf/a/low-one");
     expect(rendered.customProviders[0].model).toBe("@cf/a/low-one");
+  });
+  it("maps every tiered model to its own real ID, with no leading hyphen or space", () => {
+    const tiers = JSON.parse(readFileSync("templates/model-tiers.example.json", "utf8"));
+    const models = Object.fromEntries(Object.keys(tiers).map((id) => [id, {}]));
+    const parsed = validateProviders([{ ...entry, model: undefined, models }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const { modelAliases } = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com", tiers);
+    expect(Object.values(modelAliases).map((a) => a.model).sort()).toEqual(Object.keys(tiers).sort());
+    for (const label of Object.keys(modelAliases)) expect(label).toMatch(/^[\u2212|+]\S+$/);
   });
   it("refuses a credential reference to MASTER_KEY", () => {
     expect(validateProviders([{ ...entry, credential: "MASTER_KEY" }]).ok).toBe(false);
