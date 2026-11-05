@@ -62,6 +62,8 @@ export class HermesSandbox extends Sandbox<Env> {
   private hydration: Promise<void> | null = null;
   private status: ReadyState = { state: "starting", step: "waiting" };
   private ready = false;
+  /** Set once a stop is signalled: the container's disk can't be trusted from then on. */
+  private stopping = false;
   private lastUserActivity = 0;
   private lastSnapshotAt = 0;
   private lastSnapshotError: string | null = null;
@@ -261,6 +263,7 @@ export class HermesSandbox extends Sandbox<Env> {
   private async takeSnapshot(): Promise<SnapshotResult> {
     const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
     if (!identity) return { skipped: "no user bound to this sandbox" };
+    if (this.stopping) return { skipped: "container stopping" };
     if (!(await this.isRunning())) return { skipped: "container not running" };
     if (!(await this.hasReadyFile())) return { skipped: "container not hydrated" };
 
@@ -353,6 +356,7 @@ export class HermesSandbox extends Sandbox<Env> {
     await this.serial(async () => {
       await this.finalSnapshot("stop");
       await this.clearActiveMarker();
+      this.stopping = true;
       await this.stop();
     });
   }
@@ -390,6 +394,7 @@ export class HermesSandbox extends Sandbox<Env> {
       if (!saved) console.error("[final-snapshot:idle] giving up; stopping without a final snapshot");
       this.finalSnapshotFailures = 0;
       await this.clearActiveMarker();
+      this.stopping = true;
       await super.onActivityExpired();
     });
   }
@@ -397,6 +402,7 @@ export class HermesSandbox extends Sandbox<Env> {
   override async onStop(params?: Parameters<Sandbox<Env>["onStop"]>[0]): Promise<void> {
     this.generation++;
     this.ready = false;
+    this.stopping = false;
     this.hydration = null;
     // A failure stays visible until its retry window passes, even though stopping is what follows it.
     if (this.status.state !== "failed") this.status = { state: "starting", step: "waiting" };

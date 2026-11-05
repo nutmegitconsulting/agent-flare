@@ -111,6 +111,10 @@ def _copy_sqlite(src: Path, dst: Path) -> None:
 
 def stage(home: Path, stage_dir: Path) -> dict:
     _credential_check()
+    # Hydration always writes config.yaml. Without it the home is gone or going, as in a container
+    # that's shutting down, and an empty backup would outrank every good one.
+    if not (home / "config.yaml").is_file():
+        raise RuntimeError(f"refusing to snapshot {home}: no config.yaml")
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
     stage_dir.mkdir(parents=True)
@@ -238,6 +242,8 @@ def verify(home: Path) -> dict:
                 continue
             files += 1
             bytes_total += path.lstat().st_size
+    if not (home / "config.yaml").is_file():
+        problems.append("config.yaml missing")
     if files != manifest.get("files"):
         problems.append(f"expected {manifest.get('files')} files, found {files}")
     if bytes_total != manifest.get("bytes"):

@@ -33,7 +33,28 @@ class Base(unittest.TestCase):
         return af_state.apply(self.home, path)
 
 
-class Stage(Base):
+class Hydrated(Base):
+    def setUp(self):
+        super().setUp()
+        (self.home / "config.yaml").write_text("a: 1\n")
+
+
+class EmptyHome(Base):
+    def test_a_home_that_is_gone_or_empty_is_never_snapshotted(self):
+        for home in (self.home / "gone", self.home):
+            with self.assertRaises(RuntimeError):
+                af_state.stage(home, Path(self.tmp.name) / "stage")
+
+    def test_an_empty_backup_fails_verification(self):
+        restored = Path(self.tmp.name) / "restored"
+        restored.mkdir()
+        (restored / af_state.MANIFEST).write_text(json.dumps({"files": 0, "bytes": 0, "databases": []}))
+        result = af_state.verify(restored)
+        self.assertFalse(result["ok"])
+        self.assertIn("config.yaml missing", result["problems"])
+
+
+class Stage(Hydrated):
     def test_leaves_out_secrets_and_junk_keeps_the_rest(self):
         (self.home / "config.yaml").write_text("a: 1\n")
         (self.home / ".env").write_text("KEY=secret\n")
@@ -97,7 +118,7 @@ class Stage(Base):
         self.assertEqual(copy.execute("SELECT n FROM t").fetchone()[0], 42)
 
 
-class UserDataStays(Base):
+class UserDataStays(Hydrated):
     def test_names_like_logs_or_cache_are_excluded_only_where_hermes_puts_them(self):
         keep = ["skills/x/cache/data.json", "skills/x/logs/notes.md", "memories/tmp/plan.md",
                 "workspace/app/uv.lock", "workspace/app/venv/keep.txt", "workspace/app/sandboxes/a.txt"]
@@ -126,7 +147,7 @@ class UserDataStays(Base):
             af_state.stage(self.home, self.stage)
 
 
-class Verify(Base):
+class Verify(Hydrated):
     def test_no_manifest_is_untrusted(self):
         self.assertFalse(af_state.verify(self.home)["ok"])
 
