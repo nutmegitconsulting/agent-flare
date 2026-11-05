@@ -97,6 +97,23 @@ sent=$(dx "head -1 /tmp/stub.log")
 echo "$sent" | grep -q '"auth": "Bearer team-secret-value"' && ok "the request carries the credential from .env" || die "auth sent: $(echo "$sent" | cut -c1-120)"
 echo "$sent" | grep -q '"gw": "slug"' && echo "$sent" | grep -q 'alice@example.com' && ok "the request carries gateway and user tags" || die "headers: $sent"
 
+echo "== price tiers in the model picker"
+tiers='{"m1":"medium"}'
+dx "echo '$tiers' > /run/agent-flare/model-tiers.json"
+dx "$PY /t/browser_sim.py $HOST" >/dev/null
+picker=$(dx "$PY /t/picker_sim.py $HOST 2>/dev/null" | tail -1)
+pick() { echo "$picker" | "$PYHOST" -c "import json,sys;d=json.load(sys.stdin);row=[p for p in d['providers'] if p['slug']=='custom:team-gateway'][0];print(eval(sys.argv[1],{'row':row,'d':d}))" "$1"; }
+[ "$(pick "row['pricing']['m1']['input']")" = "●●○" ] && [ "$(pick "row['pricing']['m1']['output']")" = medium ] && ok "the process answering the picker shows the tier mark" || die "picker: $(echo "$picker" | cut -c1-500)"
+echo "$picker" | grep -qE '\\$|[0-9]\.[0-9]' && die "a price reached the picker: $(echo "$picker" | cut -c1-500)" || ok "no money value in the picker's data"
+dx "rm /run/agent-flare/model-tiers.json"
+dx "$PY /t/browser_sim.py $HOST" >/dev/null
+picker=$(dx "$PY /t/picker_sim.py $HOST 2>/dev/null" | tail -1)
+[ "$(pick "row['pricing'] in (None, {})")" = True ] && [ "$(pick "row['models']")" = "['m1']" ] && ok "no tier file: no mark, and the picker still works" || die "picker without tiers: $(echo "$picker" | cut -c1-500)"
+dx "echo 'not json' > /run/agent-flare/model-tiers.json"
+dx "$PY /t/browser_sim.py $HOST" >/dev/null
+picker=$(dx "$PY /t/picker_sim.py $HOST 2>/dev/null" | tail -1)
+[ "$(pick "row['pricing'] in (None, {})")" = True ] && ok "a broken tier file: no mark, and the picker still works" || die "picker with bad tiers: $(echo "$picker" | cut -c1-500)"
+
 echo "== supervision"
 gateway_pid() { dx "$PY -c \"import json;print(json.load(open('$HOME_DIR/gateway.pid'))['pid'])\""; }
 before=$(gateway_pid)

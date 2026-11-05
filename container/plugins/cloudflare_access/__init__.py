@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 _TAG = "dashboard-auth[cloudflare-access]"
 
 AUTH_FILE = Path(os.environ.get("AGENT_FLARE_AUTH_FILE", "/run/agent-flare/auth.json"))
+TIERS_FILE = Path(os.environ.get("AGENT_FLARE_TIERS_FILE", "/run/agent-flare/model-tiers.json"))
+TIER_MARKS = {"low": "\u25cf\u25cb\u25cb", "medium": "\u25cf\u25cf\u25cb", "high": "\u25cf\u25cf\u25cf"}
 CODE_TTL_SECONDS = 60
 ACCESS_TTL_SECONDS = 12 * 60 * 60
 REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -128,6 +130,42 @@ class CloudflareAccessProvider(DashboardAuthProvider):
         return None
 
 
+def label_model_tiers(payload):
+    """Show a price tier in the picker through the price tag it already draws for each model. The tag
+    prints `input / output`, so those carry the mark and the tier's name, never a price. Only custom
+    providers: built-in ones keep their own pricing. Any failure leaves the payload without marks."""
+    try:
+        tiers = json.loads(TIERS_FILE.read_text(encoding="utf-8"))
+        for row in payload.get("providers", []):
+            if not str(row.get("slug", "")).startswith("custom:"):
+                continue
+            labels = {model: {"input": TIER_MARKS[tiers[model]], "output": tiers[model], "cache": None, "free": False}
+                      for model in row.get("models") or [] if tiers.get(model) in TIER_MARKS}
+            if labels:
+                row["pricing"] = labels
+                row.pop("pricing_pending", None)
+    except Exception:  # noqa: BLE001 - a cosmetic mark must never break the model picker.
+        logger.debug("%s: no model tiers", _TAG, exc_info=True)
+    return payload
+
+
+def _install_tier_labels() -> None:
+    """Every picker surface calls build_model_options_payload through the module at call time."""
+    import functools  # noqa: PLC0415
+
+    from hermes_cli import inventory  # noqa: PLC0415
+    original = inventory.build_model_options_payload
+    if getattr(original, "_agent_flare", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        return label_model_tiers(original(*args, **kwargs))
+
+    wrapped._agent_flare = True
+    inventory.build_model_options_payload = wrapped
+
+
 def register(ctx) -> None:
     """Register unconditionally in this image: the listener must start before the Worker has
     anything else to say, and a missing identity file fails the sign-in closed, not open."""
@@ -135,3 +173,7 @@ def register(ctx) -> None:
     LAST_SKIP_REASON = ""
     ctx.register_dashboard_auth_provider(CloudflareAccessProvider())
     logger.info("%s: registered", _TAG)
+    try:
+        _install_tier_labels()
+    except Exception:  # noqa: BLE001 - Hermes may move this function; sign-in must still work.
+        logger.warning("%s: model tier labels unavailable", _TAG, exc_info=True)
