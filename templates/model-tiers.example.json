@@ -9,7 +9,7 @@
   "@cf/moonshotai/kimi-k2.7-code": "high",
   "@cf/deepseek-ai/deepseek-v4-pro-0813": "high",
   "@cf/zai-org/glm-5.3": "high",
-  "anthropic/claude-haiku-5-5": "low",
+  "anthropic/claude-haiku-5-5": "medium",
   "anthropic/claude-haiku-4-5": "high",
   "anthropic/claude-sonnet-5-5": "premium",
   "anthropic/claude-opus-5-5": "premium"

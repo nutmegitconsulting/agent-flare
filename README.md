@@ -143,7 +143,7 @@ Every change applies at the user's next boot, and the Users screen shows who's w
 
 The picker shows a model's cost at the start of its name: `..$` low, `.$$` medium, `$$$` high, `*$$$` far above the rest. It's ordinary Hermes config: a model alias maps the shown name to the real ID. The list is `config/model-tiers.json`, shared by every role; edit it with `scripts/templates.mjs tiers` (`low`, `medium`, `high`, `premium`) or by typing the mark before the model in a role's model list. A model with no entry shows no mark. The mark has no space after it, because the webapp can't switch to a name containing a space in a running session. The model in use shows under its real name.
 
-Marks use a blended price per million tokens, (3 x input + output) / 4: low under $0.50, medium up to $1.50, high up to $3, premium above $3. Workers AI models use Cloudflare's prices, and Claude models use Anthropic's API prices.
+Marks use a blended price per million tokens, (3 x input + output) / 4: low under $0.50, medium up to $1.50, high up to $3, premium above $3. Workers AI models use Cloudflare's prices, and Claude models use Anthropic's API prices. Haiku 5.5 uses its price for prompts over 100,000 tokens, because agent sessions can reach that.
 
 New homes start in dark mode, through Hermes's own preferences file. A user can change it, and a choice they've made is never replaced.
 
