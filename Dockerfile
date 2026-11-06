@@ -32,18 +32,11 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # --- System tools ---
 # build-essential is required by install.sh's node-pty native build.
 # squashfs-tools: createBackup/restoreBackup run mksquashfs/unsquashfs in-container.
+# openssh-client: for an agent's outbound git over SSH. There's no SSH server in this image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         curl ca-certificates git squashfs-tools build-essential openssh-server \
+         curl ca-certificates git squashfs-tools build-essential openssh-client \
     && rm -rf /var/lib/apt/lists/*
-
-# --- SSH setup for Cloudflare Containers debug access ---
-RUN mkdir -p /run/sshd \
-    && echo 'root:*:19694:0:99999:7:::' > /etc/shadow \
-    && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
-    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \
-    && sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
-    && ssh-keygen -A
 
 # --- hermes user (install + runtime data owner) ---
 RUN useradd --create-home --shell /bin/bash --uid 1000 hermes

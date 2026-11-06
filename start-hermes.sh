@@ -11,16 +11,10 @@
 # =============================================================================
 set -u
 
-export HERMES_HOME=/home/hermes/.hermes
-export PATH="/home/hermes/.local/bin:/opt/hermes-install/node/bin:/usr/local/bin:$PATH"
 READY_FILE=/run/agent-flare/ready
 
-mkdir -p "$HERMES_HOME" /run/agent-flare
+mkdir -p /run/agent-flare
 chmod 700 /run/agent-flare
-
-# Debug access only: reachable through `wrangler containers ssh` with a configured key.
-mkdir -p /run/sshd
-/usr/sbin/sshd &
 
 echo "[agent-flare] waiting for hydration"
 while [ ! -f "$READY_FILE" ]; do

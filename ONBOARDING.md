@@ -133,4 +133,4 @@ Check `/__af/admin/users` for backup counts, and `npx wrangler tail` for logs.
 | Hermes asks to connect a provider | No provider has a credential. `/__af/admin/users` shows `config.inference.missing` and `config.warnings`. Set the secret and the user's next boot selects it |
 | Messages fail with 401 or 403 | The credential was refused: check the Worker secret can use that gateway |
 
-For a debug shell, set `containers[0].ssh.enabled` to true, add your `ssh-ed25519` key under `authorized_keys`, redeploy and use `wrangler containers ssh`.
+SSH into containers is off. To turn it on for debugging, see [Debugging a container](README.md#debugging-a-container).

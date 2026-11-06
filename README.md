@@ -197,6 +197,24 @@ Admins are listed in the `ADMIN_EMAILS` var.
 
 See [ONBOARDING.md](ONBOARDING.md).
 
+## Debugging a container
+
+SSH is off: the config sets `ssh.enabled` to `false`, and the image has no SSH server. Use `npx wrangler tail` and the admin user page first.
+
+To open a shell, follow Cloudflare's [SSH guide](https://developers.cloudflare.com/containers/guides/ssh/), with the settings in the [Wrangler SSH reference](https://developers.cloudflare.com/workers/wrangler/configuration/#ssh):
+
+1. In your Wrangler config, set `containers[0].ssh.enabled` to `true` and add your key. Only `ssh-ed25519` keys work:
+   ```jsonc
+   "ssh": { "enabled": true },
+   "authorized_keys": [{ "name": "you", "public_key": "ssh-ed25519 AAAA..." }]
+   ```
+2. Deploy, and make sure the container is running. SSH won't start a stopped one, and a session won't keep one awake.
+3. Find the instance with `npx wrangler containers instances`, then connect with `npx wrangler containers ssh <INSTANCE_ID>`.
+
+The guide doesn't say whether an image needs its own SSH server. If the connection fails, try adding `openssh-server` to the `Dockerfile` and starting `sshd` in `start-hermes.sh`.
+
+Containers run as root, so a shell can read that user's `.env`, chats and credentials. Keep `"enabled": false` in the config when you're done: Cloudflare's docs and Wrangler's schema disagree on the default, so don't just delete the line.
+
 ## Testing
 
 ```bash

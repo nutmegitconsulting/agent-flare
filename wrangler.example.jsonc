@@ -1,5 +1,10 @@
 {
-  // Copy to wrangler.jsonc (gitignored), or let scripts/render-wrangler.mjs generate it.
+  // Example Worker config. scripts/render-wrangler.mjs writes wrangler.jsonc (gitignored) from this file and AF_*
+  // variables, or copy it by hand and replace the placeholders. See ONBOARDING.md.
+  //
+  // Secrets never go here. Set them with `npx wrangler secret put NAME`:
+  //   MASTER_KEY               required: openssl rand -base64 48
+  //   CLOUDFLARE_AI_API_TOKEN  needed by api_token providers in templates
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "agent-flare",
   "main": "src/index.ts",
@@ -12,44 +17,52 @@
   "containers": [
     {
       "class_name": "AgentSandbox",
+      // Builds here on deploy. To run an image you pushed with `wrangler containers push`, use its registry name:
+      //   "registry.cloudflare.com/YOUR_ACCOUNT_ID/agent-flare:TAG"
       "image": "./Dockerfile",
       "instance_type": "standard-2",
-      // One container per active user.
+      // One container per active user. A user past the limit can't get a container.
       "max_instances": 10,
-      // Debug shell via `wrangler containers ssh`. Needs an ssh-ed25519 key under
-      // authorized_keys to work at all; set false to close it entirely.
+      // Closed. To open it, see "Debugging a container" in README.md.
       "ssh": { "enabled": false }
     }
   ],
   "durable_objects": {
     "bindings": [{ "name": "Sandbox", "class_name": "AgentSandbox" }]
   },
+  // Keep both. HermesSandbox is an empty stub that holds the namespace of deployments made before AgentSandbox.
   "migrations": [
     { "new_sqlite_classes": ["HermesSandbox"], "tag": "v1" },
-    // HermesSandbox moved to the durable_object policy on SDK 1.0, which is one-way. It stays as an empty stub.
     { "new_sqlite_classes": ["AgentSandbox"], "tag": "v2" }
   ],
+  // Create with: npx wrangler r2 bucket create agent-flare-state
   "r2_buckets": [
     { "binding": "BACKUP_BUCKET", "bucket_name": "agent-flare-state" }
   ],
+  // Create with: npx wrangler kv namespace create agent-flare-credentials
   "kv_namespaces": [
     { "binding": "CREDENTIALS_KV", "id": "YOUR_KV_NAMESPACE_ID" }
   ],
   // Keeps secrets set with `wrangler secret put` across deploys.
   "keep_vars": true,
   "vars": {
+    // Your Access team, and the audience (AUD) tag of the Access application on your hostname.
     "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
     "ACCESS_AUD_TAG": "your-access-application-aud",
+    // Who can use the admin screens, for example "you@example.com,teammate@example.com". Empty means nobody.
     "ADMIN_EMAILS": "",
+    // Idle time before a container stops, for example "30m" or "1h".
     "SLEEP_AFTER": "30m",
+    // Minutes between snapshots of a running container.
     "SNAPSHOT_INTERVAL_MINUTES": "10",
     // With no "Keep awake" and no tap, a container stops after this long even with a tab open.
     "FORGOTTEN_TAB_CAP_HOURS": "12",
-    // Worker secrets templates may reference as "$NAME". Comma-separated.
+    // Worker secrets templates may reference as "$NAME", for example "SHARED_KEY,SEARCH_API_KEY". Comma-separated.
     "TEMPLATE_SECRETS": "",
     // Streams restores instead of loading the whole archive into Durable Object memory.
     "SANDBOX_TRANSPORT": "rpc"
   },
+  // Every 5 minutes: snapshots. Every 2 hours: pruning old backups.
   "triggers": {
     "crons": ["*/5 * * * *", "0 */2 * * *"]
   }
