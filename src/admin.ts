@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { chooseTheme, contrastWarnings, customCookie, CUSTOM_FIELDS, DEFAULT_THEME, THEME_NAMES, themeCookie, themeFromCookies, THEMES, validateCustom, type Theme, type ThemeName } from "./themes";
 /**
  * The admin screens. Server-rendered, with no script. They are mounted behind the same checks as every admin
  * route: the Worker's Access JWT verification, ADMIN_EMAILS, and the same-origin check on writes. ADMIN_EMAILS
@@ -66,22 +68,46 @@ export async function audit(c: Ctx, action: string, target: string, detail?: Rec
 // Pages
 // ---------------------------------------------------------------------------
 
-function page(title: string, body: string, status = 200): Response {
+export const pageContext = new AsyncLocalStorage<{ name: ThemeName | "custom"; tokens: Theme; path: string; savedCustom: Theme | null }>();
+
+function themeForm(current: ThemeName | "custom", path: string): string {
+  const label = (name: string) => name[0].toUpperCase() + name.slice(1);
+  const button = (name: string) => name === current
+    ? `<button name="theme" value="${name}" class="current" aria-current="true">${label(name)} (current)</button>`
+    : `<button name="theme" value="${name}">${label(name)}</button>`;
+  // Fixed colours, whatever a custom theme has made of the rest of the page.
+  const reset = current === "custom"
+    ? `<button name="reset" value="1" style="background:#000;color:#fff;border:2px solid #fff;margin:0">Reset to Ember</button>` : "";
+  return `<form method="post" action="/__af/admin/theme" class="themes"><input type="hidden" name="back" value="${e(path)}"><span class="muted">Theme</span>
+    ${[...THEME_NAMES.map(button), button("custom")].join(" ")} <a href="/__af/admin/theme">Edit colours</a> ${reset}</form>`;
+}
+
+export function page(title: string, body: string, status = 200): Response {
+  const context = pageContext.getStore() ?? { name: DEFAULT_THEME, tokens: THEMES[DEFAULT_THEME], path: "/__af/admin", savedCustom: null };
+  const t = context.tokens;
   return new Response(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en" style="background:${t.bg}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>${e(title)} · Agent Flare</title>
 <style>
-  :root { color-scheme: light dark; --bg:#f7f7f8; --fg:#1a1a1d; --muted:#6b6b73; --line:#d9d9de; --warn:#9a5b00; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#131316; --fg:#ececf0; --muted:#8b8b93; --line:#303036; --warn:#e5a54b; } }
+  :root { color-scheme:dark; --bg:${t.bg}; --surface:${t.surface}; --surface-2:${t.surface2}; --fg:${t.fg}; --muted:${t.muted}; --line:${t.line}; --field-line:${t.fieldLine}; --warn:${t.warn}; --link:${t.link}; --accent:${t.accent}; --on-accent:${t.onAccent}; --accent-hover:${t.accentHover}; }
+  html { background:var(--bg); }
   body { margin:0 auto; max-width:60rem; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
-  nav a { margin-right:1rem; } h1 { font-size:1.3rem; } h2 { font-size:1.05rem; margin-top:1.75rem; }
+  a { color:var(--link); } nav { background:var(--surface-2); margin:-16px -16px 0; padding:.5rem 16px; display:flex; flex-wrap:wrap; align-items:center; gap:.25rem 1rem; } nav a { display:inline-block; padding:.45rem 0; }
+  h1 { font-size:1.3rem; } h2 { font-size:1.05rem; margin-top:1.75rem; }
   .scroll { overflow-x:auto; } table { border-collapse:collapse; width:100%; }
-  th,td { text-align:left; padding:.35rem .6rem .35rem 0; border-bottom:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; }
-  label { display:block; margin:.6rem 0 .15rem; } input,select,textarea { font:inherit; max-width:100%; box-sizing:border-box; }
+  th,td { text-align:left; padding:.35rem .6rem; border-bottom:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; } th { background:var(--surface); }
+  label { display:block; margin:.6rem 0 .15rem; }
+  input,select,textarea { font:inherit; max-width:100%; box-sizing:border-box; background:var(--surface); color:var(--fg); border:1px solid var(--field-line); border-radius:4px; padding:.35rem .5rem; }
   input[type=text],input[type=password],textarea { width:32rem; } .muted { color:var(--muted); } .warn { color:var(--warn); }
-  code { overflow-wrap:anywhere; } button { font:inherit; margin-top:.6rem; } form.inline { display:inline; }
+  code { overflow-wrap:anywhere; } form.inline { display:inline; }
+  button { font:inherit; margin-top:.6rem; padding:.4rem .9rem; background:var(--accent); color:var(--on-accent); border:0; border-radius:4px; cursor:pointer; } button:hover { background:var(--accent-hover); }
+  .themes { margin-left:auto; display:flex; flex-wrap:wrap; align-items:center; gap:.4rem; } .themes button { margin:0; background:transparent; color:var(--link); border:1px solid var(--field-line); }
+  .themes button:hover { background:var(--surface); } .themes button.current { color:var(--fg); font-weight:600; border-color:var(--fg); }
+  :focus-visible { outline:2px solid var(--link); outline-offset:2px; }
+  @media (pointer:coarse), (max-width:40rem) { input,select,button,nav a { min-height:44px; } }
 </style></head><body>
-<nav><a href="/__af/admin">Users</a><a href="/__af/admin/roles">Roles</a><a href="/__af/admin/audit">Audit</a></nav>
+<nav><a href="/__af/admin">Users</a><a href="/__af/admin/roles">Roles</a><a href="/__af/admin/audit">Audit</a>${themeForm(context.name, context.path)}</nav>
 <h1>${e(title)}</h1>${body}</body></html>`, {
     status,
     headers: {
@@ -191,6 +217,41 @@ function modelList(provider: GatewayProviderEntry, tiers: ModelTiers): string {
 // ---------------------------------------------------------------------------
 
 export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (bucket: R2Bucket) => Promise<string[]>): void {
+  // The theme comes from cookies, checked here on every request, and reaches page() without passing through each route.
+  admin.use("*", (c, next) => {
+    const url = new URL(c.req.url);
+    const theme = themeFromCookies(c.req.header("cookie"));
+    return pageContext.run({ ...theme, path: url.pathname + url.search }, () => next());
+  });
+
+  admin.post("/theme", async (c) => {
+    const { cookies, location } = chooseTheme(await c.req.parseBody(), c.req.header("cookie"));
+    const headers = new Headers({ location });
+    for (const cookie of cookies) headers.append("set-cookie", cookie);
+    return new Response(null, { status: 303, headers });
+  });
+
+  admin.get("/theme", (c) => {
+    const { tokens, name } = pageContext.getStore()!;
+    const warnings = name === "custom" ? contrastWarnings(tokens) : [];
+    return page("Theme colours", `
+      ${warnings.length ? `<p class="warn" style="background:#000;color:#fff;padding:.5rem;border:2px solid #fff">Some text may be hard to read: ${warnings.map(e).join("; ")}. It's saved anyway.</p>` : ""}
+      <p class="muted">Each one as #rrggbb. Saved in this browser only.</p>
+      <form method="post" action="/__af/admin/theme/custom">
+        ${CUSTOM_FIELDS.map(([key, label]) => `<label for="c-${key}">${e(label)}</label><input id="c-${key}" type="text" name="${key}" value="${e(tokens[key])}" pattern="#[0-9a-fA-F]{6}" maxlength="7" required>`).join("")}
+        <br><button>Save</button>
+      </form>`);
+  });
+
+  admin.post("/theme/custom", async (c) => {
+    const result = validateCustom(await c.req.parseBody());
+    if ("invalid" in result) return problem(`Each colour has to be #rrggbb. Check: ${result.invalid.join(", ")}.`, "/__af/admin/theme");
+    const headers = new Headers({ location: "/__af/admin/theme" });
+    headers.append("set-cookie", customCookie(result.theme));
+    headers.append("set-cookie", themeCookie("custom"));
+    return new Response(null, { status: 303, headers });
+  });
+
   admin.get("/", async (c) => {
     const listing = await c.env.BACKUP_BUCKET.list({ prefix: "users/", delimiter: "/" });
     const subs = [...new Set([...listing.delimitedPrefixes.map((p) => p.split("/")[1]), ...(await activeUsers(c.env.BACKUP_BUCKET))])];
