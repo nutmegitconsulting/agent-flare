@@ -59,12 +59,13 @@ export const TIER_MARKS: Record<ModelTier, string> = { low: "..$", medium: ".$$"
 
 /**
  * The name a model has in the picker, such as "$$$ Claude Haiku 4.5 (200k)". A Hermes model alias maps it back to
- * the real ID, which is all the API ever sees. Workers AI models start with CF.
+ * the real ID, which is all the API ever sees. Workers AI models start with CF. The gaps are U+2800, a blank that
+ * isn't whitespace: the webapp splits a pick on whitespace, and refuses a real space in a running session.
  */
 export function modelLabel(id: string, tier: ModelTier | undefined, info: ProviderModelInfo = {}): string {
   const name = info.name?.trim() || id.split("/").pop()!.replace(/-/g, " ");
   return [tier && TIER_MARKS[tier], id.startsWith("@cf/") && "CF", name, info.context_length && `(${contextText(info.context_length)})`]
-    .filter(Boolean).join(" ");
+    .filter(Boolean).join(" ").replace(/\s+/g, "\u2800");
 }
 
 function contextText(tokens: number): string {
