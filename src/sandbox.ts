@@ -591,6 +591,6 @@ export class AgentSandbox extends Sandbox<Env> {
 // The SDK's alarm loop calls this, and it's private only in the SDK's types, so it can't be overridden in the class.
 // Its own version treats an in-flight request as activity, which on this SDK includes the webapp's socket.
 const sdkIdleCheck = (Sandbox.prototype as unknown as { isActivityExpired(this: unknown): boolean }).isActivityExpired;
-(HermesSandbox.prototype as unknown as { isActivityExpired(this: HermesSandbox): boolean }).isActivityExpired = function () {
+(AgentSandbox.prototype as unknown as { isActivityExpired(this: AgentSandbox): boolean }).isActivityExpired = function () {
   return this.actionIdleExpired() ?? sdkIdleCheck.call(this);
 };
