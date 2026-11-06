@@ -1,19 +1,33 @@
 # Agent Flare: webapp and state overhaul
 
-Branch: `webapp-and-state`. Deployed from this machine 2026-11-05, and SDK 1.0.3 on 2026-11-06. Not pushed to GitHub: Chris hasn't asked for that yet.
+Branch: `return-0.12.14` (live). `webapp-and-state` holds the 1.0.3 work. Deployed from this machine 2026-11-05, and SDK 1.0.3 on 2026-11-06. Not pushed to GitHub: Chris hasn't asked for that yet.
 Started 2026-11-04. Keep this file current; secrets, the account ID and the Access AUD never go in it.
 
 ## Current state: back on SDK 0.12.14 (live 2026-11-06)
 
 Chris's direction: use 0.12.14 until Cloudflare's 1.0.3 docs catch up with the container management features this needs. Branch `return-0.12.14`, from `185264f`. The 1.0.3 work is intact on `webapp-and-state`. Local only, no GitHub.
 
-**Live:** Worker version `63ef49af`, class `AgentSandbox`, application `agent-flare-agentsandbox`, default scheduling, `max_instances` 10, image `agent-flare:5b31331` (no cache, guard clean, container suite passed, 39 and 37).
+**Live:** Worker version `620124a8`, commit `fe36c32`, `SLEEP_AFTER` 30m, class `AgentSandbox`, application `agent-flare-agentsandbox`, default scheduling, `max_instances` 10, image `agent-flare:f60285f` (no cache, guard clean, container suite 39 and 37). Not in production in Chris's sense: no need to ask for deploy times until he says so. Deploy Worker-only changes with `--containers-rollout=none`.
 
 **Why a new class:** Cloudflare's guide says "You cannot undo the deploy that moves your class to `scheduling_policy: "durable_object"`" and "0.x code cannot start containers for the class, even after `wrangler rollback`". So `HermesSandbox` stays as an empty stub, keeping its namespace and data. Its application `agent-flare-hermes` remains, as does `agent-flare-hermessandbox` (0.x, 9765e5d), which waits on Chris.
 
-**Idle design:** `sleepAfter` = `SLEEP_AFTER` (30m), the SDK's own timer. The chip hooks in through `isActivityExpired`, as in `185264f`. None of the 1.0.3 alarm work came back. Cloudflare's source shows that timer is itself an alarm loop inside the `Container` class.
+**Idle design: 100% chip led (Chris).** The chip reports a tap, a keystroke, a page load, and an agent mid-turn (`busyBySession`), at most once a minute. Nothing else counts. A container gets its 30 minutes at start, kept in Durable Object storage. The SDK's alarm loop checks it, up to 3 minutes late (Chris accepted). After a stop, only a page load starts a new container. 12-hour backstop since the last real tap or key, even with an agent busy (Chris accepted). A closed tab stops about 30 minutes after the last report, ending the turn, unless Keep awake is on (Chris accepted).
 
-**Came forward:** admin container control, backup list and download, optional awake cap (`max_instances` is also a hard limit, 10), deploy guard, user guide, dark waiting screens.
+**Measured on production, primus@, at `SLEEP_AFTER` 3m (each n=1 unless noted):**
+- Untouched tab: counted down, stopped about 75s after zero with a final snapshot, turned red, stayed stopped 2 minutes until a click, then restarted with a countdown. Ran before the rollout finished, so its plugin isn't known; the Worker logic was new.
+- Tap renews the time. Same plugin caveat.
+- Stop: red, parked, instance inactive. On the old plugin.
+- Busy agent, new plugin: a 6-minute turn held past the 3-minute timer, the time moving about a minute each minute. **Not seen: the countdown and stop after the turn ended.** Testing stopped on Chris's word.
+- Deploy with `--containers-rollout=none`, mid-turn: container not stopped, turn kept running.
+- Deploys without that flag started container rollouts. Two containers stopped during rollouts, with no snapshot, so changes since the last snapshot were lost (n=2). That rollouts caused it is inferred.
+
+**Not tested:** a turn with the tab closed; the chip across a no-rollout deploy once the turn ends; a real 30-minute run; the live admin pages, including themes (primus@ isn't an admin, Chris has to check). The remaining tests are on the ops board.
+
+**Admin:** the same-origin check is gone, because `Referrer-Policy: no-referrer` made every admin form send `Origin: null`. Admin pages now send `same-origin`. Chris's decision: Access protects this for now, and a WAF rule, documented in README and ONBOARDING, comes later (ops board). Theme picker: Ember by default, Lantern, or custom `#rrggbb` colours, per browser in a cookie.
+
+**R2:** Chris allows deleting Agent Flare data when work needs it, without asking.
+
+**Came forward:** admin container control, backup list and download, optional awake cap (`max_instances` is also a hard limit, 10), deploy guard, user guide, dark waiting screens. Chip actions are logged in the Worker.
 
 **Data:**
 - 1.0.3 `tar+zstd` backups can't be restored by 0.x. Each user's index and newest archive were copied to `hold/1x-2026-11-06/`; the live index holds only `squashfs` entries. The archives stay in `backups/`; nothing was deleted.
