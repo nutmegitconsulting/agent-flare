@@ -70,6 +70,17 @@ interface StoredIdentity extends AccessIdentity {
   groups?: string[];
 }
 
+const IDLE_KEY = "idle";
+const IDLE_DEFAULT_MS = 30 * 60_000;
+/** Longer than a container takes to exit after SIGTERM. Only matters if the stop never arrives. */
+const STOP_WAIT_MS = 2 * 60_000;
+
+function parseIdle(value: string | undefined): number {
+  const match = /^(\d+)(s|m|h)$/.exec((value ?? "").trim());
+  if (!match) return IDLE_DEFAULT_MS;
+  return Number(match[1]) * { s: 1_000, m: 60_000, h: 3_600_000 }[match[2] as "s" | "m" | "h"];
+}
+
 /**
  * The class SDK 1.0 ran on. Cloudflare's move to the durable_object policy can't be undone for a class, so it stays
  * as an empty stub to keep its namespace and data, and this SDK runs on AgentSandbox with a new container application.
@@ -79,20 +90,42 @@ export class HermesSandbox extends DurableObject<Env> {
 }
 
 export class AgentSandbox extends Sandbox<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx as never, env);
+    this.idleMs = parseIdle(env.SLEEP_AFTER);
+    // This object can restart while its container keeps running. Idle time has to survive that.
+    void ctx.blockConcurrencyWhile(async () => {
+      if (!(ctx as unknown as { container?: { running: boolean } }).container?.running) return;
+      const saved = await ctx.storage.get<{ lastActionAt: number; actionIdleAt: number }>(IDLE_KEY);
+      if (saved) {
+        this.lastActionAt = saved.lastActionAt;
+        this.actionIdleAt = saved.actionIdleAt;
+      } else {
+        this.startIdleClock();
+      }
+    });
+  }
+
   private queue: Promise<unknown> = Promise.resolve();
   private generation = 0;
   private hydration: Promise<void> | null = null;
   private status: ReadyState = { state: "starting", step: "waiting" };
   private ready = false;
-  /** Set once a stop is signalled: the container's disk can't be trusted from then on. */
-  private stopping = false;
+  /** Set once a stop is signalled: the container's disk can't be trusted from then on. Lapses if no stop arrives. */
+  private stoppingAt = 0;
+  private get stopping(): boolean {
+    return this.stoppingAt > 0 && Date.now() - this.stoppingAt < STOP_WAIT_MS;
+  }
+  private set stopping(value: boolean) {
+    this.stoppingAt = value ? Date.now() : 0;
+  }
+  private readonly idleMs: number;
   private lastUserActivity = 0;
   private lastSnapshotAt = 0;
   private lastSnapshotError: string | null = null;
   private lastFailureAt = 0;
   private finalSnapshotFailures = 0;
   private lastActionAt = 0;
-  private lastServerActionAt = 0;
   /** When idle runs out, counted from the last real tap or keystroke. Null until the chip first reports. */
   private actionIdleAt: number | null = null;
 
@@ -107,6 +140,8 @@ export class AgentSandbox extends Sandbox<Env> {
   async ensureReady(identity: AccessIdentity, publicUrl: string, accessJwt: string, mayStart = true): Promise<ReadyState> {
     // An open tab keeps polling. After a planned stop that must not start the container again.
     if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
+    // A stop is signalled but the container hasn't exited. It still looks running, and a request here would start a new one.
+    if (this.stopping) return { state: "asleep" };
     // Nor may a tab's retries start one that went to sleep: tested, they do within seconds. That takes a page load.
     if (!mayStart && !this.hydration && !(await this.isRunning())) return { state: "asleep" };
     // The cap applies only to starting. Containers already running are left alone.
@@ -122,8 +157,10 @@ export class AgentSandbox extends Sandbox<Env> {
       const isCurrent = () => generation === this.generation;
       this.status = { state: "starting", step: "starting container" };
       const run: Promise<void> = this.serial(() => this.hydrate({ ...identity, publicUrl }, accessJwt, generation))
-        .then(() => {
+        .then(async () => {
           if (!isCurrent()) return;
+          // A container always has an idle time, from here on, whether or not a chip ever reports.
+          if (this.actionIdleAt === null) this.startIdleClock();
           this.ready = true;
           this.status = { state: "ready" };
         })
@@ -350,6 +387,7 @@ export class AgentSandbox extends Sandbox<Env> {
    * the container's idle timer, so snapshotting on a timer alone would keep it awake forever.
    */
   async snapshotIfDue(intervalMs: number): Promise<SnapshotResult> {
+    if (this.stopping) return { skipped: "container stopping" };
     if (!(await this.isRunning())) {
       const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
       if (identity) await this.env.BACKUP_BUCKET.delete(`${ACTIVE_PREFIX}${identity.sub}`);
@@ -369,7 +407,7 @@ export class AgentSandbox extends Sandbox<Env> {
       // Running from before leases existed: its cap counts from now.
       await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, startedAt: Date.now() });
     } else if ((lease.leaseUntil || this.actionIdleAt === null) && leaseView(lease, capMs(this.env.FORGOTTEN_TAB_CAP_HOURS), Date.now()).due) {
-      // Without the chip reporting, nothing else can tell a forgotten tab from a used one, so the cap is the backstop.
+      // The lease's end, or the backstop: 12 hours since a real tap or keystroke, even with an agent still busy.
       return this.plannedStop(lease.leaseUntil ? "lease" : "cap");
     }
     const now = Date.now();
@@ -422,8 +460,7 @@ export class AgentSandbox extends Sandbox<Env> {
   /** For the status chip. Reads only: it can't wake a container or count as activity. */
   async leaseStatus(): Promise<{ state: "awake" | "asleep" | "parked"; idleAt?: number } & Partial<LeaseView>> {
     if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
-    if (!(await this.isRunning())) return { state: "asleep" };
-    // Known only while the chip reports. Otherwise the tab's own traffic keeps renewing the SDK's timer.
+    if (this.stopping || !(await this.isRunning())) return { state: "asleep" };
     return {
       state: "awake", ...(this.actionIdleAt === null ? {} : { idleAt: this.actionIdleAt }),
       ...leaseView(await this.leaseState(), capMs(this.env.FORGOTTEN_TAB_CAP_HOURS), Date.now()),
@@ -515,37 +552,41 @@ export class AgentSandbox extends Sandbox<Env> {
   }
 
   /**
-   * A tap or keystroke in the tab, reported by the status chip. An open tab sends frames and polls every few
-   * seconds by itself, and each one renews the SDK's timer, so that timer can't tell whether anyone is there.
+   * Idle is 100% chip led. The chip reports a tap, a keystroke, a page load, and an agent mid-turn, and nothing else
+   * counts: not requests, polling or sockets. `busy` marks the last: it holds off idle, but not the 12-hour backstop.
    */
-  async noteUserAction(): Promise<void> {
+  async noteUserAction(busy = false): Promise<void> {
+    if (this.stopping || !(await this.isRunning())) return;
     this.lastActionAt = Date.now();
-    this.renewActivityTimeout();
-    this.actionIdleAt = (this as unknown as { sleepAfterMs: number }).sleepAfterMs;
-  }
-
-  /**
-   * A write through the webapp, seen by the Worker: a person is probably there. It's the safe fallback if the chip
-   * stops or never loads. It only ever extends: it doesn't switch on the chip's idle rule. At most once a minute.
-   */
-  async noteServerAction(): Promise<void> {
-    const now = Date.now();
-    if (now - this.lastServerActionAt < 60_000) return;
-    this.lastServerActionAt = now;
-    if (this.actionIdleAt !== null) await this.noteUserAction();
+    this.actionIdleAt = this.lastActionAt + this.idleMs;
+    await this.saveIdle();
+    if (busy) return;
     const lease = await this.leaseState();
-    if (lease.startedAt) await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, lastTapAt: now });
+    if (lease.startedAt) await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, lastTapAt: this.lastActionAt });
   }
 
-  /** The idle check once the chip is reporting. Before that, or if it never does, the SDK's own check applies. */
-  actionIdleExpired(): boolean | null {
-    return this.actionIdleAt === null ? null : this.actionIdleAt <= Date.now();
+  private saveIdle(): Promise<void> {
+    return this.ctx.storage.put(IDLE_KEY, { lastActionAt: this.lastActionAt, actionIdleAt: this.actionIdleAt });
   }
 
-  /** Pushes idle out by one full period, under whichever rule applies. */
+  private startIdleClock(): void {
+    this.actionIdleAt = Date.now() + this.idleMs;
+    void this.saveIdle();
+  }
+
+  /** The SDK's alarm loop asks this. There's always an answer from the idle time, so no request can hold it up. */
+  idleExpired(): boolean {
+    if (this.hydration) return false;
+    if (this.actionIdleAt === null) {
+      this.startIdleClock();
+      return false;
+    }
+    return this.actionIdleAt <= Date.now();
+  }
+
+  /** Pushes idle out by one full period. */
   private holdOffIdle(): void {
-    this.renewActivityTimeout();
-    if (this.actionIdleAt !== null) this.actionIdleAt = (this as unknown as { sleepAfterMs: number }).sleepAfterMs;
+    this.startIdleClock();
   }
 
   override async onActivityExpired(): Promise<void> {
@@ -558,7 +599,7 @@ export class AgentSandbox extends Sandbox<Env> {
       const started = Date.now();
       const saved = await this.finalSnapshot("idle");
       // The snapshot takes a while. A user who came back during it must not be cut off.
-      if ((this.actionIdleAt === null ? this.lastUserActivity : this.lastActionAt) > started) {
+      if (this.lastActionAt > started) {
         this.holdOffIdle();
         return;
       }
@@ -580,6 +621,7 @@ export class AgentSandbox extends Sandbox<Env> {
     this.ready = false;
     this.stopping = false;
     this.actionIdleAt = null;
+    await this.ctx.storage.delete(IDLE_KEY);
     await this.ctx.storage.delete(LEASE_KEY);
     this.hydration = null;
     // A failure stays visible until its retry window passes, even though stopping is what follows it.
@@ -590,7 +632,6 @@ export class AgentSandbox extends Sandbox<Env> {
 
 // The SDK's alarm loop calls this, and it's private only in the SDK's types, so it can't be overridden in the class.
 // Its own version treats an in-flight request as activity, which on this SDK includes the webapp's socket.
-const sdkIdleCheck = (Sandbox.prototype as unknown as { isActivityExpired(this: unknown): boolean }).isActivityExpired;
-(AgentSandbox.prototype as unknown as { isActivityExpired(this: AgentSandbox): boolean }).isActivityExpired = function () {
-  return this.actionIdleExpired() ?? sdkIdleCheck.call(this);
+(AgentSandbox.prototype as unknown as { isActivityExpired(this: AgentSandbox): boolean }).isActivityExpired = function (this: AgentSandbox) {
+  return this.idleExpired();
 };

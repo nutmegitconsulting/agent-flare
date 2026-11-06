@@ -3,10 +3,12 @@
 // Any failure means no chip, and Hermes carries on.
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { host } from '@hermes/plugin-sdk'
 
 const POLL_MS = 60_000
 const REPORT_MS = 60_000
 const TICK_MS = 15_000
+const BUSY_CHECK_MS = 15_000
 // A full reload goes through the Worker's starting page to the new backend. Nothing here runs without a tap.
 const restart = async state => {
   if (state === 'parked') await fetch('/__af/wake', { method: 'POST' }).catch(() => {})
@@ -23,14 +25,28 @@ async function send(path, body) {
   if (!response.ok) throw new Error(String(response.status))
 }
 
-// A person is here: a tap or a key, at most once a minute. A tab's own traffic isn't reported, which is the point.
+// Idle is led by this chip. A person is here (a tap, a key, a page load) or an agent is mid-turn. At most once a minute.
+// A tab's own traffic isn't reported, which is the point.
 let lastReport = 0
 let lastInput = Date.now()
-function report() {
+function report(busy = false) {
   lastInput = Date.now()
   if (Date.now() - lastReport < REPORT_MS) return
   lastReport = Date.now()
-  fetch('/__af/activity', { method: 'POST' }).catch(() => {})
+  fetch('/__af/activity', {
+    body: JSON.stringify({ busy }),
+    headers: { 'content-type': 'application/json' },
+    method: 'POST'
+  }).catch(() => {})
+}
+const onInput = () => report()
+
+function agentBusy() {
+  try {
+    return Object.values(host.state.busyBySession.get()).some(Boolean)
+  } catch {
+    return false
+  }
 }
 
 const GREEN = '#22c55e'
@@ -55,13 +71,13 @@ function view(status, now) {
   const at = stopTime(status)
   const leased = status.reason === 'lease'
   const active = (leased && !status.warn) || (!status.warn && now - lastInput < ACTIVE_MS)
-  return { color: active ? GREEN : ORANGE, name: active ? 'Active' : 'Idle', text: at ? countdown(at, now) : 'Active' }
+  return { color: active ? GREEN : ORANGE, name: active ? 'Active' : 'Idle', text: at ? countdown(at, now) : '\u2013' }
 }
 
 function detail(status) {
   if (status.reason === 'lease') return `Stays on until ${time(status.stopsAt)}, then saves and stops.`
   if (status.warn) return `Saves and stops at ${time(status.stopsAt)} unless you keep it awake.`
-  return status.idleAt ? `Sleeps at ${time(status.idleAt)} unless you tap or type.` : 'Sleeps when idle.'
+  return status.idleAt ? `Sleeps at ${time(status.idleAt)} unless you tap or type, or an agent is working.` : 'Sleeps when idle.'
 }
 
 const ROW = { background: 'none', border: 0, color: 'inherit', cursor: 'pointer', display: 'block', font: 'inherit',
@@ -86,17 +102,19 @@ function Control() {
     report()
     refresh()
     const timer = setInterval(refresh, POLL_MS)
+    const busyTimer = setInterval(() => agentBusy() && report(true), BUSY_CHECK_MS)
     const ticker = setInterval(() => setNow(Date.now()), TICK_MS)
-    document.addEventListener('pointerdown', report, { capture: true, passive: true })
-    document.addEventListener('keydown', report, { capture: true, passive: true })
+    document.addEventListener('pointerdown', onInput, { capture: true, passive: true })
+    document.addEventListener('keydown', onInput, { capture: true, passive: true })
     const onVisible = () => document.visibilityState === 'visible' && refresh()
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       clearInterval(timer)
+      clearInterval(busyTimer)
       clearInterval(ticker)
       document.removeEventListener('visibilitychange', onVisible)
-      document.removeEventListener('pointerdown', report, { capture: true })
-      document.removeEventListener('keydown', report, { capture: true })
+      document.removeEventListener('pointerdown', onInput, { capture: true })
+      document.removeEventListener('keydown', onInput, { capture: true })
     }
   }, [])
 

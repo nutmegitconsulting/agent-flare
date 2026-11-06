@@ -107,9 +107,10 @@ app.post("/__af/lease/stop", async (c) => {
   return c.json(result, "error" in result ? 500 : 200);
 });
 
-// The chip reporting a tap or keystroke. The only thing, with a lease, that holds off idle once it's reporting.
+// The chip reporting a tap, a keystroke, a page load, or an agent mid-turn. The only thing that holds off idle.
 app.post("/__af/activity", async (c) => {
-  await sandboxFor(c.env, c.get("identity").sub).noteUserAction();
+  const body = await c.req.json<{ busy?: boolean }>().catch(() => ({ busy: false }));
+  await sandboxFor(c.env, c.get("identity").sub).noteUserAction(body.busy === true);
   return c.json({ ok: true });
 });
 
@@ -255,8 +256,6 @@ app.all("*", async (c) => {
   // Only a page load starts a container. An open tab's API calls and socket retries can't.
   const status = await sandbox.ensureReady(identity, new URL(c.req.url).origin, c.get("jwt"), isDocumentLoad(c.req.raw));
   if (status.state !== "ready") return notReady(c.req.raw, status);
-
-  if (c.req.method !== "GET" && c.req.method !== "HEAD") await sandbox.noteServerAction();
 
   const request = forProxy(c.req.raw);
   const upgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";

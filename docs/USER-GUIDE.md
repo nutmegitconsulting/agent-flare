@@ -30,7 +30,7 @@ The time is how long until it next goes to sleep: `30m` is 30 minutes, `2h` is 2
 
 ![The orange dot](images/chip-idle.png)
 
-Tapping or typing in Hermes starts the 30 minutes again. Leaving the page open doesn't, and neither does an agent working by itself. **If you start a long task and walk away, it stops when the time runs out, unless you use Keep awake.**
+Tapping or typing in Hermes starts the 30 minutes again. So does your agent working on something, as long as this page stays open. Leaving the page open with nothing happening doesn't. **If you close the page while your agent works, it stops about 30 minutes later, unless you use Keep awake.**
 
 ## Keep awake
 
