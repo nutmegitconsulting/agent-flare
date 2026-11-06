@@ -469,6 +469,7 @@ export class AgentSandbox extends Sandbox<Env> {
 
   /** A tap on "Keep awake". The only thing that renews a lease. */
   async keepAwake(hours: 1 | 2): Promise<{ leaseUntil: number } | { error: string }> {
+    console.log(`[chip] keep awake ${hours}h`);
     if (!(await this.isRunning())) return { error: "not running" };
     await this.noteUserAction();
     const next = nextLease(await this.leaseState(), hours, Date.now());
@@ -478,6 +479,7 @@ export class AgentSandbox extends Sandbox<Env> {
 
   /** A tap on "Stop". If the snapshot fails the container stays up, so a tap can't lose work. */
   async stopByUser(): Promise<{ status: "stopped" | "not running" } | { error: string }> {
+    console.log("[chip] stop");
     const result = await this.applyByRestart();
     if (!("error" in result)) await this.ctx.storage.put(PARKED_KEY, true);
     return result;
@@ -485,6 +487,7 @@ export class AgentSandbox extends Sandbox<Env> {
 
   /** A person asked for it back. Only this clears a planned stop. */
   async wake(): Promise<void> {
+    console.log("[chip] wake");
     await this.ctx.storage.delete(PARKED_KEY);
   }
 
@@ -557,6 +560,7 @@ export class AgentSandbox extends Sandbox<Env> {
    */
   async noteUserAction(busy = false): Promise<void> {
     if (this.stopping || !(await this.isRunning())) return;
+    console.log(`[chip] activity${busy ? " (agent busy)" : ""}`);
     this.lastActionAt = Date.now();
     this.actionIdleAt = this.lastActionAt + this.idleMs;
     await this.saveIdle();
@@ -590,6 +594,7 @@ export class AgentSandbox extends Sandbox<Env> {
   }
 
   override async onActivityExpired(): Promise<void> {
+    console.log("[chip] idle time ran out");
     await this.serial(async () => {
       // A lease holds off idle sleep. The snapshot cron is what ends it.
       if ((await this.leaseState()).leaseUntil) {
