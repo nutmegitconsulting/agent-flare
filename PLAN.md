@@ -3,6 +3,81 @@
 Branch: `return-0.12.14` (live). `webapp-and-state` holds the 1.0.3 work. Deployed from this machine 2026-11-05, and SDK 1.0.3 on 2026-11-06. Not pushed to GitHub: Chris hasn't asked for that yet.
 Started 2026-11-04. Keep this file current; secrets, the account ID and the Access AUD never go in it.
 
+## Handoff (2026-11-06)
+
+Read this first, then "Current state" below. Sections further down about 1.0.3 and its idle plan are history. Test tools, and how to log in as primus@, live in the agent's folder.
+
+### Deploying
+
+Worker-only:
+```bash
+set -a; . ~/.config/cf-shipleybuilds.env; set +a   # never print the token
+export CLOUDFLARE_ACCOUNT_ID=<account id>
+node scripts/check-deploy.mjs wrangler.prod.jsonc
+npx wrangler deploy --config wrangler.prod.jsonc --containers-rollout=none
+```
+`wrangler.prod.jsonc` is gitignored and holds the live settings: hostname, Access team and AUD, KV ID, admins. Keep it. `scripts/render-wrangler.mjs` regenerates it from `AF_*` variables and needs those values, so read them from the existing file. Then confirm `SLEEP_AFTER` with the Worker's settings API.
+
+New image:
+```bash
+TAG=agent-flare:$(git rev-parse --short HEAD)
+AF_NO_CACHE=1 AF_BUILD_CA=/etc/ssl/certs/ca-certificates.crt AF_FORBIDDEN_CA=/usr/local/share/ca-certificates/Cloudflare_CA.crt scripts/build-image.sh "$TAG"
+AF_BUILD_CA=/etc/ssl/certs/ca-certificates.crt tests/container/run.sh "$TAG"
+npx wrangler containers push "$TAG"
+AF_IMAGE=registry.cloudflare.com/<account id>/$TAG AF_WRANGLER_OUT=wrangler.prod.jsonc node scripts/render-wrangler.mjs
+node scripts/check-deploy.mjs wrangler.prod.jsonc
+npx wrangler deploy --config wrangler.prod.jsonc
+```
+Then watch the rollout (the agent's `rollouts.py`). Containers started before it finishes can run the old image and plugin. Check by opening the chip's menu, whose wording says "or an agent is working" on the current plugin. Templates: `node scripts/templates.mjs push templates/team`, `tiers templates/model-tiers.json`.
+
+The deploy token expires **2026-11-08 04:59 UTC**. It has R2 read and write, Containers, Workers and Email Sending. It gets 403 on Email Routing and on zone rulesets, so WAF rules are Chris's to create.
+
+### What's unfinished
+
+- Admin pages and themes on the live site: never seen, because primus@ isn't an admin. Chris has to check them.
+- Chip tests not run: the countdown and stop after a busy turn ends; a turn with the tab closed; the chip across a no-rollout deploy when idle; a real 30-minute run. On the board.
+- The WAF rule, on the board for Chris. Text in `README.md`. Until then, nothing refuses cross-site writes to `/__af/*` beyond Access.
+- The local end-to-end suite (`tests/e2e/run.mjs`) hasn't run on this branch since the merge. Its idle and same-origin expectations are out of date, and it needs a local `wrangler.jsonc` and a local base image with the host's CA. It's only good for code regressions.
+- `3d97ae43...` starts empty because its only backups are 1.0 format, in `hold/1x-2026-11-06/`. Chris isn't using it.
+- Old applications `agent-flare-hermes` and `agent-flare-hermessandbox` still exist. Chris hasn't said to delete them.
+- Snapshot interval is 15 minutes with a tab open, not 10: the check runs seconds short at the 10-minute tick. Measured on 1.0.3; the same check is in this code (read). Not fixed.
+
+### Gotchas
+
+- **Durable Object memory:** on 1.0.3, production lost it within 6-12 seconds of quiet (16 tries). On 0.12.14 the SDK's alarm loop keeps the object busier, but it can still restart. Anything that decides a stop lives in storage.
+- **The SDK's `stop()` only sends a signal.** The container still reads as running for about 6 seconds, and a request in that window started a new one (n=1, before the fix). `exec` and `containerFetch` start a container if there is none.
+- **`Referrer-Policy: no-referrer` sends `Origin: null` on same-origin form posts.** Measured by Chris's coordinator in real Chrome.
+- **The webapp writes by itself:** `PATCH /api/ui-preferences` about 5 minutes after load (n=1), and `socket-ticket` POSTs on reconnect. Don't count writes as activity. Chat goes over the socket and is invisible to the Worker.
+- **Rollouts:** with `durable_object` scheduling, `wrangler deploy` needs an image pinned by digest. On the default policy a tag works.
+- **`wrangler tail` drops events.** Durable Object logs often go missing during restores and snapshots. Use timestamps of the events that do arrive, or R2.
+- **Instance listing:** it has shown `inactive` for a container that was serving. Cloudflare's event history is stronger, when it returns anything.
+- **Local clock:** this host has run about a minute off Cloudflare's. Compare times on one clock.
+- **Local Docker bridge:** this host's firewall blocks a container reaching `wrangler dev`, which SDK 1.0 backups needed.
+- **Memory:** this host has about 13 GB, usually with little free. A no-cache build plus a suite got background jobs killed by the memory watchdog once. Run them one at a time, and check `free -m` first.
+- **Hermes's model labels:** a leading `-` is stripped, so low is U+2212 `−`, with no space after a mark. A stale browser profile from a different key can stick on "Starting Hermes".
+- **Waiting:** don't wait silently. Use bounded loops; a pattern that matches your own process never ends.
+
+### Chris's decisions, and why
+
+- SDK 0.12.14, from `185264f`, until Cloudflare's 1.0.3 docs catch up with the container management features needed. 1.0's class move is one-way, hence the new class `AgentSandbox` and the stub `HermesSandbox`.
+- Idle is 100% chip led, no alarm of ours: "we know when the user or agent is active". He rejected a 60-second alarm, and the plan needs to keep to the SDK's own timer.
+- Accepted: a closed tab stops about 30 minutes after the last report, losing the turn; the 12-hour backstop; stops up to 3 minutes late; containers stopping on a deploy, with no maintenance-window code.
+- Security checks that WAF can do go in WAF, not code. Access JWT and admin checks stay.
+- Backup downloads: admins are super admins, so plaintext in a backup is acceptable, audited, with one warning line.
+- Pale flash on Hermes's first frame: accepted. Don't patch Hermes.
+- Not in production until Chris says so: deploy without asking, and delete Agent Flare R2 data when the work needs it.
+- Test with a short timer on Cloudflare: don't make Chris wait for 30-minute runs.
+
+### Wrong claims, so nobody repeats them
+
+- "Every deploy stops every container": false. Of 3 deploys, one stopped primus@ at the time; a stop came later during a rollout; and `e1491709...` ran through two. Rollouts as the cause is inferred. `--containers-rollout=none` didn't stop a mid-turn container (n=1).
+- "A deploy doesn't restart containers": Cloudflare's line about 1.0 sandboxes. Not established here.
+- Anything measured on `wrangler dev` or local Docker as proof of idle behaviour, including every end-to-end pass.
+- "SDK 1.0 removed the idle stop": no doc says so. `setInactivityTimeout` and `SIGTERM` exist; what 1.0's package lacks is the hooks.
+- "Sending a message is a Worker-seen write": chat goes over the socket.
+- "Test (e) passed": my screenshot came before the stop took effect. Wait before calling a result.
+- "Eviction" as a root cause on 1.0.3 was never directly observed; memory loss was.
+
 ## Current state: back on SDK 0.12.14 (live 2026-11-06)
 
 Chris's direction: use 0.12.14 until Cloudflare's 1.0.3 docs catch up with the container management features this needs. Branch `return-0.12.14`, from `185264f`. The 1.0.3 work is intact on `webapp-and-state`. Local only, no GitHub.
