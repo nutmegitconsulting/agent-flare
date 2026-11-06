@@ -6,6 +6,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const POLL_MS = 60_000
 const REPORT_MS = 60_000
+const TICK_MS = 15_000
 // A full reload goes through the Worker's starting page to the new backend. Nothing here runs without a tap.
 const restart = async state => {
   if (state === 'parked') await fetch('/__af/wake', { method: 'POST' }).catch(() => {})
@@ -24,17 +25,37 @@ async function send(path, body) {
 
 // A person is here: a tap or a key, at most once a minute. A tab's own traffic isn't reported, which is the point.
 let lastReport = 0
+let lastInput = Date.now()
 function report() {
+  lastInput = Date.now()
   if (Date.now() - lastReport < REPORT_MS) return
   lastReport = Date.now()
   fetch('/__af/activity', { method: 'POST' }).catch(() => {})
 }
 
-function label(status) {
-  if (status.state !== 'awake') return 'Stopped, tap to restart'
-  if (status.warn) return `Stops ${time(status.stopsAt)}`
-  if (status.reason === 'lease') return `Awake to ${time(status.stopsAt)}`
-  return status.idleAt ? `Idle ${time(status.idleAt)}` : 'Awake'
+const GREEN = '#22c55e'
+const ORANGE = '#f6821f'
+const RED = '#ef4444'
+const ACTIVE_MS = 5 * 60_000
+
+// Minutes until the next planned stop: the lease's end, or when idle runs out.
+function stopTime(status) {
+  return status.reason === 'lease' ? status.stopsAt : status.idleAt ?? (status.warn ? status.stopsAt : null)
+}
+
+function countdown(at, now) {
+  const minutes = Math.ceil((at - now) / 60_000)
+  if (minutes <= 0) return 'now'
+  return minutes > 90 ? `${Math.round(minutes / 60)}h` : `${minutes}m`
+}
+
+// Colour is never the only signal: the text and the screen-reader label say the same thing.
+function view(status, now) {
+  if (status.state !== 'awake') return { color: RED, name: 'Stopped', text: 'Stopped, tap to restart' }
+  const at = stopTime(status)
+  const leased = status.reason === 'lease'
+  const active = (leased && !status.warn) || (!status.warn && now - lastInput < ACTIVE_MS)
+  return { color: active ? GREEN : ORANGE, name: active ? 'Active' : 'Idle', text: at ? countdown(at, now) : 'Active' }
 }
 
 function detail(status) {
@@ -50,6 +71,7 @@ function Control() {
   const [status, setStatus] = useState(null)
   const [open, setOpen] = useState(false)
   const [error, setError] = useState('')
+  const [now, setNow] = useState(Date.now())
 
   const refresh = async () => {
     try {
@@ -64,12 +86,14 @@ function Control() {
     report()
     refresh()
     const timer = setInterval(refresh, POLL_MS)
+    const ticker = setInterval(() => setNow(Date.now()), TICK_MS)
     document.addEventListener('pointerdown', report, { capture: true, passive: true })
     document.addEventListener('keydown', report, { capture: true, passive: true })
     const onVisible = () => document.visibilityState === 'visible' && refresh()
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       clearInterval(timer)
+      clearInterval(ticker)
       document.removeEventListener('visibilitychange', onVisible)
       document.removeEventListener('pointerdown', report, { capture: true })
       document.removeEventListener('keydown', report, { capture: true })
@@ -77,6 +101,8 @@ function Control() {
   }, [])
 
   if (!status) return null
+
+  const shown = view(status, now)
 
   const act = (path, body, after) => async () => {
     setError('')
@@ -95,11 +121,16 @@ function Control() {
     style: { alignItems: 'stretch', display: 'inline-flex', flexShrink: 0 },
     children: [
       jsxs('button', {
+        'aria-label': `${shown.name}: ${shown.text}`,
         // The bar is 20px tall, so an invisible extension makes the tap target taller than the row.
-        children: [label(status), jsx('span', { 'aria-hidden': true, style: { bottom: 0, left: 0, position: 'absolute', right: 0, top: -16 } })],
+        children: [
+          jsx('span', { 'aria-hidden': true, children: '\u25cf ', style: { color: shown.color } }),
+          shown.text,
+          jsx('span', { 'aria-hidden': true, style: { bottom: 0, left: 0, position: 'absolute', right: 0, top: -16 } })
+        ],
         onClick: () => (status.state === 'awake' ? setOpen(!open) : restart(status.state)),
-        style: { background: 'none', border: 0, color: status.warn || status.state !== 'awake' ? '#f6821f' : 'inherit', cursor: 'pointer',
-          font: 'inherit', fontSize: '0.6875rem', padding: '0 12px', position: 'relative', touchAction: 'manipulation', whiteSpace: 'nowrap' },
+        style: { background: 'none', border: 0, color: 'inherit', cursor: 'pointer', font: 'inherit', fontSize: '0.6875rem',
+          padding: '0 12px', position: 'relative', touchAction: 'manipulation', whiteSpace: 'nowrap' },
         type: 'button'
       }),
       // A tap anywhere else closes the menu.
