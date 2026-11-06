@@ -6,6 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync, createSign, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { request as httpRequest } from "node:http";
 import { WebSocket as WsClient } from "ws";
 import { join } from "node:path";
 
@@ -39,6 +40,22 @@ function jwt(sub, email, key = privateKey, claims = {}) {
   return `${body}.${createSign("RSA-SHA256").update(body).sign(key).toString("base64url")}`;
 }
 
+function pageLoad(url, headers) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(url, { headers: Object.fromEntries(headers) }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const out = new Headers();
+        for (let i = 0; i < res.rawHeaders.length; i += 2) out.append(res.rawHeaders[i], res.rawHeaders[i + 1]);
+        resolve(new Response(res.statusCode === 304 ? null : Buffer.concat(chunks), { status: res.statusCode, headers: out }));
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 // --- a browser for one Access user ---
 class Browser {
   constructor(sub, email) { Object.assign(this, { sub, email, token: jwt(sub, email), jar: new Map() }); }
@@ -46,7 +63,12 @@ class Browser {
     const headers = new Headers(init.headers);
     headers.set("Cf-Access-Jwt-Assertion", this.token);
     if (this.jar.size) headers.set("cookie", [...this.jar].map(([k, v]) => `${k}=${v}`).join("; "));
-    const response = await fetch(path.startsWith("http") ? path : BASE + path, { redirect: "manual", ...init, headers });
+    // A browser's page load says Sec-Fetch-Mode: navigate, and only that may start a container. Node's fetch
+    // always says "cors", so page loads go through node:http, which sends what it's given.
+    const isPageLoad = (headers.get("accept") ?? "").includes("text/html") && (!headers.has("sec-fetch-mode") || headers.get("sec-fetch-mode") === "navigate");
+    if (isPageLoad) headers.set("sec-fetch-mode", "navigate");
+    const url = path.startsWith("http") ? path : BASE + path;
+    const response = isPageLoad ? await pageLoad(url, headers) : await fetch(url, { redirect: "manual", ...init, headers });
     for (const cookie of response.headers.getSetCookie()) {
       const [pair] = cookie.split(";");
       const i = pair.indexOf("=");
@@ -161,6 +183,7 @@ const alice = new Browser("11111111-aaaa-4aaa-8aaa-111111111111", "alice@example
 const bob = new Browser("22222222-bbbb-4bbb-8bbb-222222222222", "alice@other.example");
 const admin = new Browser("33333333-cccc-4ccc-8ccc-333333333333", "admin@example.com");
 const nokey = new Browser("44444444-dddd-4ddd-8ddd-444444444444", "nokey@example.com");
+const carol = new Browser("55555555-eeee-4eee-8eee-555555555555", "carol@example.com");
 
 try {
   for (let i = 0; ; i++) {
@@ -180,6 +203,7 @@ try {
   // Every kind of route, before any user has a container: nothing may answer without a verified token.
   const routes = [["GET", "/"], ["GET", "/login"], ["GET", "/api/health"], ["GET", "/api/status"], ["GET", "/api/ws"],
     ["GET", "/__af/status"], ["POST", "/__af/snapshot"], ["POST", "/__af/stop"], ["GET", "/__af/nope"],
+    ["GET", "/__af/lease"], ["POST", "/__af/lease"], ["POST", "/__af/lease/stop"], ["POST", "/__af/wake"], ["POST", "/__af/activity"],
     ["GET", "/__af/admin/users"], ["POST", "/__af/admin/users/x/stop"], ["POST", "/__af/admin/users/x/snapshot"],
     ["POST", "/__af/admin/users/x/prune"], ["PUT", "/__af/admin/prefill/a@example.com"]];
   const tokens = {
@@ -358,7 +382,196 @@ try {
   await sleep(3000);
   expect((await alice.waitReady()).state === "ready", "wakes with the original role");
 
+  console.log("== keep awake and stop");
+  const tick = () => fetch(`${BASE}/cdn-cgi/handler/scheduled?cron=*/5+*+*+*+*`).catch(() => {});
+  const jsonPost = (body) => ({ method: "POST", headers: { "content-type": "application/json", origin: BASE, "sec-fetch-site": "same-origin" }, body: JSON.stringify(body ?? {}) });
+  const row = async (who) => (await admin.json("/__af/admin/users")).users.find((u) => u.sub === who.sub);
+  const backupsOf = async (who) => (await row(who))?.backups ?? 0;
+  expect((await carol.json("/__af/lease")).state === "asleep", "the chip's read shows asleep, and doesn't start anything");
+  await sleep(2000);
+  expect(!containerOf(carol), "reading the state doesn't wake a container");
+  expect((await carol.waitReady()).state === "ready", "the user's container starts");
+  inside(carol, `test -s ${HOME}/desktop-plugins/agent-flare/plugin.js`);
+  ok("the chip plugin is installed in the Hermes home");
+  await carol.load();
+  const pluginRoot = await carol.json("/api/desktop-plugins/root");
+  const pluginList = await carol.fetch(`/api/desktop-plugins/list?path=${encodeURIComponent(pluginRoot.root ?? pluginRoot.path ?? pluginRoot)}`);
+  const pluginBody = await pluginList.text();
+  expect(pluginList.status === 200 && pluginBody.includes("agent-flare"), "Hermes lists the plugin", pluginBody.slice(0, 200));
+  const activityBefore = (await row(carol)).lastUserActivity;
+  const awake = await carol.json("/__af/lease");
+  expect(awake.state === "awake" && awake.reason === "cap" && !awake.warn, "no lease: awake, with the forgotten-tab cap", JSON.stringify(awake));
+  expect(awake.idleAt === undefined, "before the chip reports, no idle time is claimed", JSON.stringify(awake));
+  expect((await row(carol)).lastUserActivity === activityBefore, "the chip's read isn't activity");
+  await sleep(1100);
+  const written = await carol.fetch("/api/auth/ws-ticket", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await written.body?.cancel();
+  const afterWrite = await carol.json("/__af/lease");
+  expect(afterWrite.stopsAt > awake.stopsAt && afterWrite.idleAt === undefined, "with no chip, a write through the webapp extends the cap, and doesn't start the chip's rule", JSON.stringify(afterWrite));
+  for (const [label, body, want] of [["8 hours", { hours: 8 }, 400], ["3 hours", { hours: 3 }, 400], ["1.5 hours", { hours: 1.5 }, 400], ["no hours", {}, 400], ["a string", { hours: "1" }, 400]]) {
+    const r = await carol.fetch("/__af/lease", jsonPost(body));
+    await r.body?.cancel();
+    expect(r.status === want, `a lease of ${label} is refused`, String(r.status));
+  }
+  for (const path of ["/__af/lease", "/__af/lease/stop", "/__af/wake"]) {
+    const r = await carol.fetch(path, { method: "POST", headers: { origin: "https://evil.example", "content-type": "application/json" }, body: '{"hours":1}' });
+    await r.body?.cancel();
+    expect(r.status === 403, `a cross-site POST to ${path} is refused`, String(r.status));
+  }
+  expect(containerOf(carol), "and the container is still up");
+  const tapped = await carol.json("/__af/lease", jsonPost({ hours: 1 }));
+  const remaining = tapped.leaseUntil - Date.now();
+  expect(remaining > 3_590_000 && remaining <= 3_600_000, "a tap gives a lease of 1 hour", JSON.stringify(tapped));
+  const renewed = await carol.json("/__af/lease", jsonPost({ hours: 2 }));
+  expect(renewed.leaseUntil - Date.now() <= 7_200_000, "tapping again can't stack past 2 hours", JSON.stringify(renewed));
+  const again1 = await carol.json("/__af/lease", jsonPost({ hours: 1 }));
+  expect(again1.leaseUntil < renewed.leaseUntil, "a shorter tap replaces it");
+  tapped.leaseUntil = again1.leaseUntil;
+  const leased = await carol.json("/__af/lease");
+  expect(leased.reason === "lease" && leased.stopsAt === tapped.leaseUntil && !leased.warn, "the chip shows the lease");
+  await sleep((SLEEP_AFTER_SECONDS + 25) * 1000);
+  expect(containerOf(carol), "a lease holds the container past its idle time, with nothing connected");
+  await carol.fetch("/__af/test/age", jsonPost({ ms: 51 * 60_000 }));
+  expect((await carol.json("/__af/lease")).warn === true, "the last 10 minutes show a warning");
+  await tick();
+  await sleep(3000);
+  expect(containerOf(carol), "before its end, the cron leaves a lease alone");
+  const beforeEnd = await backupsOf(carol);
+  await carol.fetch("/__af/test/age", jsonPost({ ms: 10 * 60_000 }));
+  await tick();
+  for (let i = 0; i < 20 && containerOf(carol); i++) await sleep(1500);
+  expect(!containerOf(carol), "at its end the lease stops the container");
+  expect(await backupsOf(carol) > beforeEnd, "and it took a snapshot first");
+  const parkedDoc = await carol.fetch("/", { headers: { accept: "text/html" } });
+  const parkedBody = await parkedDoc.text();
+  expect(parkedDoc.status === 503 && parkedBody.includes("Wake it up"), "the page offers a wake button", parkedBody.slice(0, 200));
+  const polled = await carol.fetch("/api/status");
+  await polled.body?.cancel();
+  await carol.fetch("/api/health").then((r) => r.body?.cancel());
+  expect(polled.status === 503, "an open tab's polling is refused");
+  await sleep(5000);
+  expect(!containerOf(carol), "and can't start it again");
+  expect((await carol.json("/__af/lease")).state === "parked", "the chip's read says so");
+  expect((await (await admin.fetch("/__af/admin")).text()).includes("until the user wakes it"), "the admin screen says so");
+  const woken = await carol.fetch("/__af/wake", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await woken.body?.cancel();
+  expect(woken.status === 303 && woken.headers.get("location") === "/", "a tap on wake goes back to the app");
+  expect((await carol.waitReady()).state === "ready", "and starts it");
+  expect(!(await carol.json("/__af/lease")).reason?.includes("lease"), "with no old lease");
+
+  await carol.load();
+  const { ticket: capTicket } = await carol.json("/api/auth/ws-ticket", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  const openTab = new WsClient(`ws://localhost:${PORT}/api/ws?ticket=${capTicket}`, { headers: { "Cf-Access-Jwt-Assertion": carol.token, origin: BASE } });
+  await new Promise((resolve, reject) => { openTab.once("message", resolve); openTab.once("error", reject); setTimeout(() => reject(new Error("no frame")), 20_000); })
+    .catch((e) => fail("a tab's socket opens", e.message));
+  const closed = new Promise((resolve) => openTab.once("close", resolve));
+  await carol.fetch("/__af/test/age", jsonPost({ ms: 11 * 3_600_000 }));
+  await tick();
+  await sleep(3000);
+  expect(containerOf(carol), "under the cap, an open tab keeps its container");
+  const beforeCap = await backupsOf(carol);
+  await carol.fetch("/__af/test/age", jsonPost({ ms: 3_600_000 }));
+  await tick();
+  for (let i = 0; i < 20 && containerOf(carol); i++) await sleep(1500);
+  expect(!containerOf(carol), "the forgotten-tab cap stops it, with a socket open");
+  expect(await backupsOf(carol) > beforeCap, "after a snapshot");
+  await Promise.race([closed, sleep(10_000)]);
+  await sleep(5000);
+  expect(!containerOf(carol), "and the tab can't bring it back");
+  openTab.terminate();
+  const carolWake = await carol.fetch("/__af/wake", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await carolWake.body?.cancel();
+  expect((await carol.waitReady()).state === "ready", "wakes again");
+
+  await carol.load();
+  const asleepStop = await carol.fetch("/__af/stop", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await asleepStop.body?.cancel();
+  await sleep(3000);
+  expect(!containerOf(carol), "stopped, not planned, for the tab's retries");
+  const retry = await carol.fetch("/api/status");
+  await retry.body?.cancel();
+  await carol.fetch("/api/config", { headers: { accept: "text/html", "sec-fetch-mode": "cors" } }).then((r) => r.body?.cancel());
+  const retrySocket = await new Promise((resolve) => {
+    const socket = new WsClient(`ws://localhost:${PORT}/api/ws?ticket=x`, { headers: { "Cf-Access-Jwt-Assertion": carol.token, origin: BASE } });
+    socket.on("unexpected-response", (_, r) => resolve(r.statusCode));
+    socket.on("open", () => { socket.close(); resolve(101); });
+    socket.on("error", () => resolve("error"));
+  });
+  expect(retry.status === 503 && retrySocket === 503, "a tab's API call and socket retry are refused", `${retry.status} ${retrySocket}`);
+  await sleep(5000);
+  expect(!containerOf(carol), "and can't start a sleeping container");
+  expect((await carol.json("/__af/lease")).state === "asleep", "the chip's read says stopped");
+  const reloaded = await carol.fetch("/", { headers: { accept: "text/html", "sec-fetch-mode": "navigate" } });
+  await reloaded.text();
+  expect(reloaded.status === 503, "a page load shows the starting page");
+  expect((await carol.waitReady()).state === "ready", "and starts it");
+  const reloadedPage = await carol.load();
+  expect(reloadedPage.status === 200, "the reload lands on the new backend", JSON.stringify(reloadedPage.hops));
+  const stillSignedIn = await carol.fetch("/api/auth/me");
+  await stillSignedIn.body?.cancel();
+  expect(stillSignedIn.status === 200, "still signed in after the restart");
+
+  console.log("== an open, idle tab stops on time");
+  await carol.load();
+  const { ticket: idleTicket } = await carol.json("/api/auth/ws-ticket", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  const idleTab = new WsClient(`ws://localhost:${PORT}/api/ws?ticket=${idleTicket}`, { headers: { "Cf-Access-Jwt-Assertion": carol.token, origin: BASE } });
+  await new Promise((resolve, reject) => { idleTab.once("message", resolve); idleTab.once("error", reject); setTimeout(() => reject(new Error("no frame")), 20_000); })
+    .catch((e) => fail("the tab's socket opens", e.message));
+  const reported = await carol.fetch("/__af/activity", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await reported.body?.cancel();
+  const crossReport = await carol.fetch("/__af/activity", { method: "POST", headers: { origin: "https://evil.example" } });
+  await crossReport.body?.cancel();
+  expect(reported.status === 200 && crossReport.status === 403, "the chip's report works, same-origin only");
+  const idleAt = (await carol.json("/__af/lease")).idleAt;
+  expect(idleAt > Date.now() && idleAt <= Date.now() + SLEEP_AFTER_SECONDS * 1000, "and the chip now has a real idle time", String(idleAt));
+  const tabStarted = Date.now();
+  let tabUp = true;
+  // The SDK's alarm wakes at most 3 minutes apart, or at its own idle time if sooner, so a stop can be that late.
+  while (tabUp && Date.now() - tabStarted < (2 * SLEEP_AFTER_SECONDS + 30) * 1000) {
+    await carol.fetch("/api/status").then((r) => r.body?.cancel());
+    await carol.fetch("/api/profiles").then((r) => r.body?.cancel());
+    const seen = await carol.json("/__af/lease");
+    if (seen.idleAt && seen.idleAt !== idleAt) fail("polling moved the idle time", JSON.stringify({ idleAt, seen }));
+    if (idleTab.readyState === WsClient.OPEN) idleTab.send('{"jsonrpc":"2.0","id":9,"method":"ping","params":{}}');
+    await sleep(4000);
+    tabUp = !!containerOf(carol);
+  }
+  const tabTook = Math.round((Date.now() - tabStarted) / 1000);
+  expect(!tabUp && tabTook >= SLEEP_AFTER_SECONDS - 5, `an open socket and a polling tab don't hold it up: stopped after ${tabTook}s of ${SLEEP_AFTER_SECONDS}s idle`, String(tabTook));
+  idleTab.terminate();
+  await sleep(4000);
+  expect(!containerOf(carol), "and the tab's retries don't bring it back");
+  const carolPage = await carol.fetch("/", { headers: { accept: "text/html" } });
+  await carolPage.text();
+  expect((await carol.waitReady()).state === "ready", "a page load does");
+
+  console.log("== a lease holds it past idle, then ends");
+  const leasedAgain = await carol.fetch("/__af/lease", jsonPost({ hours: 1 }));
+  await leasedAgain.body?.cancel();
+  expect(leasedAgain.status === 200, "keep awake");
+  await sleep((SLEEP_AFTER_SECONDS + 25) * 1000);
+  expect(containerOf(carol), "after a report, a lease still holds it past its idle time");
+  await carol.fetch("/__af/test/age", jsonPost({ ms: 3_600_000 }));
+  await tick();
+  for (let i = 0; i < 20 && containerOf(carol); i++) await sleep(1500);
+  expect(!containerOf(carol), "and stops it at the lease's end");
+  const carolWake3 = await carol.fetch("/__af/wake", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await carolWake3.body?.cancel();
+  expect((await carol.waitReady()).state === "ready", "wakes again");
+
+  const beforeStop2 = await backupsOf(carol);
+  const stopped2 = await carol.fetch("/__af/lease/stop", jsonPost({}));
+  await stopped2.body?.cancel();
+  expect(stopped2.status === 200, "a tap on stop works");
+  await sleep(3000);
+  expect(!containerOf(carol) && await backupsOf(carol) > beforeStop2, "it snapshots and stops");
+  expect((await carol.json("/__af/status")).status.state === "parked", "and stays stopped");
+  const carolWake2 = await carol.fetch("/__af/wake", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await carolWake2.body?.cancel();
+
   console.log("== isolation");
+  // The section above outlasts the idle time, so alice may have gone to sleep.
+  await alice.waitReady();
   expect((await bob.waitReady()).state === "ready", "second user gets a container");
   expect(containerOf(alice) !== containerOf(bob), "same email local part, different containers");
   expect(inside(bob, `test -e ${HOME}/SOUL.md && cat ${HOME}/SOUL.md`) !== "template soul", "unassigned user gets no template");

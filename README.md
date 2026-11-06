@@ -33,7 +33,7 @@ If backups exist and none can be restored, **the container doesn't start**. The 
 
 Hydration, snapshots and pruning for a user run one at a time inside their Durable Object.
 
-**Sleep.** When a container idles past `SLEEP_AFTER`, it takes a final snapshot and stops. If the snapshot fails it stays up and retries, up to three idle cycles. The snapshot cron skips containers with no activity since their last snapshot, so it doesn't hold them awake. An open browser tab holds a WebSocket and counts as activity.
+**Sleep.** When a container idles past `SLEEP_AFTER`, it takes a final snapshot and stops. If the snapshot fails it stays up and retries, up to three idle cycles. The snapshot cron skips containers with no activity since their last snapshot, so it doesn't hold them awake. An open tab alone doesn't count as activity once the status chip is reporting; see "Keeping a container awake".
 
 R2 layout:
 
@@ -141,6 +141,18 @@ The picker shows our score for agent work as the first character of a model's na
 
 New homes start in dark mode, through Hermes's own preferences file. A user can change it, and a choice they've made is never replaced.
 
+## Keeping a container awake
+
+A chip in Hermes's status bar shows the container's state. It's an ordinary Hermes desktop plugin (`container/desktop-plugins/agent-flare/plugin.js`), copied into the home at boot; if it fails, there's no chip and the fallback below applies. It reads `Idle 6:12` for when idle time runs out, or `Stopped, tap to restart`. A tap offers Keep awake 1 hour, Keep awake 2 hours, and Stop.
+
+- **What counts as activity.** Once the chip is reporting: a tap or keystroke in the tab, reported at most once a minute, or a tap on Keep awake. Measured on an idle open tab: about 7 socket frames each way and 20 HTTP reads every 30 seconds, each renewing the SDK's timer, so that timer can't tell whether anyone is there. So an open tab idles out on time, up to 3 minutes late because of how often the SDK's alarm checks. Work running inside the container doesn't count either: use Keep awake for long tasks.
+- **The lease lives in the Durable Object.** Only a tap renews it, 1 or 2 hours from that tap and no other value. It holds off idle sleep through `onActivityExpired`. At its end, within 5 minutes, the snapshot cron saves and stops the container, even with a tab open. The chip warns for the last 10 minutes.
+- **If the chip isn't reporting,** nobody gets stopped at the idle time mid-use: the SDK's own rule applies, and on this SDK an open socket blocks idle. As a backstop, a container stops `FORGOTTEN_TAB_CAP_HOURS` (default 12) after its start, its last tap, or the last write through the webapp, which the Worker sees. Chat messages travel over the socket, which the Worker can't read, so someone who only chats, with no chip, would still reach the cap.
+- **Only a person starts a container.** An open tab's API calls and socket retries get a 503 and can't wake it; left alone, they did within seconds. Reloading the page does, which is what a tap on `Stopped, tap to restart` does. After a lease or cap ends, or a tap on Stop, loading the page offers a Wake button first.
+- **Stop** takes a snapshot first. If that fails, the container stays up.
+
+A running agent turn ends when the container stops.
+
 ## Routes
 
 Everything is behind Access. Anything not listed goes to the caller's Hermes webapp.
@@ -150,6 +162,11 @@ Everything is behind Access. Anything not listed goes to the caller's Hermes web
 | `GET /__af/status` | Wakes the caller's container; reports its state |
 | `POST /__af/snapshot` | Snapshots the caller's container |
 | `POST /__af/stop` | Final snapshot, then stop |
+| `GET /__af/lease` | The chip's read: state and when it stops. Can't wake a container |
+| `POST /__af/lease` | `{"hours": 1 or 2}`: keep awake |
+| `POST /__af/lease/stop` | Snapshot, then stop until woken |
+| `POST /__af/activity` | The chip reporting a tap or keystroke |
+| `POST /__af/wake` | Allow it to start again |
 | `/__af/admin` | Admins: the screens above |
 | `GET /__af/admin/users` | Admins: all users, their backups, and their selected inference provider |
 | `POST /__af/admin/users/:sub/{stop,snapshot,prune}` | Admins: act on a user |
@@ -176,7 +193,7 @@ The Hermes version is pinned in the `Dockerfile` (`HERMES_COMMIT`), because the 
 ## Limits
 
 - A container sleeping means Hermes' own scheduled jobs and messaging gateways don't run. Raise `SLEEP_AFTER` for those, at higher cost.
-- A forgotten open tab keeps a container running.
+- If the status chip isn't running, a forgotten open tab keeps a container up until the cap.
 - Only the Hermes home survives a restart. Agents default to working in `<home>/workspace` for that reason. Files elsewhere in the container, such as `~/.gitconfig` for the OS user, are lost; `terminal.home_mode: profile` in `config.yaml` keeps those under the home too.
 
 ## License

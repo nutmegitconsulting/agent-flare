@@ -150,6 +150,7 @@ const PENDING = `<span class="warn">Change waiting for next boot</span>`;
 
 function statusText(user: UserView): string {
   const state = user.details.status;
+  if (user.details.parked) return "Stopped, until the user wakes it";
   if (state.state === "failed") return `<span class="warn">Failed</span>`;
   return state.state === "ready" ? "Ready" : `Asleep or starting`;
 }

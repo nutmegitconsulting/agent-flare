@@ -41,6 +41,8 @@
     "ADMIN_EMAILS": "",
     "SLEEP_AFTER": "30m",
     "SNAPSHOT_INTERVAL_MINUTES": "10",
+    // With no "Keep awake" and no tap, a container stops after this long even with a tab open.
+    "FORGOTTEN_TAB_CAP_HOURS": "12",
     // Worker secrets templates may reference as "$NAME". Comma-separated.
     "TEMPLATE_SECRETS": "",
     // Streams restores instead of loading the whole archive into Durable Object memory.

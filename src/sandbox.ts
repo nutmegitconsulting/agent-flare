@@ -18,6 +18,7 @@ import type { Env } from "./env";
 import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest, type RestoreOutcome } from "./persistence";
 import { keyStatuses, resolveProviderKey } from "./credentials";
 import { configFingerprint, resolveEffective } from "./effective";
+import { capMs, leaseView, nextLease, type LeaseState, type LeaseView } from "./lease";
 import { renderProviders } from "./providers";
 import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
@@ -34,6 +35,9 @@ const IDENTITY_KEY = "identity";
 const SEALED_COPY_KEY = "sealed-files";
 const LAST_RESTORE_KEY = "last-restore";
 const CONFIG_STATUS_KEY = "config-status";
+const LEASE_KEY = "lease";
+/** Set when a container stopped so that nothing but a person starts it again. */
+const PARKED_KEY = "parked";
 const ACTIVE_PREFIX = "active/";
 const WEBAPP_START_TIMEOUT_MS = 120_000;
 /** After a failed hydration, keep reporting it for this long before trying again. */
@@ -45,6 +49,8 @@ const UI_DEFAULTS = { "hermes-desktop-mode-v1": "dark" };
 
 export type ReadyState =
   | { state: "ready" }
+  | { state: "parked" }
+  | { state: "asleep" }
   | { state: "starting"; step: string }
   | { state: "failed"; error: string };
 
@@ -74,6 +80,10 @@ export class HermesSandbox extends Sandbox<Env> {
   private lastSnapshotError: string | null = null;
   private lastFailureAt = 0;
   private finalSnapshotFailures = 0;
+  private lastActionAt = 0;
+  private lastServerActionAt = 0;
+  /** When idle runs out, counted from the last real tap or keystroke. Null until the chip first reports. */
+  private actionIdleAt: number | null = null;
 
   /** Runs `work` after everything already queued, whether that succeeded or not. */
   private serial<T>(work: () => Promise<T>): Promise<T> {
@@ -83,7 +93,11 @@ export class HermesSandbox extends Sandbox<Env> {
   }
 
   /** Current state. Starts hydration if needed and returns without waiting for it. */
-  async ensureReady(identity: AccessIdentity, publicUrl: string, accessJwt: string): Promise<ReadyState> {
+  async ensureReady(identity: AccessIdentity, publicUrl: string, accessJwt: string, mayStart = true): Promise<ReadyState> {
+    // An open tab keeps polling. After a planned stop that must not start the container again.
+    if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
+    // Nor may a tab's retries start one that went to sleep: tested, they do within seconds. That takes a page load.
+    if (!mayStart && !this.hydration && !(await this.isRunning())) return { state: "asleep" };
     this.lastUserActivity = Date.now();
     if (this.ready && (await this.isRunning())) return { state: "ready" };
     this.ready = false;
@@ -154,6 +168,7 @@ export class HermesSandbox extends Sandbox<Env> {
 
     // Only now can Hermes start, and only now can snapshots run.
     assertCurrent();
+    await this.ctx.storage.put<LeaseState>(LEASE_KEY, { startedAt: Date.now() });
     await this.exec(`mkdir -p ${RUN_DIR} && touch ${READY_FILE}`);
     this.status = { state: "starting", step: "starting Hermes" };
     await this.waitForWebapp(assertCurrent);
@@ -336,6 +351,14 @@ export class HermesSandbox extends Sandbox<Env> {
       }
       this.ready = true;
     }
+    const lease = await this.leaseState();
+    if (!lease.startedAt) {
+      // Running from before leases existed: its cap counts from now.
+      await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, startedAt: Date.now() });
+    } else if ((lease.leaseUntil || this.actionIdleAt === null) && leaseView(lease, capMs(this.env.FORGOTTEN_TAB_CAP_HOURS), Date.now()).due) {
+      // Without the chip reporting, nothing else can tell a forgotten tab from a used one, so the cap is the backstop.
+      return this.plannedStop(lease.leaseUntil ? "lease" : "cap");
+    }
     const now = Date.now();
     if (now - this.lastSnapshotAt < intervalMs) return { skipped: "interval not reached" };
     const inflight = (this as unknown as { inflightRequests?: number }).inflightRequests ?? 0;
@@ -363,6 +386,8 @@ export class HermesSandbox extends Sandbox<Env> {
       lastRestore: (await this.ctx.storage.get<RestoreOutcome & { at: number }>(LAST_RESTORE_KEY)) ?? null,
       config: (await this.ctx.storage.get(CONFIG_STATUS_KEY)) ?? null,
       lastUserActivity: this.lastUserActivity,
+      parked: (await this.ctx.storage.get<boolean>(PARKED_KEY)) ?? false,
+      lease: await this.leaseStatus(),
       inflight: (this as unknown as { inflightRequests?: number }).inflightRequests ?? 0,
     };
   }
@@ -374,6 +399,70 @@ export class HermesSandbox extends Sandbox<Env> {
       await this.clearActiveMarker();
       this.stopping = true;
       await this.stop();
+    });
+  }
+
+  private async leaseState(): Promise<LeaseState> {
+    return (await this.ctx.storage.get<LeaseState>(LEASE_KEY)) ?? {};
+  }
+
+  /** For the status chip. Reads only: it can't wake a container or count as activity. */
+  async leaseStatus(): Promise<{ state: "awake" | "asleep" | "parked"; idleAt?: number } & Partial<LeaseView>> {
+    if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
+    if (!(await this.isRunning())) return { state: "asleep" };
+    // Known only while the chip reports. Otherwise the tab's own traffic keeps renewing the SDK's timer.
+    return {
+      state: "awake", ...(this.actionIdleAt === null ? {} : { idleAt: this.actionIdleAt }),
+      ...leaseView(await this.leaseState(), capMs(this.env.FORGOTTEN_TAB_CAP_HOURS), Date.now()),
+    };
+  }
+
+  /** A tap on "Keep awake". The only thing that renews a lease. */
+  async keepAwake(hours: 1 | 2): Promise<{ leaseUntil: number } | { error: string }> {
+    if (!(await this.isRunning())) return { error: "not running" };
+    await this.noteUserAction();
+    const next = nextLease(await this.leaseState(), hours, Date.now());
+    await this.ctx.storage.put<LeaseState>(LEASE_KEY, next);
+    return { leaseUntil: next.leaseUntil };
+  }
+
+  /** A tap on "Stop". If the snapshot fails the container stays up, so a tap can't lose work. */
+  async stopByUser(): Promise<{ status: "stopped" | "not running" } | { error: string }> {
+    const result = await this.applyByRestart();
+    if (!("error" in result)) await this.ctx.storage.put(PARKED_KEY, true);
+    return result;
+  }
+
+  /** A person asked for it back. Only this clears a planned stop. */
+  async wake(): Promise<void> {
+    await this.ctx.storage.delete(PARKED_KEY);
+  }
+
+  /** Lease or cap ran out: snapshot, then stop, and stay stopped until a person returns. */
+  private async plannedStop(reason: string): Promise<SnapshotResult> {
+    return this.serial(async () => {
+      const saved = await this.finalSnapshot(reason);
+      if (!saved && ++this.finalSnapshotFailures < FINAL_SNAPSHOT_RETRIES) {
+        console.warn(`[planned-stop:${reason}] staying up to retry (${this.finalSnapshotFailures}/${FINAL_SNAPSHOT_RETRIES})`);
+        return { skipped: "final snapshot failed; will retry" };
+      }
+      if (!saved) console.error(`[planned-stop:${reason}] giving up; stopping without a final snapshot`);
+      this.finalSnapshotFailures = 0;
+      await this.ctx.storage.put(PARKED_KEY, true);
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await this.stop();
+      return { skipped: `stopped: ${reason}` };
+    });
+  }
+
+  /** Local tests only: moves a container's lease clock back. See index.ts. */
+  async ageForTest(ms: number): Promise<void> {
+    const lease = await this.leaseState();
+    await this.ctx.storage.put<LeaseState>(LEASE_KEY, {
+      ...(lease.leaseUntil ? { leaseUntil: lease.leaseUntil - ms } : {}),
+      ...(lease.lastTapAt ? { lastTapAt: lease.lastTapAt - ms } : {}),
+      ...(lease.startedAt ? { startedAt: lease.startedAt - ms } : {}),
     });
   }
 
@@ -412,18 +501,57 @@ export class HermesSandbox extends Sandbox<Env> {
     if (identity) await this.env.BACKUP_BUCKET.delete(`${ACTIVE_PREFIX}${identity.sub}`);
   }
 
+  /**
+   * A tap or keystroke in the tab, reported by the status chip. An open tab sends frames and polls every few
+   * seconds by itself, and each one renews the SDK's timer, so that timer can't tell whether anyone is there.
+   */
+  async noteUserAction(): Promise<void> {
+    this.lastActionAt = Date.now();
+    this.renewActivityTimeout();
+    this.actionIdleAt = (this as unknown as { sleepAfterMs: number }).sleepAfterMs;
+  }
+
+  /**
+   * A write through the webapp, seen by the Worker: a person is probably there. It's the safe fallback if the chip
+   * stops or never loads. It only ever extends: it doesn't switch on the chip's idle rule. At most once a minute.
+   */
+  async noteServerAction(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastServerActionAt < 60_000) return;
+    this.lastServerActionAt = now;
+    if (this.actionIdleAt !== null) await this.noteUserAction();
+    const lease = await this.leaseState();
+    if (lease.startedAt) await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, lastTapAt: now });
+  }
+
+  /** The idle check once the chip is reporting. Before that, or if it never does, the SDK's own check applies. */
+  actionIdleExpired(): boolean | null {
+    return this.actionIdleAt === null ? null : this.actionIdleAt <= Date.now();
+  }
+
+  /** Pushes idle out by one full period, under whichever rule applies. */
+  private holdOffIdle(): void {
+    this.renewActivityTimeout();
+    if (this.actionIdleAt !== null) this.actionIdleAt = (this as unknown as { sleepAfterMs: number }).sleepAfterMs;
+  }
+
   override async onActivityExpired(): Promise<void> {
     await this.serial(async () => {
+      // A lease holds off idle sleep. The snapshot cron is what ends it.
+      if ((await this.leaseState()).leaseUntil) {
+        this.holdOffIdle();
+        return;
+      }
       const started = Date.now();
       const saved = await this.finalSnapshot("idle");
       // The snapshot takes a while. A user who came back during it must not be cut off.
-      if (this.lastUserActivity > started) {
-        this.renewActivityTimeout();
+      if ((this.actionIdleAt === null ? this.lastUserActivity : this.lastActionAt) > started) {
+        this.holdOffIdle();
         return;
       }
       if (!saved && ++this.finalSnapshotFailures < FINAL_SNAPSHOT_RETRIES) {
         console.warn(`[final-snapshot:idle] staying up to retry (${this.finalSnapshotFailures}/${FINAL_SNAPSHOT_RETRIES})`);
-        this.renewActivityTimeout();
+        this.holdOffIdle();
         return;
       }
       if (!saved) console.error("[final-snapshot:idle] giving up; stopping without a final snapshot");
@@ -438,9 +566,18 @@ export class HermesSandbox extends Sandbox<Env> {
     this.generation++;
     this.ready = false;
     this.stopping = false;
+    this.actionIdleAt = null;
+    await this.ctx.storage.delete(LEASE_KEY);
     this.hydration = null;
     // A failure stays visible until its retry window passes, even though stopping is what follows it.
     if (this.status.state !== "failed") this.status = { state: "starting", step: "waiting" };
     await super.onStop(params);
   }
 }
+
+// The SDK's alarm loop calls this, and it's private only in the SDK's types, so it can't be overridden in the class.
+// Its own version treats an in-flight request as activity, which on this SDK includes the webapp's socket.
+const sdkIdleCheck = (Sandbox.prototype as unknown as { isActivityExpired(this: unknown): boolean }).isActivityExpired;
+(HermesSandbox.prototype as unknown as { isActivityExpired(this: HermesSandbox): boolean }).isActivityExpired = function () {
+  return this.actionIdleExpired() ?? sdkIdleCheck.call(this);
+};

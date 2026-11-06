@@ -121,6 +121,7 @@ RUN chown root:root /opt/hermes-install /opt/hermes-install/hermes-agent /opt/uv
 COPY --chown=root:root container/plugins/cloudflare_access /opt/hermes-install/hermes-agent/plugins/dashboard_auth/cloudflare_access
 COPY --chown=root:root container/af_state.py /usr/local/lib/af_state.py
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
+COPY --chown=root:root container/desktop-plugins/agent-flare/plugin.js /usr/local/lib/af-desktop-plugin.js
 # af-python: Hermes' own venv, which provides ruamel.yaml for af_state.py.
 RUN chmod +x /usr/local/bin/start-hermes.sh \
     && printf '#!/bin/sh\nexec %s "$@"\n' "$(ls -d /opt/hermes-install/installs/*/environments/*/venv/bin/python | head -1)" > /usr/local/bin/af-python \

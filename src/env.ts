@@ -16,6 +16,8 @@ export interface Env {
   /** Idle time before a container sleeps, e.g. "30m". */
   SLEEP_AFTER?: string;
   SNAPSHOT_INTERVAL_MINUTES?: string;
+  /** Hours a container stays up with no lease and no tap, even with a tab open. Default 12. */
+  FORGOTTEN_TAB_CAP_HOURS?: string;
   /** Comma-separated Worker secret names that templates may reference as "$NAME". */
   TEMPLATE_SECRETS?: string;
 

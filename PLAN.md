@@ -88,6 +88,14 @@ Not yet used with a real login.
 - **Audit:** one new R2 object per change, under `audit/`, never with a key value.
 - Roles only set which models appear and the default. **Chris's decision (2026-11-05): usability, not security**, so there's no enforcement and no budgets. The screens say so.
 
+## Container control (built, not deployed)
+
+Chip in `statusBar.right` through Hermes's desktop plugin feature, with no patch or injection; see README. Chris ruled out new plugin code earlier for tier marks, then chose this for container control. **The 12-hour cap is a default Chris hasn't confirmed** (`FORGOTTEN_TAB_CAP_HOURS`).
+
+Measured 2026-11-05 on SDK 0.12.14, with a real tab and a 2-minute idle time: an open tab stayed up over 6 minutes. `wsConnect` goes through `containerFetch`, which counts the socket as in flight. Even without that, the tab's own frames and polling renew the SDK's timer every few seconds. Cloudflare's current docs describe 1.x, and they direct 0.x apps to separate docs. A backgrounded phone tab probably goes idle because the phone suspends it.
+
+So activity is now a tap or keystroke the chip reports, and the cap is only the backstop for when the chip isn't reporting. The tab's retries can't wake a stopped container: they did within about 20 seconds before this.
+
 ## Tier marks and dark mode (2026-11-05)
 
 Chris: vanilla Hermes, with no patch and no new plugin code. A plugin mark and a webapp patch were both built and removed. The Access auth plugin stays, because login depends on it.
@@ -131,7 +139,7 @@ Details are under "Found while deploying".
 ## Changes Chris should know about
 
 - `jwt` provider mode is gone. It relied on the desktop client fetching a gateway JWT. `api_token` mode with `cf-aig-metadata` tagging replaces it, and `user_env` lets a user bring a key.
-- An open browser tab keeps a container running, and so costs money.
+- Without the status chip reporting, an open browser tab keeps a container running until the cap, and so costs money.
 - A sleeping container runs no Hermes cron jobs or messaging gateways.
 - `max_instances` caps users awake at once. Default 10.
 - `@cloudflare/sandbox` is 0.12.14; 1.0.3 is current. Not upgraded, to change one thing at a time.

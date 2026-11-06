@@ -362,6 +362,20 @@ class Apply(Base):
         self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
         self.assertEqual(self.config()["model"]["default"], "picked")
 
+    def test_the_status_chip_is_installed_and_a_failure_is_harmless(self):
+        source = Path(self.tmp.name) / "plugin.js"
+        source.write_text("v2")
+        target = self.home / "desktop-plugins/agent-flare/plugin.js"
+        original = af_state.DESKTOP_PLUGIN
+        try:
+            af_state.DESKTOP_PLUGIN = source
+            self.assertTrue(self.bundle()["desktop_plugin"])
+            self.assertEqual(target.read_text(), "v2")
+            af_state.DESKTOP_PLUGIN = Path(self.tmp.name) / "missing.js"
+            self.assertFalse(self.bundle()["desktop_plugin"])
+        finally:
+            af_state.DESKTOP_PLUGIN = original
+
     def test_a_ui_default_fills_an_empty_store_and_never_replaces_a_choice(self):
         store = self.home / "ui-preferences.json"
         mode = "hermes-desktop-mode-v1"

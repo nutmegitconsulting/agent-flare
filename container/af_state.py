@@ -53,6 +53,7 @@ INSTALL_LINKS = ("installs", "tools")
 # Agents work here by default, because it's inside what gets snapshotted.
 WORKSPACE = "workspace"
 PRIVATE_MODE = 0o600
+DESKTOP_PLUGIN = Path("/usr/local/lib/af-desktop-plugin.js")
 
 
 def _credential_check():
@@ -348,6 +349,15 @@ def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], 
     return None
 
 
+def _install_desktop_plugin(home: Path) -> bool:
+    """Our status chip, in Hermes's own plugin folder. Nothing depends on it, so a failure here is only no chip."""
+    try:
+        _write(home / "desktop-plugins" / "agent-flare" / "plugin.js", DESKTOP_PLUGIN.read_bytes())
+        return True
+    except OSError:
+        return False
+
+
 def _seed_ui_preferences(home: Path, defaults: dict[str, str]) -> list[str]:
     """Add webapp preferences the store lacks, in the document Hermes's own ui_preferences module writes.
     Never changes one that's there: that's the user's. An unreadable store is Hermes's to deal with."""
@@ -477,6 +487,7 @@ def apply(home: Path, bundle_path: Path) -> dict:
         os.chmod(home / "webapp", 0o700)
 
     report["ui_defaults"] = _seed_ui_preferences(home, bundle.get("ui_defaults") or {})
+    report["desktop_plugin"] = _install_desktop_plugin(home)
 
     for rel in (".env", "auth.json"):
         path = home / rel

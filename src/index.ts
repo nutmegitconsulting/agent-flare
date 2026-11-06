@@ -14,7 +14,8 @@ import { Hono } from "hono";
 import { AccessError, verifyAccessJwt, type AccessIdentity } from "./access";
 import { adminScreens } from "./admin";
 import type { Env } from "./env";
-import { startingPage } from "./pages";
+import { parseLeaseHours } from "./lease";
+import { parkedPage, startingPage } from "./pages";
 import { getIndex } from "./persistence";
 import { HermesSandbox, WEBAPP_PORT, type ReadyState } from "./sandbox";
 import { putSealed, prefillKey } from "./secrets";
@@ -82,6 +83,43 @@ app.post("/__af/snapshot", async (c) => {
   return c.json(result);
 });
 
+// The status chip. Reading this can't wake a container or count as activity.
+app.get("/__af/lease", async (c) => {
+  return c.json(await sandboxFor(c.env, c.get("identity").sub).leaseStatus(), 200, { "cache-control": "no-store" });
+});
+
+app.post("/__af/lease", async (c) => {
+  const { hours } = await c.req.json<{ hours?: unknown }>().catch(() => ({ hours: undefined }));
+  const leaseHours = parseLeaseHours(hours);
+  if (!leaseHours) return c.json({ error: "hours must be 1 or 2" }, 400);
+  const result = await sandboxFor(c.env, c.get("identity").sub).keepAwake(leaseHours);
+  return c.json(result, "error" in result ? 409 : 200);
+});
+
+app.post("/__af/lease/stop", async (c) => {
+  const result = await sandboxFor(c.env, c.get("identity").sub).stopByUser();
+  return c.json(result, "error" in result ? 500 : 200);
+});
+
+// The chip reporting a tap or keystroke. The only thing, with a lease, that holds off idle once it's reporting.
+app.post("/__af/activity", async (c) => {
+  await sandboxFor(c.env, c.get("identity").sub).noteUserAction();
+  return c.json({ ok: true });
+});
+
+app.post("/__af/wake", async (c) => {
+  await sandboxFor(c.env, c.get("identity").sub).wake();
+  return c.redirect("/", 303);
+});
+
+// Local tests only, like TEST_JWKS: moves the caller's own lease clock back.
+app.post("/__af/test/age", async (c) => {
+  if (c.env.ALLOW_TEST_JWKS !== "1") return c.text("Not found", 404);
+  const { ms } = await c.req.json<{ ms: number }>();
+  await sandboxFor(c.env, c.get("identity").sub).ageForTest(ms);
+  return c.json({ ok: true });
+});
+
 app.post("/__af/stop", async (c) => {
   await sandboxFor(c.env, c.get("identity").sub).stopWithSnapshot();
   return c.json({ status: "stopped" });
@@ -147,10 +185,19 @@ app.all("/__af/*", (c) => c.text("Not found", 404));
 // ---------------------------------------------------------------------------
 
 function isDocumentLoad(request: Request): boolean {
-  return request.method === "GET" && (request.headers.get("accept") ?? "").includes("text/html");
+  if (request.method !== "GET" || !(request.headers.get("accept") ?? "").includes("text/html")) return false;
+  // A script can send an Accept header, but not this one.
+  const mode = request.headers.get("sec-fetch-mode");
+  return !mode || mode === "navigate";
 }
 
 function notReady(request: Request, status: ReadyState): Response {
+  if (status.state === "parked" && isDocumentLoad(request)) {
+    return new Response(parkedPage(), {
+      status: 503,
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
   if (isDocumentLoad(request)) {
     return new Response(startingPage(status), {
       status: status.state === "failed" ? 500 : 503,
@@ -193,8 +240,11 @@ function forProxy(request: Request): Request {
 app.all("*", async (c) => {
   const identity = c.get("identity");
   const sandbox = sandboxFor(c.env, identity.sub);
-  const status = await sandbox.ensureReady(identity, new URL(c.req.url).origin, c.get("jwt"));
+  // Only a page load starts a container. An open tab's API calls and socket retries can't.
+  const status = await sandbox.ensureReady(identity, new URL(c.req.url).origin, c.get("jwt"), isDocumentLoad(c.req.raw));
   if (status.state !== "ready") return notReady(c.req.raw, status);
+
+  if (c.req.method !== "GET" && c.req.method !== "HEAD") await sandbox.noteServerAction();
 
   const request = forProxy(c.req.raw);
   const upgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";

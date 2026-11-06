@@ -32,7 +32,7 @@ ${failed
     try {
       const response = await fetch("/__af/status", { cache: "no-store" });
       const { status } = await response.json();
-      if (status.state === "ready") return location.reload();
+      if (status.state === "ready" || status.state === "parked") return location.reload();
       if (status.state === "failed") return location.reload();
       document.getElementById("step").textContent = status.step + "\\u2026";
     } catch {}
@@ -41,4 +41,21 @@ ${failed
   setTimeout(poll, 1500);
 </script>`}
 </main></body></html>`;
+}
+
+/** After a planned stop. Waking takes a tap, because an open tab must not be able to start the container. */
+export function parkedPage(): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Flare</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f7f7f8; --fg: #1a1a1d; --muted: #6b6b73; --accent: #f6821f; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #131316; --fg: #ececf0; --muted: #8b8b93; } }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; box-sizing: border-box;
+         background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 32rem; } h1 { font-size: 1.25rem; margin: 0 0 .25rem; } p { margin: 0 0 1rem; color: var(--muted); }
+  button { font: inherit; padding: .6rem 1.2rem; min-height: 44px; border: 0; border-radius: 6px; background: var(--accent); color: #111; }
+</style></head>
+<body><main><h1>Your agent is asleep</h1><p>Your work was saved.</p>
+<form method="post" action="/__af/wake"><button>Wake it up</button></form></main></body></html>`;
 }
