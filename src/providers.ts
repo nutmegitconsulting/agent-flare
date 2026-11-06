@@ -18,6 +18,8 @@
 export interface ProviderModelInfo {
   context_length?: number;
   max_length?: number;
+  /** Shown in the picker. Never sent to the API. */
+  name?: string;
 }
 
 export interface GatewayProviderEntry {
@@ -56,11 +58,18 @@ export type ModelTiers = Record<string, ModelTier>;
 export const TIER_MARKS: Record<ModelTier, string> = { low: "..$", medium: ".$$", high: "$$$", premium: "*$$$" };
 
 /**
- * The name a tiered model has in the picker. A Hermes model alias maps it back to the real ID. No space: the
- * webapp splits a pick on whitespace, so a name with a space can't be picked in a running session.
+ * The name a model has in the picker, such as "$$$ Claude Haiku 4.5 (200k)". A Hermes model alias maps it back to
+ * the real ID, which is all the API ever sees. Workers AI models start with CF.
  */
-export function modelLabel(id: string, tier: ModelTier): string {
-  return `${TIER_MARKS[tier]}${id.split("/").pop()}`;
+export function modelLabel(id: string, tier: ModelTier | undefined, info: ProviderModelInfo = {}): string {
+  const name = info.name?.trim() || id.split("/").pop()!.replace(/-/g, " ");
+  return [tier && TIER_MARKS[tier], id.startsWith("@cf/") && "CF", name, info.context_length && `(${contextText(info.context_length)})`]
+    .filter(Boolean).join(" ");
+}
+
+function contextText(tokens: number): string {
+  if (tokens >= 1_000_000) return `${Number((tokens / 1_000_000).toFixed(1))}M`;
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
 }
 
 const API_MODES = new Set(["chat_completions", "responses", "anthropic", "bedrock_converse", "auto"]);
@@ -128,6 +137,11 @@ export function validateProviders(
         Object.keys(e.models).length === 0) {
       return { ok: false, error: `${at}.models must be a non-empty object` };
     }
+    for (const [id, info] of Object.entries(e.models)) {
+      if (info?.name !== undefined && (typeof info.name !== "string" || !/^[\w .+()-]{1,64}$/.test(info.name))) {
+        return { ok: false, error: `${at}.models "${id}" name must be up to 64 letters, digits, spaces and . + ( ) - _` };
+      }
+    }
     if (e.model !== undefined && !(e.model in e.models) && e.discover_models !== true) {
       return { ok: false, error: `${at}.model "${e.model}" is not in models` };
     }
@@ -188,7 +202,7 @@ export function renderProviders(
     const models: Record<string, ProviderModelInfo> = {};
     for (const [id, info] of Object.entries(e.models)) {
       const tier = tiers[id];
-      const label = tier && TIER_MARKS[tier] ? modelLabel(id, tier) : id;
+      const label = (tier && TIER_MARKS[tier]) || info.name ? modelLabel(id, tier, info) : id;
       models[label in modelAliases ? id : label] = info;
       if (label !== id && !(label in modelAliases)) modelAliases[label] = { model: id, provider: e.name, base_url: e.base_url };
     }

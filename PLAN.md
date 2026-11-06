@@ -35,6 +35,7 @@ The deploy token expires **2026-11-08 04:59 UTC**. It has R2 read and write, Con
 ### What's unfinished
 
 - Cost marks and Claude models (Chris, 2026-11-06): committed, **not deployed**. `..$`, `.$$`, `$$$`, `*$$$`, with Claude scored on Anthropic's API prices and called through the existing `cloudflare-gateway` provider (`anthropic/...`, Anthropic key stored on the gateway). Do not add an Anthropic provider. To go out: Worker deploy, `templates.mjs push templates/team`, `tiers templates/model-tiers.json`. Then test each Claude model live, and how the marks render in the picker. `wrangler.prod.jsonc` also adds primus@ to `ADMIN_EMAILS`, on Chris's word. Premium cutoff above $3 blended is my choice, so Sonnet 5.5 is premium.
+- Picker names (Chris, 2026-11-06): `$$$ Claude Haiku 4.5 (200k)`, `.$$ CF Qwen 3.8 27b (262k)`. Display only; the alias sends the real ID. Commit `4e1fd74` recorded that a name with a space was refused, but on image `f60285f` Hermes's `switch_model` accepted one (function-level, n=1 per name), and Chris has seen spaces work. Confirm a real pick in the browser after deploying. Haiku 5.5 is `.$$` with a 100K context (Chris).
 - Admin pages and themes on the live site: never seen, because primus@ isn't an admin. Chris has to check them.
 - Chip tests not run: the countdown and stop after a busy turn ends; a turn with the tab closed; the chip across a no-rollout deploy when idle; a real 30-minute run. On the board.
 - The WAF rule, on the board for Chris. Text in `README.md`. Until then, nothing refuses cross-site writes to `/__af/*` beyond Access.
@@ -55,7 +56,7 @@ The deploy token expires **2026-11-08 04:59 UTC**. It has R2 read and write, Con
 - **Local clock:** this host has run about a minute off Cloudflare's. Compare times on one clock.
 - **Local Docker bridge:** this host's firewall blocks a container reaching `wrangler dev`, which SDK 1.0 backups needed.
 - **Memory:** this host has about 13 GB, usually with little free. A no-cache build plus a suite got background jobs killed by the memory watchdog once. Run them one at a time, and check `free -m` first.
-- **Hermes's model labels:** a leading `-` is stripped, so low is U+2212 `−`, with no space after a mark. A stale browser profile from a different key can stick on "Starting Hermes".
+- **Hermes's model labels:** a leading `-` is stripped. A stale browser profile from a different key can stick on "Starting Hermes".
 - **Waiting:** don't wait silently. Use bounded loops; a pattern that matches your own process never ends.
 
 ### Chris's decisions, and why

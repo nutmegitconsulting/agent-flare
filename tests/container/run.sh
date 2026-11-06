@@ -44,11 +44,11 @@ J
 PLATFORM='"webapp":{"enabled":true,"host":"0.0.0.0","port":9120,"public_url":"https://agents.example.com"},
  "dashboard":{"trusted_proxies":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","127.0.0.1","::1","fc00::/7"]}'
 PROVIDER='"custom_providers":[{"name":"team-gateway","base_url":"http://127.0.0.1:9555/v1","key_env":"TEAM_KEY","api_mode":"chat_completions",
- "discover_models":false,"extra_headers":{"cf-aig-gateway-id":"slug","cf-aig-metadata":"{\"user\":\"alice@example.com\"}"},"models":{"m1":{"context_length":64000},"..$gemma-4":{"context_length":64000},".$$qwen-3":{"context_length":64000},"$$$glm-5":{"context_length":64000},"*$$$claude-5":{"context_length":64000}}}],
- "model_aliases":{"..$gemma-4":{"model":"@cf/google/gemma-4","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
-  ".$$qwen-3":{"model":"@cf/qwen/qwen-3","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
-  "$$$glm-5":{"model":"@cf/zai-org/glm-5","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
-  "*$$$claude-5":{"model":"anthropic/claude-5","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"}}'
+ "discover_models":false,"extra_headers":{"cf-aig-gateway-id":"slug","cf-aig-metadata":"{\"user\":\"alice@example.com\"}"},"models":{"m1":{"context_length":64000},"..$ CF Gemma 4 (64k)":{"context_length":64000},".$$ CF Qwen 3 (64k)":{"context_length":64000},"$$$ CF GLM 5 (64k)":{"context_length":64000},"*$$$ Claude 5 (64k)":{"context_length":64000}}}],
+ "model_aliases":{"..$ CF Gemma 4 (64k)":{"model":"@cf/google/gemma-4","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
+  ".$$ CF Qwen 3 (64k)":{"model":"@cf/qwen/qwen-3","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
+  "$$$ CF GLM 5 (64k)":{"model":"@cf/zai-org/glm-5","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
+  "*$$$ Claude 5 (64k)":{"model":"anthropic/claude-5","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"}}'
 CANDIDATES='"provider_candidates":[{"provider":"team-gateway","model":"m1","key_env":"TEAM_KEY"}]'
 
 echo "== unit tests"
@@ -102,7 +102,7 @@ echo "$sent" | grep -q '"auth": "Bearer team-secret-value"' && ok "the request c
 echo "$sent" | grep -q '"gw": "slug"' && echo "$sent" | grep -q 'alice@example.com' && ok "the request carries gateway and user tags" || die "headers: $sent"
 
 echo "== tier marks in model names"
-for pair in '..$gemma-4|@cf/google/gemma-4' '.$$qwen-3|@cf/qwen/qwen-3' '$$$glm-5|@cf/zai-org/glm-5' '*$$$claude-5|anthropic/claude-5'; do
+for pair in '..$ CF Gemma 4 (64k)|@cf/google/gemma-4' '.$$ CF Qwen 3 (64k)|@cf/qwen/qwen-3' '$$$ CF GLM 5 (64k)|@cf/zai-org/glm-5' '*$$$ Claude 5 (64k)|anthropic/claude-5'; do
     want="${pair##*|}"; label="${pair%|*}"
     dx "$PY /t/browser_sim.py $HOST" >/dev/null
     dx ": > /tmp/stub.log"

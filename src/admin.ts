@@ -498,7 +498,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const provider = providers[0];
     const statuses = provider ? await keyStatuses(c.env, "", role, [provider]) : {};
     const tiers = await loadTiers(c.env.BACKUP_BUCKET);
-    const lines = provider ? Object.entries(provider.models ?? {}).map(([m, i]) => `${mark(tiers, m)}${m}${i.context_length ? ` ${i.context_length}` : ""}`).join("\n") : "";
+    const lines = provider ? Object.entries(provider.models ?? {}).map(([m, i]) => `${mark(tiers, m)}${m}${i.context_length ? ` ${i.context_length}${i.name ? ` ${i.name}` : ""}` : ""}`).join("\n") : "";
     const base = `/__af/admin/roles/${encodeURIComponent(role)}`;
     return page(`Role: ${role}`, `
       ${definition ? "" : `<p class="muted">New role. It's created when you save.</p>`}
@@ -513,10 +513,10 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
         <label for="p-cred">Worker secret to use if no key is set below</label>
         <input id="p-cred" type="text" name="credential" value="${e(provider?.credential ?? "")}" placeholder="CLOUDFLARE_AI_API_TOKEN">
         <label for="p-env">Variable name in the user's .env</label><input id="p-env" type="text" name="key_env" value="${e(provider?.key_env ?? "")}">
-        <label for="p-models">Models in the picker, one per line, as <code>mark model-id context-length</code>. The mark and context length are optional.</label>
+        <label for="p-models">Models in the picker, one per line, as <code>mark model-id context-length display name</code>. Only the model ID is required, and a display name needs a context length before it. For example: <code>$$$ anthropic/claude-haiku-4-5 200000 Claude Haiku 4.5</code></label>
         <textarea id="p-models" name="models" rows="12">${e(lines)}</textarea>
         <label for="p-default">Default model</label><input id="p-default" type="text" name="model" value="${e(provider?.model ?? "")}">
-        <p class="muted">Marks: <code>${e(TIER_MARKS.low)}</code> low, <code>${e(TIER_MARKS.medium)}</code> medium, <code>${e(TIER_MARKS.high)}</code> high, <code>${e(TIER_MARKS.premium)}</code> far above the rest. They show the model's cost, at the start of its name in the picker. A model has one mark across all roles, so changing it here changes it everywhere.</p>
+        <p class="muted">Marks: <code>${e(TIER_MARKS.low)}</code> low, <code>${e(TIER_MARKS.medium)}</code> medium, <code>${e(TIER_MARKS.high)}</code> high, <code>${e(TIER_MARKS.premium)}</code> far above the rest. They show the model's cost, at the start of its name in the picker, which reads like <code>$$$ Claude Haiku 4.5 (200k)</code>. Models whose ID starts <code>@cf/</code> also get <code>CF</code>. Without a display name, the name comes from the ID. Only the ID goes to the API. A model has one mark across all roles, so changing it here changes it everywhere.</p>
         <button>Save role</button></form>
       ${provider ? `<h2>Key for this role</h2><p>${keyText(statuses[provider.name])}</p>
       <form method="post" action="${base}/key"><input type="hidden" name="provider" value="${e(provider.name)}">
@@ -536,11 +536,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const marked: ModelTiers = {};
     for (const line of field("models").split("\n").map((l) => l.trim()).filter(Boolean)) {
       const { tier, rest } = splitMark(line);
-      const [id, length] = rest.split(/\s+/);
+      const [id, length, ...name] = rest.split(/\s+/);
       if (tier) marked[id] = tier;
       if (!MODEL_RE.test(id)) return problem(`That isn't a model ID: ${id}`, back);
       if (length && !/^\d{1,9}$/.test(length)) return problem(`That isn't a context length: ${length}`, back);
-      models[id] = length ? { context_length: Number(length) } : {};
+      models[id] = { ...(length ? { context_length: Number(length) } : {}), ...(name.length ? { name: name.join(" ") } : {}) };
     }
     const definition = (await readDefinition(c.env.BACKUP_BUCKET, role)) ?? {};
     const existing = Array.isArray(definition.providers) ? (definition.providers as GatewayProviderEntry[]) : [];

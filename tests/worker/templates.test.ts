@@ -124,9 +124,9 @@ describe("providers", () => {
     if (!parsed.ok) throw new Error(parsed.error);
     const rendered = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com",
       { "@cf/a/low-one": "low", "@cf/b/mid": "medium", "@cf/c/high": "high", "anthropic/top": "premium" });
-    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["..$low-one", ".$$mid", "$$$high", "*$$$top", "@cf/d/unscored"]);
-    expect((rendered.customProviders[0].models as Record<string, unknown>)["..$low-one"]).toEqual({ context_length: 1 });
-    expect(rendered.modelAliases["$$$high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
+    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["..$ CF low one (1)", ".$$ CF mid", "$$$ CF high", "*$$$ top", "@cf/d/unscored"]);
+    expect((rendered.customProviders[0].models as Record<string, unknown>)["..$ CF low one (1)"]).toEqual({ context_length: 1 });
+    expect(rendered.modelAliases["$$$ CF high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
     expect(rendered.candidates[0].model).toBe("@cf/a/low-one");
     expect(rendered.customProviders[0].model).toBe("@cf/a/low-one");
   });
@@ -137,7 +137,19 @@ describe("providers", () => {
     if (!parsed.ok) throw new Error(parsed.error);
     const { modelAliases } = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com", tiers);
     expect(Object.values(modelAliases).map((a) => a.model).sort()).toEqual(Object.keys(tiers).sort());
-    for (const label of Object.keys(modelAliases)) expect(label).toMatch(/^(\.\.\$|\.\$\$|\$\$\$|\*\$\$\$)\S+$/);
+    for (const label of Object.keys(modelAliases)) expect(label).toMatch(/^(\.\.\$|\.\$\$|\$\$\$|\*\$\$\$) \S/);
+  });
+  it("shows a display name and context length, and sends only the real ID", () => {
+    const parsed = validateProviders([{ ...entry, model: undefined, models: {
+      "anthropic/claude-haiku-4-5": { name: "Claude Haiku 4.5", context_length: 200000 },
+      "@cf/qwen/qwen3.8-27b": { name: "Qwen 3.8 27b", context_length: 262144 },
+      "@cf/zai-org/glm-5.3": { context_length: 1048576 } } }]);
+    if (!parsed.ok) throw new Error(parsed.error);
+    const { modelAliases } = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com",
+      { "anthropic/claude-haiku-4-5": "high", "@cf/qwen/qwen3.8-27b": "medium", "@cf/zai-org/glm-5.3": "high" });
+    expect(Object.keys(modelAliases)).toEqual(["$$$ Claude Haiku 4.5 (200k)", ".$$ CF Qwen 3.8 27b (262k)", "$$$ CF glm 5.3 (1M)"]);
+    expect(modelAliases["$$$ Claude Haiku 4.5 (200k)"].model).toBe("anthropic/claude-haiku-4-5");
+    expect(validateProviders([{ ...entry, models: { m: { name: "bad\nname" } }, model: undefined }]).ok).toBe(false);
   });
   it("refuses a credential reference to MASTER_KEY", () => {
     expect(validateProviders([{ ...entry, credential: "MASTER_KEY" }]).ok).toBe(false);
