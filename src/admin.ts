@@ -34,12 +34,13 @@ const GATEWAY_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MODEL_RE = /^[A-Za-z0-9@][A-Za-z0-9@._:/+-]{0,127}$/;
 const AUDIT_PREFIX = "audit/";
 const MAX_KEY_LENGTH = 4096;
-/** What a line of models may start with. The hyphen and en dash are how people type the low mark. */
-const MARK_INPUT: Record<string, ModelTier> = { "-": "low", "\u2013": "low", [TIER_MARKS.low]: "low", [TIER_MARKS.medium]: "medium", [TIER_MARKS.high]: "high" };
+/** What a line of models may start with. */
+const MARK_INPUT = Object.fromEntries(Object.entries(TIER_MARKS).map(([tier, mark]) => [mark, tier as ModelTier]));
 
 function splitMark(line: string): { tier?: ModelTier; rest: string } {
-  const tier = MARK_INPUT[line[0]];
-  return tier && /\s/.test(line[1] ?? "") ? { tier, rest: line.slice(1).trim() } : { rest: line };
+  const [first, ...rest] = line.split(/\s+/);
+  const tier = MARK_INPUT[first];
+  return tier && rest.length ? { tier, rest: rest.join(" ") } : { rest: line };
 }
 
 const mark = (tiers: ModelTiers, id: string) => (tiers[id] ? `${TIER_MARKS[tiers[id]]} ` : "");
@@ -515,7 +516,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
         <label for="p-models">Models in the picker, one per line, as <code>mark model-id context-length</code>. The mark and context length are optional.</label>
         <textarea id="p-models" name="models" rows="12">${e(lines)}</textarea>
         <label for="p-default">Default model</label><input id="p-default" type="text" name="model" value="${e(provider?.model ?? "")}">
-        <p class="muted">Marks: <code>${e(TIER_MARKS.low)}</code> low, <code>|</code> medium, <code>+</code> high. They're our score for agent work, shown at the start of the model's name in the picker. A model has one mark across all roles, so changing it here changes it everywhere.</p>
+        <p class="muted">Marks: <code>${e(TIER_MARKS.low)}</code> low, <code>${e(TIER_MARKS.medium)}</code> medium, <code>${e(TIER_MARKS.high)}</code> high, <code>${e(TIER_MARKS.premium)}</code> far above the rest. They show the model's cost, at the start of its name in the picker. A model has one mark across all roles, so changing it here changes it everywhere.</p>
         <button>Save role</button></form>
       ${provider ? `<h2>Key for this role</h2><p>${keyText(statuses[provider.name])}</p>
       <form method="post" action="${base}/key"><input type="hidden" name="provider" value="${e(provider.name)}">

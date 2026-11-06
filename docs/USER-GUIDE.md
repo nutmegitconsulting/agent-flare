@@ -74,12 +74,13 @@ Tap the small arrow in the box where you type. You'll see a list of models. Tap 
 
 ![The model list](images/models.png)
 
-The names in this picture are examples. The mark at the start of a name is our score for how well that model does agent work:
+The names in this picture are examples, and it shows older marks. The mark at the start of a name shows what the model costs:
 
-| Mark | Score |
+| Mark | Cost |
 |---|---|
-| `−` | Low |
-| <code>&#124;</code> | Medium |
-| `+` | High |
+| `..$` | Low |
+| `.$$` | Medium |
+| `$$$` | High |
+| `*$$$` | Far above the rest |
 
 No mark means it hasn't been scored. These are guides only: you can use any model on your list.

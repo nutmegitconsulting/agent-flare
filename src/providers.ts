@@ -47,13 +47,13 @@ export interface ProviderCandidate {
   key_env: string;
 }
 
-export type ModelTier = "low" | "medium" | "high";
+export type ModelTier = "low" | "medium" | "high" | "premium";
 export type ModelTiers = Record<string, ModelTier>;
 /**
- * Our score for each model, shown as the first character of its name in Hermes's picker. Low is U+2212, the
- * minus sign, because the webapp removes a leading hyphen from names and refuses to switch to one.
+ * What each model costs, shown at the start of its name in Hermes's picker. Premium is for a model that costs far
+ * more than the rest of the list.
  */
-export const TIER_MARKS: Record<ModelTier, string> = { low: "\u2212", medium: "|", high: "+" };
+export const TIER_MARKS: Record<ModelTier, string> = { low: "..$", medium: ".$$", high: "$$$", premium: "*$$$" };
 
 /**
  * The name a tiered model has in the picker. A Hermes model alias maps it back to the real ID. No space: the

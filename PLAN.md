@@ -34,6 +34,7 @@ The deploy token expires **2026-11-08 04:59 UTC**. It has R2 read and write, Con
 
 ### What's unfinished
 
+- Cost marks and Claude models (Chris, 2026-11-06): committed, **not deployed**. `..$`, `.$$`, `$$$`, `*$$$`, with Claude scored on Anthropic's API prices and called through the existing `cloudflare-gateway` provider (`anthropic/...`, Anthropic key stored on the gateway). Do not add an Anthropic provider. To go out: Worker deploy, `templates.mjs push templates/team`, `tiers templates/model-tiers.json`. Then test each Claude model live, and how the marks render in the picker. `wrangler.prod.jsonc` also adds primus@ to `ADMIN_EMAILS`, on Chris's word. Premium cutoff above $3 blended is my choice, so Sonnet 5.5 is premium.
 - Admin pages and themes on the live site: never seen, because primus@ isn't an admin. Chris has to check them.
 - Chip tests not run: the countdown and stop after a busy turn ends; a turn with the tab closed; the chip across a no-rollout deploy when idle; a real 30-minute run. On the board.
 - The WAF rule, on the board for Chris. Text in `README.md`. Until then, nothing refuses cross-site writes to `/__af/*` beyond Access.
@@ -424,7 +425,7 @@ So activity is now a tap or keystroke the chip reports, and the cap is only the 
 
 Chris: vanilla Hermes, with no patch and no new plugin code. A plugin mark and a webapp patch were both built and removed. The Access auth plugin stays, because login depends on it.
 
-- **Tier marks are plain config:** `model_aliases` maps a shown name such as `+glm-5.3` to its real ID. Chris chose `-` low, `|` medium, `+` high. The webapp strips a leading hyphen and refuses to switch to one, so low uses the minus sign U+2212, which looks the same; the role form also accepts a typed hyphen. Names have no space after the mark, because the webapp can't switch to a name with a space in a running session.
+- **Superseded 2026-11-06 by the cost marks, see Handoff.** **Tier marks are plain config:** `model_aliases` maps a shown name such as `+glm-5.3` to its real ID. Chris chose `-` low, `|` medium, `+` high. The webapp strips a leading hyphen and refuses to switch to one, so low uses the minus sign U+2212, which looks the same; the role form also accepts a typed hyphen. Names have no space after the mark, because the webapp can't switch to a name with a space in a running session.
 - **One list:** `config/model-tiers.json` in R2, shared by all roles. Source: `templates/model-tiers.example.json`. Cutoffs: blended = (3 x input + output) / 4 per million tokens; low under 0.50, medium up to 1.50, high above. Pricing page updated 2026-10-20.
 - **Limit:** the model in use shows under its real name, with no mark, in the pill and in an extra top row of the menu.
 - **Dark mode:** seeded into Hermes's own `ui-preferences.json` when the key is absent. It's the user's afterwards.

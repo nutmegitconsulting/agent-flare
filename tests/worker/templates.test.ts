@@ -120,13 +120,13 @@ describe("providers", () => {
   });
   it("shows a tier as the first character of the name, and aliases it to the real ID", () => {
     const parsed = validateProviders([{ ...entry, model: "@cf/a/low-one", models: {
-      "@cf/a/low-one": { context_length: 1 }, "@cf/b/mid": {}, "@cf/c/high": {}, "@cf/d/unscored": {} } }]);
+      "@cf/a/low-one": { context_length: 1 }, "@cf/b/mid": {}, "@cf/c/high": {}, "anthropic/top": {}, "@cf/d/unscored": {} } }]);
     if (!parsed.ok) throw new Error(parsed.error);
     const rendered = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com",
-      { "@cf/a/low-one": "low", "@cf/b/mid": "medium", "@cf/c/high": "high" });
-    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["\u2212low-one", "|mid", "+high", "@cf/d/unscored"]);
-    expect((rendered.customProviders[0].models as Record<string, unknown>)["\u2212low-one"]).toEqual({ context_length: 1 });
-    expect(rendered.modelAliases["+high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
+      { "@cf/a/low-one": "low", "@cf/b/mid": "medium", "@cf/c/high": "high", "anthropic/top": "premium" });
+    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["..$low-one", ".$$mid", "$$$high", "*$$$top", "@cf/d/unscored"]);
+    expect((rendered.customProviders[0].models as Record<string, unknown>)["..$low-one"]).toEqual({ context_length: 1 });
+    expect(rendered.modelAliases["$$$high"]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
     expect(rendered.candidates[0].model).toBe("@cf/a/low-one");
     expect(rendered.customProviders[0].model).toBe("@cf/a/low-one");
   });
@@ -137,7 +137,7 @@ describe("providers", () => {
     if (!parsed.ok) throw new Error(parsed.error);
     const { modelAliases } = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com", tiers);
     expect(Object.values(modelAliases).map((a) => a.model).sort()).toEqual(Object.keys(tiers).sort());
-    for (const label of Object.keys(modelAliases)) expect(label).toMatch(/^[\u2212|+]\S+$/);
+    for (const label of Object.keys(modelAliases)) expect(label).toMatch(/^(\.\.\$|\.\$\$|\$\$\$|\*\$\$\$)\S+$/);
   });
   it("refuses a credential reference to MASTER_KEY", () => {
     expect(validateProviders([{ ...entry, credential: "MASTER_KEY" }]).ok).toBe(false);

@@ -92,7 +92,7 @@ if (command === "check" && target) {
   put(bucket, "config/assignments.json", target);
 } else if (command === "tiers" && target) {
   for (const [model, tier] of Object.entries(JSON.parse(readFileSync(target, "utf8")))) {
-    if (!["low", "medium", "high"].includes(tier)) fail(`${model}: tier must be low, medium or high`);
+    if (!["low", "medium", "high", "premium"].includes(tier)) fail(`${model}: tier must be low, medium, high or premium`);
   }
   put(bucket, "config/model-tiers.json", target);
 } else {

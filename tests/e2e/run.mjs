@@ -263,7 +263,7 @@ try {
   expect(config.includes("cf-aig-metadata") && config.includes(alice.email), "provider tagged with the user", config);
   const modelInfo = await alice.json("/api/model/info");
   expect(modelInfo.provider === "gw" && modelInfo.model === "m", "first launch has the template's provider selected", JSON.stringify(modelInfo));
-  expect(config.includes("model_aliases") && config.includes("|m") && config.includes("model: m"), "the tier mark is in the model's name, aliased to the real ID", config);
+  expect(config.includes("model_aliases") && config.includes(".$$m") && config.includes("model: m"), "the tier mark is in the model's name, aliased to the real ID", config);
   expect(JSON.parse(inside(alice, `cat ${HOME}/ui-preferences.json`)).values["hermes-desktop-mode-v1"] === "dark", "a new home starts in dark mode");
   const aliceConfig = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).config;
   expect(aliceConfig.inference.selected === "gw" && !aliceConfig.warnings.some((w) => w.includes("provider")), "admin sees the provider selected", JSON.stringify(aliceConfig));
@@ -317,7 +317,7 @@ try {
 
   // A role with a hostile name in the fields: everything user-derived must come back escaped.
   const hostile = '<img src=x onerror=alert(1)>';
-  const saved = await admin.fetch("/__af/admin/roles/engineers", form({ name: "gw", mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY", gateway_id: "eng-gw", credential: "", models: "m 1000\n+ big 2000", model: "big" }));
+  const saved = await admin.fetch("/__af/admin/roles/engineers", form({ name: "gw", mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY", gateway_id: "eng-gw", credential: "", models: "m 1000\n$$$ big 2000", model: "big" }));
   await saved.body?.cancel();
   expect(saved.status === 303, "admin creates a role", String(saved.status));
   const badRole = await admin.fetch("/__af/admin/roles/bad", form({ name: hostile, mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY", gateway_id: "g", models: "m", model: "" }));
@@ -411,8 +411,8 @@ try {
   expect(!containerOf(alice), "applying stops the container, after a snapshot");
   expect((await alice.waitReady()).state === "ready", "the user wakes on their next visit");
   const afterApply = inside(alice, `cat ${HOME}/config.yaml`);
-  expect(afterApply.includes("+big"), "a mark typed in the role form reaches the picker", afterApply.slice(0, 400));
-  expect((await (await admin.fetch("/__af/admin/roles/engineers")).text()).includes("+ big 2000"), "the role form shows the mark with the model");
+  expect(afterApply.includes("$$$big"), "a mark typed in the role form reaches the picker", afterApply.slice(0, 400));
+  expect((await (await admin.fetch("/__af/admin/roles/engineers")).text()).includes("$$$ big 2000"), "the role form shows the mark with the model");
   expect(afterApply.includes("alice-gw") && afterApply.includes("big"), "the new role and the override are in place", afterApply.slice(0, 400));
   expect(inside(alice, `cat ${HOME}/SOUL.md`) === "template soul", "the user's files are untouched by the change");
   const keyInEnv = inside(alice, `grep -c '^GW_KEY=${adminKey}$' ${HOME}/.env`);
