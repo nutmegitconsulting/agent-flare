@@ -64,19 +64,6 @@ app.use("*", async (c, next) => {
 // The caller's own container
 // ---------------------------------------------------------------------------
 
-// The Worker's own writes can't rely on the Access cookie's SameSite setting to stop cross-site POSTs.
-app.use("/__af/*", async (c, next) => {
-  if (c.req.method === "GET") return next();
-  const origin = c.req.header("origin");
-  const site = c.req.header("sec-fetch-site");
-  // An opaque origin, as from a sandboxed frame, sends the text "null", which is no origin of ours.
-  const crossOrigin = origin && URL.parse(origin)?.host !== new URL(c.req.url).host;
-  if (crossOrigin || (site && !["same-origin", "none"].includes(site))) {
-    return c.text("Cross-site request refused", 403);
-  }
-  await next();
-});
-
 app.get("/__af/status", async (c) => {
   const { sub, email } = c.get("identity");
   const sandbox = sandboxFor(c.env, sub);

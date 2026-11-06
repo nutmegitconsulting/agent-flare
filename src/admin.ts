@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { chooseTheme, contrastWarnings, customCookie, CUSTOM_FIELDS, DEFAULT_THEME, THEME_NAMES, themeCookie, themeFromCookies, THEMES, validateCustom, type Theme, type ThemeName } from "./themes";
 /**
  * The admin screens. Server-rendered, with no script. They are mounted behind the same checks as every admin
- * route: the Worker's Access JWT verification, ADMIN_EMAILS, and the same-origin check on writes. ADMIN_EMAILS
+ * route: the Worker's Access JWT verification and ADMIN_EMAILS. Cross-site writes are refused by a WAF rule. ADMIN_EMAILS
  * is a Worker var, and nothing here can change it, so an admin can't lose access through these screens.
  *
  * A role is a template; assigning one is an entry in assignments.users. Roles set which models appear in the
@@ -113,7 +113,7 @@ export function page(title: string, body: string, status = 200): Response {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "referrer-policy": "no-referrer",
+      "referrer-policy": "same-origin",
       "x-content-type-options": "nosniff",
       "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     },

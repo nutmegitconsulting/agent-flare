@@ -66,6 +66,14 @@ node scripts/render-wrangler.mjs
 npx wrangler deploy
 ```
 
+### Required: block cross-site writes at the WAF
+
+The Worker doesn't check where a write came from. **Before your first deploy,** add a custom WAF rule on your hostname (Security > WAF > Custom rules), action Block:
+
+```
+(starts_with(http.request.uri.path, "/__af/") and not http.request.method in {"GET" "HEAD"} and any(http.request.headers["sec-fetch-site"][*] in {"cross-site" "same-site"}))
+```
+
 ### From a machine behind TLS inspection
 
 `wrangler deploy` can't pass a build secret, and an image must never inherit a proxy's CA. Build by hand, and deploy the pushed image:

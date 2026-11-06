@@ -158,6 +158,16 @@ A chip in Hermes's status bar shows the container's state. It's an ordinary Herm
 
 A running agent turn ends when the container stops.
 
+## Cross-site writes: a required WAF rule
+
+The Worker doesn't check where a write came from. **Add this custom WAF rule on your hostname before deploying, action Block:**
+
+```
+(starts_with(http.request.uri.path, "/__af/") and not http.request.method in {"GET" "HEAD"} and any(http.request.headers["sec-fetch-site"][*] in {"cross-site" "same-site"}))
+```
+
+Without it, another site can make a logged-in user's browser send writes to `/__af/*`, such as Stop or an admin change. It relies on the browser's `Sec-Fetch-Site` header.
+
 ## Routes
 
 Everything is behind Access. Anything not listed goes to the caller's Hermes webapp.

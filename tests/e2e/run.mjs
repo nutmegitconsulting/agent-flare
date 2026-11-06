@@ -272,7 +272,6 @@ try {
   expect(env.includes("TEMPLATE_PLAIN=plain-value") && env.includes("TEMPLATE_SECRET=shared-secret-value") && env.includes("GW_KEY=e2e-shared-token"), "template env and secrets applied", "(env withheld)");
 
   expect(!env.includes("STOLEN=") && !env.includes(MASTER), "a template can't read MASTER_KEY");
-  expect((await alice.fetch("/__af/stop", { method: "POST", headers: { origin: "https://evil.example" } })).status === 403, "cross-site stop refused");
   expect(inside(alice, `grep -c '^  cwd: ${HOME}/workspace' ${HOME}/config.yaml`) === "1", "agents work inside the snapshotted home");
 
   console.log("== provider secret missing");
@@ -310,11 +309,6 @@ try {
       if (r.status !== want) wrong.push(`${method} ${path}: ${r.status}`);
     }
     expect(wrong.length === 0, `${label}: all ${adminRoutes.length} admin screen routes refuse with ${want}`, wrong.join("; "));
-  }
-  for (const [label, headers] of [["another origin", { origin: "https://evil.example" }], ["an opaque origin", { origin: "null" }], ["a cross-site fetch", { "sec-fetch-site": "cross-site" }]]) {
-    const r = await admin.fetch(`/__af/admin/assign`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers }, body: "email=evil@example.com&role=team" });
-    await r.body?.cancel();
-    expect(r.status === 403, `a write from ${label} is refused`, String(r.status));
   }
   const usersPage = await admin.fetch("/__af/admin");
   const usersHtml = await usersPage.text();
@@ -466,11 +460,6 @@ try {
     await r.body?.cancel();
     expect(r.status === want, `a lease of ${label} is refused`, String(r.status));
   }
-  for (const path of ["/__af/lease", "/__af/lease/stop", "/__af/wake"]) {
-    const r = await carol.fetch(path, { method: "POST", headers: { origin: "https://evil.example", "content-type": "application/json" }, body: '{"hours":1}' });
-    await r.body?.cancel();
-    expect(r.status === 403, `a cross-site POST to ${path} is refused`, String(r.status));
-  }
   expect(containerOf(carol), "and the container is still up");
   const tapped = await carol.json("/__af/lease", jsonPost({ hours: 1 }));
   const remaining = tapped.leaseUntil - Date.now();
@@ -572,9 +561,7 @@ try {
     .catch((e) => fail("the tab's socket opens", e.message));
   const reported = await carol.fetch("/__af/activity", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
   await reported.body?.cancel();
-  const crossReport = await carol.fetch("/__af/activity", { method: "POST", headers: { origin: "https://evil.example" } });
-  await crossReport.body?.cancel();
-  expect(reported.status === 200 && crossReport.status === 403, "the chip's report works, same-origin only");
+  expect(reported.status === 200, "the chip's report works");
   const idleAt = (await carol.json("/__af/lease")).idleAt;
   expect(idleAt > Date.now() && idleAt <= Date.now() + SLEEP_AFTER_SECONDS * 1000, "and the chip now has a real idle time", String(idleAt));
   const tabStarted = Date.now();
