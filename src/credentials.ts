@@ -1,113 +1,84 @@
 /**
- * Credentials store (V9) — KV-backed, OUT of the backup R2 bucket.
+ * Provider keys an admin sets. Write-only for the admin: nothing here returns a value to a browser, the
+ * admin API or a log. At boot a key is written to that user's .env, as provider credentials always are.
  *
- * Rationale: the R2 bucket (BACKUP_BUCKET) is replicated to third-party
- * backup storage. Anything stored there must be assumed to leak eventually.
- * Usable credentials therefore live in a dedicated KV namespace
- * (CREDENTIALS_KV), which is never included in the backup path.
- *
- * Migrated keys (values unchanged from their R2 json):
- *   cred:tunnel:<userId>     { hostname, token }        (was cloudflared/creds.json)
- *   cred:session:<userId>    { token }                  (was session-token.json)
- *   cred:gwjwt:<userId>      { jwt, storedAt }          (was gateway-jwt.json)
- *
- * Consistency note: KV is eventually consistent (~60s worst case). This is
- * acceptable because every one of these values is write-once-at-provision
- * and read on wake — there is no read-after-write flow inside a single
- * request path. If a provisioned user wakes within seconds of first
- * provision, the wake may see "not provisioned" once; the client retry
- * covers it. R2 stays authoritative for snapshots/backups only.
+ * Order: the user's own > the role's > the Worker secret the provider names. Sealed values live in KV with
+ * the MASTER_KEY design. Each carries its last-changed time as KV metadata, readable without decrypting.
  */
+import type { Env } from "./env";
+import type { GatewayProviderEntry } from "./providers";
+import { seal, unseal } from "./secrets";
+import { templateSecrets } from "./templates";
 
-const KV_PREFIX = {
-  tunnel: "cred:tunnel:",
-  session: "cred:session:",
-  gwjwt: "cred:gwjwt:",
-} as const;
+export const DEFAULT_CREDENTIAL = "CLOUDFLARE_AI_API_TOKEN";
 
-export type TunnelCreds = { hostname: string; token: string };
-export type SessionCreds = { token: string };
-export type GatewayJwtCreds = { jwt: string; storedAt: string };
-
-function key(kind: keyof typeof KV_PREFIX, userId: string): string {
-  return KV_PREFIX[kind] + userId;
+export type KeyScope = { kind: "user"; email: string } | { kind: "role"; role: string };
+export interface KeyStatus {
+  source: "user" | "role" | "worker-secret" | "none";
+  changedAt: string | null;
 }
 
-// ---------------------------------------------------------------------------
-// Tunnel credentials (was cloudflared/creds.json)
-// ---------------------------------------------------------------------------
+export const keyKvKey = (scope: KeyScope, provider: string) =>
+  scope.kind === "user"
+    ? `sealed:provider-key:user:${scope.email.toLowerCase()}:${provider}`
+    : `sealed:provider-key:role:${scope.role}:${provider}`;
 
-export async function getTunnelCreds(
-  kv: KVNamespace,
-  userId: string
-): Promise<TunnelCreds | null> {
-  const raw = await kv.get(key("tunnel", userId));
-  if (!raw) return null;
-  try {
-    const data = JSON.parse(raw) as Partial<TunnelCreds>;
-    if (data.hostname && data.token) return { hostname: data.hostname, token: data.token };
-    return null;
-  } catch {
-    return null;
+export async function setProviderKey(env: Env, scope: KeyScope, provider: string, value: string): Promise<void> {
+  const key = keyKvKey(scope, provider);
+  await env.CREDENTIALS_KV.put(key, await seal(env.MASTER_KEY, key, value), {
+    metadata: { changedAt: new Date().toISOString() },
+  });
+}
+
+export async function clearProviderKey(env: Env, scope: KeyScope, provider: string): Promise<void> {
+  await env.CREDENTIALS_KV.delete(keyKvKey(scope, provider));
+}
+
+/** The Worker secret a provider names. Listed names only, and never MASTER_KEY. */
+function workerSecret(env: Env, entry: GatewayProviderEntry): string {
+  const name = entry.credential ?? (entry.mode === "api_token" ? DEFAULT_CREDENTIAL : "");
+  if (!name || name === "MASTER_KEY") return "";
+  if (name === DEFAULT_CREDENTIAL) return env.CLOUDFLARE_AI_API_TOKEN ?? "";
+  const value = templateSecrets(env)[name];
+  return typeof value === "string" ? value : "";
+}
+
+async function sealedStatus(env: Env, scope: KeyScope, provider: string): Promise<string | null | undefined> {
+  const { value, metadata } = await env.CREDENTIALS_KV.getWithMetadata<{ changedAt?: string }>(keyKvKey(scope, provider));
+  return value === null ? undefined : (metadata?.changedAt ?? null);
+}
+
+export async function keyStatus(
+  env: Env, email: string | null, role: string | null, entry: GatewayProviderEntry,
+): Promise<KeyStatus> {
+  if (email) {
+    const changedAt = await sealedStatus(env, { kind: "user", email }, entry.name);
+    if (changedAt !== undefined) return { source: "user", changedAt };
   }
-}
-
-export async function putTunnelCreds(
-  kv: KVNamespace,
-  userId: string,
-  creds: TunnelCreds
-): Promise<void> {
-  await kv.put(key("tunnel", userId), JSON.stringify(creds));
-}
-
-// ---------------------------------------------------------------------------
-// Dashboard session token (was session-token.json)
-// ---------------------------------------------------------------------------
-
-export async function getSessionToken(
-  kv: KVNamespace,
-  userId: string
-): Promise<string | null> {
-  const raw = await kv.get(key("session", userId));
-  if (!raw) return null;
-  try {
-    const data = JSON.parse(raw) as { token?: string };
-    return data.token ?? null;
-  } catch {
-    return null;
+  if (role) {
+    const changedAt = await sealedStatus(env, { kind: "role", role }, entry.name);
+    if (changedAt !== undefined) return { source: "role", changedAt };
   }
+  return { source: workerSecret(env, entry) ? "worker-secret" : "none", changedAt: null };
 }
 
-export async function putSessionToken(
-  kv: KVNamespace,
-  userId: string,
-  token: string
-): Promise<void> {
-  await kv.put(key("session", userId), JSON.stringify({ token }));
-}
-
-// ---------------------------------------------------------------------------
-// Gateway JWT (was gateway-jwt.json)
-// ---------------------------------------------------------------------------
-
-export async function getGatewayJwt(
-  kv: KVNamespace,
-  userId: string
-): Promise<GatewayJwtCreds | null> {
-  const raw = await kv.get(key("gwjwt", userId));
-  if (!raw) return null;
-  try {
-    const data = JSON.parse(raw) as Partial<GatewayJwtCreds>;
-    return data.jwt ? { jwt: data.jwt, storedAt: data.storedAt ?? "" } : null;
-  } catch {
-    return null;
+/** For hydration only: the result goes to the user's .env. */
+export async function resolveProviderKey(
+  env: Env, email: string, role: string | null, entry: GatewayProviderEntry,
+): Promise<string> {
+  const scopes: KeyScope[] = [{ kind: "user", email }, ...(role ? [{ kind: "role", role } as KeyScope] : [])];
+  for (const scope of scopes) {
+    const key = keyKvKey(scope, entry.name);
+    const sealed = await env.CREDENTIALS_KV.get(key);
+    if (sealed) return unseal(env.MASTER_KEY, key, sealed);
   }
+  return workerSecret(env, entry);
 }
 
-export async function putGatewayJwt(
-  kv: KVNamespace,
-  userId: string,
-  jwt: string
-): Promise<void> {
-  await kv.put(key("gwjwt", userId), JSON.stringify({ jwt, storedAt: new Date().toISOString() }));
+/** Status for every provider, for showing and for telling whether a key changed since boot. */
+export async function keyStatuses(
+  env: Env, email: string, role: string | null, entries: GatewayProviderEntry[],
+): Promise<Record<string, KeyStatus>> {
+  const pairs = await Promise.all(entries.map(async (e) => [e.name, await keyStatus(env, email, role, e)] as const));
+  return Object.fromEntries(pairs);
 }

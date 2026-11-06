@@ -1,129 +1,237 @@
 # Agent Flare
 
-**Agent Flare** — Hermes Agent deployed on Cloudflare Sandbox with Hermes Desktop GUI connectivity via Cloudflare Tunnel.
-
-## Architecture at a glance
-
-**Agent Flare** runs the Hermes AI agent in a custom Python container on Cloudflare, driven from a desktop UI on your laptop — with the container's state snapshotted to R2 as squashfs so it survives the ephemeral container lifecycle.
+Runs a private [Hermes Agent](https://hermes-agent.nousresearch.com/) for each person on your team, on Cloudflare, in the browser. Nothing to install on a laptop.
 
 ```
-┌─────────────────────┐  cloudflared access tcp    ┌──────────────────────────────┐
-│  Laptop             │  (outbound-only tunnel)    │  Cloudflare Edge             │
-│  Hermes Desktop UI  │───────────────────────────▶│  Access (JWT auth)           │
-│  localhost:9119     │  no inbound ports anywhere │  Hono Worker (provisioning,  │
-└─────────────────────┘                            │  wake/stop, snapshot APIs)   │
-                                                   └───────────────┬──────────────┘
-                                                                   │ per-user Tunnel
-                                                   ┌───────────────▼──────────────┐
-                                                   │  Python container            │
-                                                   │  (cloudflare/sandbox-python) │
-                                                   │  Hermes agent + cloudflared  │
-                                                   │  mksquashfs ────▶ R2 snapshots
-                                                   └──────────────────────────────┘
+Browser ── HTTPS ──▶ Cloudflare Access ──▶ Worker ──▶ that user's Sandbox ──▶ Hermes webapp :9120
+                                             │               │
+                                             │               └─ squashfs snapshots ──▶ R2
+                                             └─ per-user secrets, encrypted ─────────▶ KV
 ```
 
-The five moves:
+- **One hostname, one container per person.** The Worker verifies the Access JWT and routes on the Access user ID. No request parameter can reach another user's container.
+- **HTTPS for the browser; Hermes on its default port inside.** Browsers use 443 at Cloudflare, where TLS ends. Hermes listens on 9120, plain HTTP, in the container. Containers have no public ingress, so the Worker's Access-verified path is the only way in. Keep `workers_dev` and `preview_urls` off so every request arrives through Access.
+- **One login.** A small Hermes auth provider trusts the identity the Worker verified, so users never see a second sign-in.
+- **Containers sleep when idle and wake on the next request.** A starting page shows while state comes back.
+- **State survives.** Snapshots go to R2 every 10 minutes while in use and on every stop. Restores are verified, and a bad backup never replaces a good one.
+- **Inference ready on first launch.** A template assigned by email, Access group or domain gives a user a working provider and model, with nothing to set up.
 
-1. **Desktop UI runs locally.** The Hermes Desktop GUI lives on your laptop and connects to `localhost:9119` — it is never hosted in the cloud.
-2. **Cloudflared bridges laptop → cloud.** The desktop client runs `cloudflared access tcp`, which dials an outbound-only connection through Cloudflare Access to the user's tunnel. No inbound ports are open on the laptop, and the container is never directly exposed.
-3. **Per-user Python containers on Cloudflare.** Each user's agent runs in its own container (base image `cloudflare/sandbox:0.12.7-python`) alongside a Hono Worker that provisions the tunnel, wakes and stops containers, and exposes snapshot/admin APIs.
-4. **Squashfs state backups to R2 — every 10 minutes (configurable) and at shutdown.** The container filesystem is ephemeral: the container's live state (`/home/hermes/.hermes`) is archived with `mksquashfs` on a 10-minute cadence (Worker cron; `SNAPSHOT_INTERVAL_MINUTES`), the SDK uploads the archive through the bound R2 bucket (no presigned URLs, no credentials in the container), and one last snapshot is taken just before the container is stopped (`SIGTERM`) or destroyed. On the next boot the newest archive is `unsquashfs`-extracted back in, so the agent resumes exactly where it left off. Slot-filling retention pruning keeps the snapshot history small.
-5. **Cloudflare Access in front of everything.** All public hostnames sit behind Cloudflare Access (JWT verification on every request); `workers.dev` exposure is disabled. The only authenticated way in is through Access, and tunnel credentials for each user live in a dedicated KV namespace rather than in the R2 backup bucket.
+For people using it: [the user guide](docs/USER-GUIDE.md).
 
-## Overview
+## How state works
 
-This project deploys the Hermes AI Agent inside Cloudflare Sandbox containers, using Cloudflare Tunnel for secure connectivity from a local Hermes Desktop GUI. A serverless Worker (Hono) provisions Cloudflare Tunnels per user and manages container wake/stop; user state persists in R2 as squashfs backups written by the Sandbox SDK.
+Container disks are ephemeral, so a user's Hermes home (`/home/hermes/.hermes`) is rebuilt on every boot.
 
-## Architecture
+**Boot.** Hermes waits behind a gate while the Worker hydrates the home:
 
-- **Frontend:** Hermes Desktop GUI (Windows) connects to `localhost:9119`
-- **Transport:** `cloudflared access tcp` proxies local TCP to Cloudflare Tunnel
-- **Edge:** Cloudflare Access authenticates and routes to the Worker (`hermes-agent.example.com`)
-- **Backend:** Cloudflare Sandbox + Durable Object runs Hermes Agent; Hono Worker handles the API
-- **Persistence:** R2-backed squashfs backups via the Sandbox SDK's `createBackup()` / `restoreBackup()`
+1. Restore the newest backup into a scratch directory, verify it (file count, bytes, SQLite `quick_check` on Hermes' own databases), and swap it into place. Only proof of corruption falls back to an older backup. A transient failure retries the newest, because falling back would let a new snapshot outrank it for good.
+2. Decrypt the user's secret files from KV.
+3. Apply their template (first launch), managed config and environment, and select an inference provider.
+4. Open the gate. Hermes starts, and snapshots are allowed from this point on.
 
-### Persistence
+If backups exist and none can be restored, **the container doesn't start**. The user sees an error, and the backups stay as they are. Starting empty would soon snapshot an empty home over their history.
 
-State lives in the container at `/home/hermes/.hermes` (HERMES_HOME); the snapshot tree is `/home/hermes`, which also carries the tiny `hermes` wrapper. The install (code, venv, Node, uv) lives at `/opt/hermes-install` (+ `/opt/uv`), outside the snapshot tree. Backups are written by the SDK through the bound `BACKUP_BUCKET` R2 binding (`localBucket: true`): the container runs `mksquashfs`, the SDK uploads the archive to R2. No presigned URLs, no R2 tokens, and no credentials of any kind exist in the container. Restores are a plain `unsquashfs` extraction into a normal ext4 directory.
+**Snapshot.** `container/af_state.py` builds a staged copy first: SQLite through its backup API (consistent even while Hermes writes), without Hermes' logs and caches, without secrets. The SDK archives that copy. What counts as a secret is Hermes' own list of credential stores, at the home's root and inside each profile. Those files are encrypted into KV separately. **A backup can still hold plaintext credentials:** `config.yaml`, chat history, memories and `workspace/` go in as they are. Treat the bucket as sensitive. KV holds about 12 MB per user; past that the largest files, usually browser data, are left out and logged.
 
-R2 key layout (multi-tenant):
+Hydration, snapshots and pruning for a user run one at a time inside their Durable Object.
+
+**Sleep.** When a container idles past `SLEEP_AFTER`, it takes a final snapshot and stops. If the snapshot fails it stays up and retries, up to three idle cycles. The snapshot cron skips containers with no activity since their last snapshot, so it doesn't hold them awake. An open tab alone doesn't count as activity once the status chip is reporting; see "Keeping a container awake".
+
+R2 layout:
 
 ```
-users/<userId>/backup-handle.json   newest DirectoryBackup handle (restore target)
-users/<userId>/backups-index.json   array of {id, dir, createdAt} (observability only)
-users/<userId>/providers.json       per-user AI Gateway provider config (no secrets)
-active-users.json                  userIds with currently-running containers
-backups/<id>/data.sqsh             SDK-written squashfs archive
-backups/<id>/meta.json             SDK-written metadata
+users/<sub>/backups-index.json   restore source of truth
+backups/<id>/data.sqsh           snapshot archive
+backups/<id>/meta.json           snapshot metadata
+active/<sub>                     marker: this user may have a running container
+config/assignments.json          who gets which template
+templates/<name>/...             templates
 ```
 
-Usable credentials (tunnel token, dashboard session token, gateway JWT) do NOT live in this bucket — since V9 they are in the dedicated `CREDENTIALS_KV` KV namespace under `cred:tunnel:<userId>`, `cred:session:<userId>`, `cred:gwjwt:<userId>`, so third-party R2 backups never carry credentials.
+Retention (`src/prune.ts`) keeps recent snapshots densely and older ones sparsely, and never deletes the newest.
 
-Backup lifecycle:
+## Secrets
 
-- **Restore:** `/api/wake` writes the bootstrap file first (tunnel + dashboard tokens), then calls `restoreLatest()` (restores the newest VALID backup into `/home/hermes`; empty-tree/missing blobs are skipped). No boot gate — `hermes serve` starts immediately on boot; a failed restore does not fail the wake.
-- **Periodic snapshots:** a Worker cron fires every 10 minutes; for each user in `active-users.json` whose container is `running`, a snapshot is taken if the newest backup is older than `SNAPSHOT_INTERVAL_MINUTES` (default 60). Sleeping containers are skipped.
-- **Final snapshots:** `/api/admin/stop` and `/api/admin/destroy` take a best-effort final backup before stopping/destroying.
-- **Retention:** slot-filling retention pruning runs on the `0 */2 * * *` Worker cron for every user in `active-users.json` (also on demand via `POST /api/admin/prune`): newest-first, it keeps one backup per 5-minute slot for backups younger than 2h, one per hourly slot for backups younger than 24h, then the newest 5 distinct calendar-day slots and newest 5 distinct ISO-week slots regardless of age, and never deletes the absolute newest backup; everything else is deleted (`backups/<id>/data.sqsh` + `meta.json`). The SDK backup TTL itself is 365 days, so any backup that survives pruning stays restorable.
-- **Integrity:** restore candidates are validated against their SDK-written `meta.json` (blob must exist and exceed a minimum size, so an empty-tree snapshot can never shadow real data); `createSnapshot` refuses to snapshot an empty tree when history exists.
-
-### Container image
-
-- Base: `cloudflare/sandbox:0.12.14-python`
-- Install (code, venv, Node bundle, uv CPython) lands in `/opt/hermes-install` + `/opt/uv`; `/home/hermes/.hermes` ships empty and only the tiny `hermes` wrapper lives in the snapshot tree
-- Container runs as root at runtime so the SDK can run `mksquashfs`
-- `start-hermes.sh` has no boot gate — `hermes serve` starts immediately on boot; the wake's restore completes during container boot in the common case
-
-## API
-
-All endpoints (except `/health` and `/internal/*`) require a valid Cloudflare Access JWT/`Cf-Access-Token`.
-
-| Endpoint | Purpose |
+| Where | What |
 |---|---|
-| `POST /api/client-init` | Provision (or fetch) the per-user tunnel + hostname + dashboard session token |
-| `GET /api/status` | Whether the user's tunnel is provisioned, and its hostname |
-| `POST /api/wake` | Restore latest backup, write bootstrap/tokens, wake the container |
-| `GET /api/debug/exec` | Run a command in the user's container |
-| `POST /api/admin/stop` | Final backup, then stop the container |
-| `POST /api/admin/destroy` | Final backup, then destroy the container |
-| `GET /api/admin/status` | Container state for a user |
-| `POST /api/admin/snapshot` | Force a snapshot now |
-| `POST /api/admin/restore` | Force-restore the latest backup now |
-| `POST /api/admin/prune` | Run slot-filling retention pruning for a user now |
-| `POST /api/admin/gateway-jwt` | Store the user's gateway Access JWT (used by `setup-client.ps1`) |
+| Worker Secrets | `MASTER_KEY`, `CLOUDFLARE_AI_API_TOKEN`, and secrets listed in the `TEMPLATE_SECRETS` var, which templates can reference as `$NAME`. Provider credentials reach a user's `.env` only, on each boot; they stay out of snapshots |
+| KV, encrypted | Each user's secret files; admin prefills. AES-256-GCM, key derived from `MASTER_KEY` and bound to the KV key |
+| Derived, never stored | Per-user sign-in secrets, via HKDF from `MASTER_KEY` |
 
-## Security Notes
+A Worker holds at most 128 secrets and vars (64 on the free plan), so per-user values can't live in Worker Secrets. This design has no such cap on users. **Back up `MASTER_KEY`**: losing or rotating it makes everything sealed in KV unreadable.
 
-The container environment carries two credentials:
+## Config templates
 
-- **`CLOUDFLARED_TOKEN`** — the per-user Cloudflare Tunnel credential used by `cloudflared tunnel run`.
-- **`HERMES_DASHBOARD_SESSION_TOKEN`** — the per-user dashboard session token.
+A template's main job is to pre-fill inference providers, so a user's first launch can already answer.
 
-Both are visible to any process in the container, including the Hermes agent itself. This is accepted for now because Cloudflare Sandbox is a single-container runtime with no sidecar or separate-privilege model to isolate `cloudflared` from the agent.
+```
+templates/<name>/template.json     what to apply
+templates/<name>/files/...         files copied into the Hermes home on first launch
+```
 
-Possible hardening (not yet implemented): move `CLOUDFLARED_TOKEN` to a restricted file (e.g., `/run/creds.json` with `0400` permissions) and run `cloudflared` as a separate user from the Hermes agent.
+`template.json`:
 
-## Deployment
+| Key | Applies | Who wins |
+|---|---|---|
+| `providers` | Every boot | The template, per provider name |
+| `files` | First time the user gets this template, if the file doesn't exist | The user, afterwards |
+| `config_defaults` | First launch, or when first assigned this template | The user, afterwards |
+| `config_managed` | Every boot | The template |
+| `env` | Every boot; `"$NAME"` reads Worker secret `NAME` if `TEMPLATE_SECRETS` lists it. Removed from `.env` when dropped from the template | The template |
 
-Deploys are made manually with Wrangler from the operator's machine — there is no CI/CD pipeline by design. Deploying requires Cloudflare authentication (`wrangler login`) and a running Docker daemon (the container image is built and pushed at deploy time).
+Agent Flare's own `webapp` and `dashboard.trusted_proxies` keys always win, so a template can't change the port or public URL.
 
-1. **Install dependencies:** `npm install` (Node 22+)
-2. **Authenticate:** `npx wrangler login`
-3. **Create resources** (first deploy only):
-   - `npx wrangler kv namespace create CREDENTIALS_KV` — copy the namespace ID
-   - `npx wrangler r2 bucket create hermes-agent-state`
-4. **Configure:** `cp wrangler.example.jsonc wrangler.jsonc`, then fill in your KV namespace ID, custom domain, and (optionally) SSH authorized keys. `wrangler.jsonc` is gitignored — it carries account-specific values (KV IDs, SSH keys) and must never be committed.
-5. **Set Worker secrets:** `npx wrangler secret put CF_API_TOKEN` (repeat for `ACCESS_AUD_TAG`, `CLOUDFLARE_AI_API_TOKEN` as needed)
-6. **Deploy:** `npx wrangler deploy` — Docker must be running; the `Dockerfile` image is built and pushed to Cloudflare's registry as part of the deploy
+### Providers
 
-### SSH debugging (troubleshooting only)
+Each entry in `providers`:
 
-Sandboxes ship with `ssh.enabled: true` so a running container can be reached with `npx wrangler containers ssh <INSTANCE_ID>`. Get the application ID with `npx wrangler containers list`, then the instance IDs with `npx wrangler containers instances <APP_ID>` (both steps are required — `instances` takes the application ID as an argument, and `ssh` takes the instance ID). The tunnel is authenticated by your Cloudflare account — no public port is exposed. A connection succeeds only if both of the following hold:
+| Field | |
+|---|---|
+| `name` | Lowercase letters, digits and dashes. Not a Hermes built-in such as `openrouter`, which would route to the built-in instead |
+| `mode` | `api_token`: credential is the Worker secret `CLOUDFLARE_AI_API_TOKEN`, shared by everyone, with requests tagged per user. `user_env`: credential comes from the user's `.env` |
+| `base_url` | An `https://` OpenAI-compatible endpoint. For AI Gateway: `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/compat` |
+| `key_env` | The `.env` variable holding the credential |
+| `gateway_id` | `api_token` only. Sent as `cf-aig-gateway-id` |
+| `model` | The model to select. Defaults to the first of `models` |
+| `models` | Model IDs, with `context_length` and `max_length` |
+| `api_mode`, `discover_models` | Optional; defaults `chat_completions`, `false` |
+| `extra_headers` | Optional. A header carrying a credential must read it as `"Bearer ${VAR}"`, with `VAR` set through `env`, because `config.yaml` goes in snapshots |
 
-- **sshd runs inside the container.** The image installs `openssh-server` and `start-hermes.sh` launches it. An image without an SSH server makes the tunnel useless.
-- **Your public key is hydrated via `authorized_keys`** in the container config (`ssh-ed25519` keys only). With no key entry, the tunnel opens but no login succeeds. See the [Cloudflare Containers SSH docs](https://developers.cloudflare.com/containers/) before enabling.
+**Selection.** Hermes uses only the selected provider, so listing one isn't enough. On every boot, if the user has no model selected, the first provider whose `key_env` has a value is selected. A choice the user makes in Hermes is never replaced. A selection Agent Flare made moves on if its credential is withdrawn.
 
-SSH is a debugging affordance, not a feature — disable it by setting `ssh.enabled: false` in `wrangler.jsonc`.
+**A missing secret** never stops a container. That provider is skipped, the next one with a credential is selected, and if none has one, Hermes opens on its own "connect a provider" setup. Nothing is selected that couldn't answer. `/__af/admin/users` shows each user's `config.inference` (`selected`, `missing`) and `config.warnings`, by variable name only. Once the secret is set, the provider is selected at that user's next boot.
+
+Three ways to supply a credential:
+
+| Credential | Provider | Set it with |
+|---|---|---|
+| Shared, Cloudflare | `mode: "api_token"` | `npx wrangler secret put CLOUDFLARE_AI_API_TOKEN` |
+| Shared, any other | `mode: "user_env"`, plus `"env": {"KEY_ENV": "$NAME"}` | `npx wrangler secret put NAME`, and add `NAME` to `TEMPLATE_SECRETS` |
+| Per user | `mode: "user_env"` | The admin prefill below, or the user in Hermes |
+
+See `templates/example/` and `templates/assignments.example.json`. Your real templates are gitignored, because this repo may be public. They hold no secrets, only references.
+
+```bash
+cp -r templates/example templates/mine                 # replace each YOUR_ value
+node scripts/templates.mjs check templates/mine        # validate, refuse placeholders and secrets, list secrets needed
+node scripts/templates.mjs push templates/mine         # upload
+node scripts/templates.mjs assign assignments.json     # who gets what
+```
+
+`check` needs Node 22.18 or later. Assignment order: exact email, then Access group, then email domain, then `default`.
+
+To set a personal value before someone's first login, such as their own API key:
+
+```bash
+curl -X PUT https://agents.example.com/__af/admin/prefill/someone@example.com \
+  -H "cookie: CF_Authorization=$TOKEN" -d '{"OWN_PROVIDER_API_KEY": "..."}'
+```
+
+It's used only while the user hasn't set that variable themselves.
+
+## Admin screens
+
+`/__af/admin`, for people in `ADMIN_EMAILS`: users with status and backups, a user's effective config, roles, per-user overrides, keys, and an audit trail.
+
+A role is a template, so the screens and `scripts/templates.mjs` work on the same thing. Precedence: per-user override, then assigned role, then group, domain and default assignments. Roles set which models appear in the picker, the default, and the provider settings. They make choosing easy and aren't access limits: a provider key is in each user's `.env`, so their agent can use whatever it allows.
+
+An admin can also see and control a user's container from their page, and download a backup: streamed from R2 and recorded in the audit trail. A download holds that person's chats and files, and any passwords or keys in them. There's an optional limit on containers awake at once, 0 for none, checked only when starting one.
+
+Keys are write-only, and sealed in KV. Screens show only whether one is set and when it changed. Order: user, then role, then the Worker secret the provider names.
+
+Every change applies at the user's next boot, and the Users screen shows who's waiting. A user's page can apply it now: that snapshots and then restarts, and if the snapshot fails, nothing changes. A role's default model follows a role change only if the user hasn't picked their own. `config_managed` reapplies every boot; `config_defaults` applies once and is then the user's.
+
+The picker shows a model's cost at the start of its name: `..$` low, `.$$` medium, `$$$` high, `*$$$` far above the rest. It's ordinary Hermes config: a model alias maps the shown name to the real ID. The list is `config/model-tiers.json`, shared by every role; edit it with `scripts/templates.mjs tiers` (`low`, `medium`, `high`, `premium`) or by typing the mark before the model in a role's model list. A model with no entry shows no mark.
+
+A picker name reads like `$$$ Claude Haiku 4.5 (200k)` or `.$$ CF Qwen 3.8 27b (262k)`: mark, `CF` for a Workers AI model, display name, context length. The display name is the optional `name` on the model in the template, or the third item after the ID on a role form line; without one it comes from the ID, with spaces for hyphens. Only the real ID goes to the API. The gaps in a name are U+2800, a blank that isn't whitespace, because the webapp refuses a pick containing a real space once a chat is running. The model in use shows under its real name.
+
+Marks use a blended price per million tokens, (3 x input + output) / 4: low under $0.50, medium up to $1.50, high up to $3, premium above $3. Workers AI models use Cloudflare's prices, and Claude models use Anthropic's API prices. Haiku 5.5 uses its price for prompts over 100,000 tokens, because agent sessions can reach that.
+
+New homes start in dark mode, through Hermes's own preferences file. A user can change it, and a choice they've made is never replaced.
+
+## Keeping a container awake
+
+A chip in Hermes's status bar shows the container's state. It's an ordinary Hermes desktop plugin (`container/desktop-plugins/agent-flare/plugin.js`), copied into the home at boot; if it fails, there's no chip and the fallback below applies. It shows a dot and the minutes until the next stop, such as `● 12m`: green while you're active or on a lease, orange when idle, and red for `● Stopped, tap to restart`. A tap offers Keep awake 1 hour, Keep awake 2 hours, and Stop.
+
+- **Idle is 100% chip led.** The chip reports a tap, a keystroke, a page load, and an agent mid-turn (Hermes's `busyBySession`), at most once a minute. Nothing else counts: not requests, polling, sockets or webapp writes. A container gets 30 minutes (`SLEEP_AFTER`) when it starts, so a chip that never reports means a stop 30 minutes later. The time is kept in Durable Object storage, because the object can restart while its container keeps running. The SDK's alarm loop checks it, up to 3 minutes late.
+- **If the page closes while an agent works,** reports stop, and the container stops about 30 minutes later, ending the turn. Keep awake holds it up without a page.
+- **The lease lives in the Durable Object.** Only a tap renews it, 1 or 2 hours from that tap and no other value. At its end, within 5 minutes, the snapshot cron saves and stops the container, even with a tab open. The chip warns for the last 10 minutes.
+- **12-hour backstop.** A container stops `FORGOTTEN_TAB_CAP_HOURS` (default 12) after the last real tap or keystroke, even with an agent still busy.
+- **Only a person starts a container.** An open tab's API calls and socket retries get a 503 and can't wake it; left alone, they did within seconds. Reloading the page does, which is what a tap on `Stopped, tap to restart` does. After a lease or cap ends, or a tap on Stop, loading the page offers a Wake button first.
+- **Stop** takes a snapshot first. If that fails, the container stays up.
+
+A running agent turn ends when the container stops.
+
+## Cross-site writes: a required WAF rule
+
+The Worker doesn't check where a write came from. **Add this custom WAF rule on your hostname before deploying, action Block:**
+
+```
+(starts_with(http.request.uri.path, "/__af/") and not http.request.method in {"GET" "HEAD"} and any(http.request.headers["sec-fetch-site"][*] in {"cross-site" "same-site"}))
+```
+
+Without it, another site can make a logged-in user's browser send writes to `/__af/*`, such as Stop or an admin change. It relies on the browser's `Sec-Fetch-Site` header.
+
+## Routes
+
+Everything is behind Access. Anything not listed goes to the caller's Hermes webapp.
+
+| Route | Does |
+|---|---|
+| `GET /__af/status` | Wakes the caller's container; reports its state |
+| `POST /__af/snapshot` | Snapshots the caller's container |
+| `POST /__af/stop` | Final snapshot, then stop |
+| `GET /__af/lease` | The chip's read: state and when it stops. Can't wake a container |
+| `POST /__af/lease` | `{"hours": 1 or 2}`: keep awake |
+| `POST /__af/lease/stop` | Snapshot, then stop until woken |
+| `POST /__af/activity` | The chip reporting a tap or keystroke |
+| `POST /__af/wake` | Allow it to start again |
+| `/__af/admin` | Admins: the screens above |
+| `GET /__af/admin/users` | Admins: all users, their backups, and their selected inference provider |
+| `POST /__af/admin/users/:sub/{stop,snapshot,prune}` | Admins: act on a user |
+| `PUT /__af/admin/prefill/:email` | Admins: pre-set a user's `.env` values |
+
+Admins are listed in the `ADMIN_EMAILS` var.
+
+## Deploying
+
+See [ONBOARDING.md](ONBOARDING.md).
+
+## Debugging a container
+
+SSH is off: the config sets `ssh.enabled` to `false`, and the image has no SSH server. Use `npx wrangler tail` and the admin user page first.
+
+To open a shell, follow Cloudflare's [SSH guide](https://developers.cloudflare.com/containers/guides/ssh/), with the settings in the [Wrangler SSH reference](https://developers.cloudflare.com/workers/wrangler/configuration/#ssh):
+
+1. In your Wrangler config, set `containers[0].ssh.enabled` to `true` and add your key. Only `ssh-ed25519` keys work:
+   ```jsonc
+   "ssh": { "enabled": true },
+   "authorized_keys": [{ "name": "you", "public_key": "ssh-ed25519 AAAA..." }]
+   ```
+2. Deploy, and make sure the container is running. SSH won't start a stopped one, and a session won't keep one awake.
+3. Find the instance with `npx wrangler containers instances`, then connect with `npx wrangler containers ssh <INSTANCE_ID>`.
+
+The guide doesn't say whether an image needs its own SSH server. If the connection fails, try adding `openssh-server` to the `Dockerfile` and starting `sshd` in `start-hermes.sh`.
+
+Containers run as root, so a shell can read that user's `.env`, chats and credentials. Keep `"enabled": false` in the config when you're done: Cloudflare's docs and Wrangler's schema disagree on the default, so don't just delete the line.
+
+## Testing
+
+```bash
+npm test                      # Worker unit tests
+tests/container/run.sh        # clean image, real webapp behind a simulated proxy, a chat turn to a stub provider, state round trip
+node tests/e2e/run.mjs        # wrangler dev: Worker, Durable Object, container, local R2 and KV
+```
+
+The end-to-end test simulates Access with a locally generated signing key. It covers every route refusing absent, forged, wrong-audience, wrong-issuer and expired tokens, isolation between users, the starting page, WebSockets, templates, provider selection with and without its secret, restore after stop, fallback from corrupt backups, failing closed when every backup is bad, and idle sleep. It can't cover real Access login, production R2 or production container timing.
+
+The Hermes version is pinned in the `Dockerfile` (`HERMES_COMMIT`), because the sign-in provider uses Hermes internals. Rerun `tests/container/run.sh` when bumping it.
+
+## Limits
+
+- A container sleeping means Hermes' own scheduled jobs and messaging gateways don't run. Raise `SLEEP_AFTER` for those, at higher cost.
+- If the status chip isn't running, a forgotten open tab keeps a container up until the cap.
+- Only the Hermes home survives a restart. Agents default to working in `<home>/workspace` for that reason. Files elsewhere in the container, such as `~/.gitconfig` for the OS user, are lost; `terminal.home_mode: profile` in `config.yaml` keeps those under the home too.
 
 ## License
 
@@ -132,7 +240,6 @@ This project is licensed under the MIT License.
 Portions of this project are derived from [**hermes-flare**](https://github.com/carimura/hermes-flare) by Carter Morgan, which is licensed under the Apache License, Version 2.0. Specifically:
 
 - The R2-backed squashfs state persistence pattern (`createBackup` / `restoreBackup`)
-- The sentinel-file integrity check approach for ephemeral container state hydration
 - The separation of install path (`/opt/hermes-install`) from mutable state (`/home/hermes`)
 
 The Apache License, Version 2.0 applies to those derived portions. A copy of the Apache 2.0 license is included in this repository for compliance. All original work in this project is licensed under MIT.

@@ -1,0 +1,30 @@
+{
+  "files": ["SOUL.md"],
+  "config_defaults": {},
+  "config_managed": {},
+  "env": {},
+  "providers": [
+    {
+      "name": "team-gateway",
+      "mode": "api_token",
+      "base_url": "https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT_ID/YOUR_GATEWAY_ID/compat",
+      "key_env": "TEAM_GATEWAY_API_KEY",
+      "gateway_id": "YOUR_GATEWAY_ID",
+      "api_mode": "chat_completions",
+      "model": "@cf/qwen/qwen3.8-27b",
+      "models": {
+        "@cf/qwen/qwen3.8-27b": { "context_length": 262144, "max_length": 8192 }
+      }
+    },
+    {
+      "name": "own-key",
+      "mode": "user_env",
+      "base_url": "https://YOUR_OPENAI_COMPATIBLE_HOST/v1",
+      "key_env": "OWN_PROVIDER_API_KEY",
+      "api_mode": "chat_completions",
+      "models": {
+        "YOUR_MODEL_ID": { "context_length": 128000 }
+      }
+    }
+  ]
+}

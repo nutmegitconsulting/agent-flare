@@ -1,318 +1,223 @@
-import type { Sandbox } from "@cloudflare/sandbox";
-import type { KVNamespace } from "@cloudflare/workers-types";
-import { getGatewayJwt, putGatewayJwt } from "./credentials";
-
 /**
- * Per-user AI Gateway custom providers (V8).
+ * Inference providers, delivered through config templates: what makes a user's first launch able to
+ * answer without any setup.
  *
- * Renders the worker-owned `custom_providers:` section of the container's
- * $HERMES_HOME/config.yaml + the matching key_env entries in .env, from
- * per-user R2 data. Two auth modes per provider entry:
+ * Validates a template's `providers` list and turns it into config.yaml `custom_providers` entries,
+ * the .env values they read, and an ordered list of candidates. The container selects the first
+ * candidate whose credential is present (af_state.py), because a listed provider isn't a selected one:
+ * Hermes uses `model.provider`, and without it reports that no provider is connected.
  *
- * - `jwt`: the user's Cloudflare Access JWT is the credential. The gateway
- *   has a custom domain + Access enabled; the Access edge verifies the JWT
- *   sent as `Authorization: Bearer *** (exactly what hermes' openai client
- *   does with a key_env value) and attaches cf.user_id itself (derived from
- *   the JWT sub claim — never client-supplied). No custom headers needed.
- * - `api_token`: the account-scoped REST endpoint
- *   (api.cloudflare.com/client/v4/accounts/<ID>/ai/v1). The credential is a
- *   CF API token with Workers AI:Read — stored as the WORKER secret
- *   CLOUDFLARE_AI_API_TOKEN (account-level, least privilege, shared across
- *   users) and routed per user via the cf-aig-gateway-id header.
+ * Credentials never go in the template:
  *
- * R2 layout (BACKUP_BUCKET) — config only, no secrets:
- *   users/<userId>/providers.json   worker-managed config (no secrets inside)
- * The jwt-mode session credential lives in KV (cred:gwjwt:<userId>), NOT in
- * the backup bucket (see ./credentials.ts).
+ * - `api_token`: the shared credential is the Worker secret CLOUDFLARE_AI_API_TOKEN. Requests are tagged
+ *   with the gateway and the user through cf-aig-* headers.
+ * - `user_env`: the value comes from .env: an admin prefill, the user's own value, or the template's
+ *   `env` with "$NAME" reading a Worker secret.
  */
 
 export interface ProviderModelInfo {
   context_length?: number;
   max_length?: number;
+  /** Shown in the picker. Never sent to the API. */
+  name?: string;
 }
 
 export interface GatewayProviderEntry {
-  /** Display name — must match the model prefix `@<name>/`. */
+  /** What `model.provider` names: lowercase letters, digits and dashes. */
   name: string;
-  /** `jwt` (custom domain, Access) or `api_token` (account-scoped endpoint). */
-  mode: "jwt" | "api_token";
-  /** jwt mode: `https://<gateway-custom-domain>/openai/v1`.
-   *  api_token mode: `https://api.cloudflare.com/client/v4/accounts/<ID>/ai/v1`. */
+  mode: "api_token" | "user_env";
   base_url: string;
-  /** .env variable name holding the credential. Entries must not collide. */
+  /** .env variable holding the credential. Entries must not collide. */
   key_env: string;
-  /** api_token mode only: gateway slug for the cf-aig-gateway-id header. */
+  /** api_token mode: gateway slug for the cf-aig-gateway-id header. */
   gateway_id?: string;
-  /** Wire protocol. Default `chat_completions`. Valid: chat_completions,
-   *  responses, anthropic, bedrock_converse, auto. */
+  /** Worker secret to use when no key is sealed for this user or role. api_token default: CLOUDFLARE_AI_API_TOKEN. */
+  credential?: string;
+  /** chat_completions (default), responses, anthropic, bedrock_converse or auto. */
   api_mode?: string;
-  /** Pass model discovery through to hermes. Default `false`. */
   discover_models?: boolean;
-  /** Extra HTTP headers (jwt mode: none expected; api_token mode: the
-   *  cf-aig-gateway-id header is added automatically from gateway_id). */
   extra_headers?: Record<string, string>;
-  /** Model id -> context/max length. */
   models: Record<string, ProviderModelInfo>;
-  /** Per-entry default model — rendered as `model:` inside the entry (the
-   *  field hermes' _VALID_CUSTOM_PROVIDER_FIELDS actually accepts). The
-   *  first entry's value also seeds the top-level `model:` if the
-   *  container's config has none. */
+  /** Model to select. Defaults to the first of `models`. */
   model?: string;
 }
 
-const PROVIDERS_KEY_SUFFIX = "providers.json";
-const CONFIG_YAML = "/home/hermes/.hermes/config.yaml";
-const ENV_FILE = "/home/hermes/.hermes/.env";
-const BANNER = "# >>> hermes-cloudflare worker-managed custom_providers (do not edit)";
-const BANNER_END = "# <<< end worker-managed custom_providers";
-
-function providersKey(userId: string): string {
-  return `users/${userId}/${PROVIDERS_KEY_SUFFIX}`;
+/** A provider the container may select, once `key_env` has a value in .env. */
+export interface ProviderCandidate {
+  provider: string;
+  model: string;
+  key_env: string;
 }
 
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
+export type ModelTier = "low" | "medium" | "high" | "premium";
+export type ModelTiers = Record<string, ModelTier>;
+/**
+ * What each model costs, shown at the start of its name in Hermes's picker. Premium is for a model that costs far
+ * more than the rest of the list.
+ */
+export const TIER_MARKS: Record<ModelTier, string> = { low: "..$", medium: ".$$", high: "$$$", premium: "*$$$" };
 
-const MODES = new Set(["jwt", "api_token"]);
+/**
+ * The name a model has in the picker, such as "$$$ Claude Haiku 4.5 (200k)". A Hermes model alias maps it back to
+ * the real ID, which is all the API ever sees. Workers AI models start with CF. The gaps are U+2800, a blank that
+ * isn't whitespace: the webapp splits a pick on whitespace, and refuses a real space in a running session.
+ */
+export function modelLabel(id: string, tier: ModelTier | undefined, info: ProviderModelInfo = {}): string {
+  const name = info.name?.trim() || id.split("/").pop()!.replace(/-/g, " ");
+  return [tier && TIER_MARKS[tier], id.startsWith("@cf/") && "CF", name, info.context_length && `(${contextText(info.context_length)})`]
+    .filter(Boolean).join(" ").replace(/\s+/g, "\u2800");
+}
+
+function contextText(tokens: number): string {
+  if (tokens >= 1_000_000) return `${Number((tokens / 1_000_000).toFixed(1))}M`;
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
+}
+
 const API_MODES = new Set(["chat_completions", "responses", "anthropic", "bedrock_converse", "auto"]);
 const ENV_VAR_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+/** Hermes routes these names to its built-in provider, whatever the entry says. */
+const BUILTIN_PROVIDER_NAMES = new Set([
+  "ai-gateway", "anthropic", "bedrock", "custom", "deepseek", "gemini", "lmstudio", "minimax", "nous",
+  "openai", "openai-codex", "openrouter", "xai",
+]);
+const CREDENTIAL_HEADER_RE = /authorization|api[-_]?key|token|secret|password/i;
+/** A header that carries a credential has to read it from .env: config.yaml is backed up to R2. */
+const ENV_REFERENCE_RE = /\$\{[A-Za-z_][A-Za-z0-9_]*\}/;
 
-export function validateProviders(data: unknown): { ok: true; entries: GatewayProviderEntry[] } | { ok: false; error: string } {
-  if (!Array.isArray(data)) return { ok: false, error: "body must be a JSON array of provider entries" };
-  if (data.length === 0) return { ok: false, error: "provider list must not be empty" };
+export function validateProviders(
+  data: unknown,
+): { ok: true; entries: GatewayProviderEntry[] } | { ok: false; error: string } {
+  if (!Array.isArray(data)) return { ok: false, error: "must be an array of provider entries" };
   const entries: GatewayProviderEntry[] = [];
   const seenKeyEnv = new Set<string>();
   for (let i = 0; i < data.length; i++) {
     const e = data[i] as Partial<GatewayProviderEntry>;
-    const at = (n: number) => `entry[${n}]`;
-    if (typeof e !== "object" || e === null) return { ok: false, error: `${at(i)} must be an object` };
-    if (typeof e.name !== "string" || !e.name.trim()) return { ok: false, error: `${at(i)}.name is required (string)` };
-    if (e.mode !== "jwt" && e.mode !== "api_token") return { ok: false, error: `${at(i)}.mode must be "jwt" or "api_token"` };
-    if (typeof e.base_url !== "string" || !/^https:\/\//.test(e.base_url)) return { ok: false, error: `${at(i)}.base_url must be an https:// URL` };
-    if (typeof e.key_env !== "string" || !ENV_VAR_RE.test(e.key_env)) return { ok: false, error: `${at(i)}.key_env must be a valid env var name` };
-    if (seenKeyEnv.has(e.key_env)) return { ok: false, error: `${at(i)}.key_env "${e.key_env}" is used by more than one entry` };
+    const at = `entry[${i}]`;
+    if (typeof e !== "object" || e === null) return { ok: false, error: `${at} must be an object` };
+    if (typeof e.name !== "string" || !NAME_RE.test(e.name)) {
+      return { ok: false, error: `${at}.name must be lowercase letters, digits and dashes` };
+    }
+    if (BUILTIN_PROVIDER_NAMES.has(e.name)) {
+      return { ok: false, error: `${at}.name "${e.name}" is a Hermes built-in provider; choose another` };
+    }
+    if (e.mode !== "api_token" && e.mode !== "user_env") {
+      return { ok: false, error: `${at}.mode must be "api_token" or "user_env"` };
+    }
+    if (typeof e.base_url !== "string" || !/^https:\/\//.test(e.base_url)) {
+      return { ok: false, error: `${at}.base_url must be an https:// URL` };
+    }
+    if (typeof e.key_env !== "string" || !ENV_VAR_RE.test(e.key_env)) {
+      return { ok: false, error: `${at}.key_env must be a valid env var name` };
+    }
+    if (seenKeyEnv.has(e.key_env)) return { ok: false, error: `${at}.key_env "${e.key_env}" is already used` };
     seenKeyEnv.add(e.key_env);
     if (e.mode === "api_token" && (typeof e.gateway_id !== "string" || !e.gateway_id.trim())) {
-      return { ok: false, error: `${at(i)}.gateway_id is required for mode=api_token` };
+      return { ok: false, error: `${at}.gateway_id is required for mode=api_token` };
     }
-    if (e.api_mode !== undefined && (typeof e.api_mode !== "string" || !API_MODES.has(e.api_mode))) {
-      return { ok: false, error: `${at(i)}.api_mode must be one of: ${[...API_MODES].join(", ")}` };
+    if (e.credential !== undefined && (typeof e.credential !== "string" || !ENV_VAR_RE.test(e.credential) || e.credential === "MASTER_KEY")) {
+      return { ok: false, error: `${at}.credential must name a Worker secret other than MASTER_KEY` };
+    }
+    if (e.api_mode !== undefined && !API_MODES.has(e.api_mode)) {
+      return { ok: false, error: `${at}.api_mode must be one of: ${[...API_MODES].join(", ")}` };
     }
     if (e.discover_models !== undefined && typeof e.discover_models !== "boolean") {
-      return { ok: false, error: `${at(i)}.discover_models must be a boolean` };
+      return { ok: false, error: `${at}.discover_models must be a boolean` };
     }
-    if (e.extra_headers !== undefined && (typeof e.extra_headers !== "object" || e.extra_headers === null || Array.isArray(e.extra_headers))) {
-      return { ok: false, error: `${at(i)}.extra_headers must be a string->string object` };
+    if (e.extra_headers !== undefined &&
+        (typeof e.extra_headers !== "object" || e.extra_headers === null || Array.isArray(e.extra_headers))) {
+      return { ok: false, error: `${at}.extra_headers must be an object` };
     }
-    if (typeof e.models !== "object" || e.models === null || Array.isArray(e.models) || Object.keys(e.models).length === 0) {
-      return { ok: false, error: `${at(i)}.models must be a non-empty object` };
+    for (const [header, value] of Object.entries(e.extra_headers ?? {})) {
+      if (typeof value !== "string") return { ok: false, error: `${at}.extra_headers.${header} must be a string` };
+      if (CREDENTIAL_HEADER_RE.test(header) && !ENV_REFERENCE_RE.test(value)) {
+        return { ok: false, error: `${at}.extra_headers.${header} looks like a credential; use "\${ENV_VAR}"` };
+      }
+    }
+    if (typeof e.models !== "object" || e.models === null || Array.isArray(e.models) ||
+        Object.keys(e.models).length === 0) {
+      return { ok: false, error: `${at}.models must be a non-empty object` };
+    }
+    for (const [id, info] of Object.entries(e.models)) {
+      if (info?.name !== undefined && (typeof info.name !== "string" || !/^[\w .+()-]{1,64}$/.test(info.name))) {
+        return { ok: false, error: `${at}.models "${id}" name must be up to 64 letters, digits, spaces and . + ( ) - _` };
+      }
+    }
+    if (e.model !== undefined && !(e.model in e.models) && e.discover_models !== true) {
+      return { ok: false, error: `${at}.model "${e.model}" is not in models` };
     }
     entries.push({
-      name: e.name.trim(),
-      mode: e.mode as "jwt" | "api_token",
+      name: e.name,
+      mode: e.mode,
       base_url: e.base_url,
       key_env: e.key_env,
       ...(e.gateway_id ? { gateway_id: e.gateway_id.trim() } : {}),
+      ...(e.credential ? { credential: e.credential } : {}),
       ...(e.api_mode ? { api_mode: e.api_mode } : {}),
       ...(e.discover_models !== undefined ? { discover_models: e.discover_models } : {}),
-      ...(e.extra_headers ? { extra_headers: e.extra_headers as Record<string, string> } : {}),
-      models: e.models as Record<string, ProviderModelInfo>,
+      ...(e.extra_headers ? { extra_headers: e.extra_headers } : {}),
+      models: e.models,
       ...(e.model ? { model: e.model } : {}),
     });
   }
   return { ok: true, entries };
 }
 
-// ---------------------------------------------------------------------------
-// KV storage for the gateway JWT — credentials never live in the backup
-// bucket (third-party replicated). providers.json (no secrets) stays in R2.
-// ---------------------------------------------------------------------------
-
-export async function loadProviders(bucket: R2Bucket, userId: string): Promise<GatewayProviderEntry[] | null> {
-  const obj = await bucket.get(providersKey(userId));
-  if (!obj) return null;
-  const parsed = validateProviders(await obj.json().catch(() => null));
-  if (!parsed.ok) return null; // corrupt/legacy file — treat as absent, log at call site
-  return parsed.entries;
+export interface RenderedProviders {
+  customProviders: Record<string, unknown>[];
+  env: Record<string, string>;
+  /** config.yaml `model_aliases`: label -> the real model. */
+  modelAliases: Record<string, { model: string; provider: string; base_url: string }>;
+  candidates: ProviderCandidate[];
+  warnings: string[];
 }
 
-export async function saveProviders(bucket: R2Bucket, userId: string, entries: GatewayProviderEntry[]): Promise<void> {
-  await bucket.put(providersKey(userId), JSON.stringify(entries, null, 2), {
-    httpMetadata: { contentType: "application/json" },
-  });
-}
-
-export async function storeGatewayJwt(kv: KVNamespace, userId: string, jwt: string): Promise<void> {
-  await putGatewayJwt(kv, userId, jwt);
-}
-
-export async function loadGatewayJwt(kv: KVNamespace, userId: string): Promise<string | null> {
-  const creds = await getGatewayJwt(kv, userId);
-  return creds?.jwt ?? null;
-}
-
-// ---------------------------------------------------------------------------
-// YAML rendering
-// ---------------------------------------------------------------------------
-
-function yamlScalar(v: unknown): string {
-  const s = String(v);
-  if (/^[A-Za-z0-9._@/-]+$/.test(s) && !/^\d+$/.test(s)) return s;
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
-
-/** Render the worker-managed custom_providers block (2-space base indent). */
-export function renderCustomProviders(entries: GatewayProviderEntry[], env: { aiApiToken: string; gatewayJwt: string | null }): {
-  yaml: string;
-  envLines: Record<string, string>;
-  defaultModel: string | null;
-  errors: string[];
-} {
-  const lines: string[] = [BANNER, "custom_providers:"];
-  const envLines: Record<string, string> = {};
-  const errors: string[] = [];
-  let defaultModel: string | null = null;
+/**
+ * `user` tags api_token requests with the caller's identity (cf-aig-metadata), so AI Gateway
+ * analytics and logs stay per user even though the credential is shared.
+ * `keys` holds the resolved credential per provider name (see credentials.ts). They reach .env only.
+ */
+export function renderProviders(
+  entries: GatewayProviderEntry[], keys: Record<string, string>, user: string, tiers: ModelTiers = {},
+): RenderedProviders {
+  const customProviders: Record<string, unknown>[] = [];
+  const env: Record<string, string> = {};
+  const warnings: string[] = [];
+  const modelAliases: RenderedProviders["modelAliases"] = {};
+  const candidates: ProviderCandidate[] = [];
   for (const e of entries) {
-    let credential: string;
-    switch (e.mode) {
-      case "jwt":
-        credential = env.gatewayJwt || "";
-        break;
-      case "api_token":
-        credential = env.aiApiToken;
-        break;
+    if (e.mode === "api_token") {
+      if (!keys[e.name]) {
+        warnings.push(`provider "${e.name}": no key is set, and Worker secret ${e.credential ?? "CLOUDFLARE_AI_API_TOKEN"} is not set; skipped`);
+        continue;
+      }
+      env[e.key_env] = keys[e.name];
+    } else if (keys[e.name]) {
+      env[e.key_env] = keys[e.name];
     }
-    if (!credential) {
-      errors.push(
-        e.mode === "jwt"
-          ? `provider "${e.name}" (jwt): no Access JWT on file — set it with POST /api/admin/gateway-jwt; entry skipped`
-          : `provider "${e.name}" (api_token): worker secret CLOUDFLARE_AI_API_TOKEN not set; entry skipped`,
-      );
-      continue;
-    }
-    envLines[e.key_env] = credential;
-    lines.push(`  - name: ${yamlScalar(e.name)}`);
-    lines.push(`    base_url: ${yamlScalar(e.base_url)}`);
-    lines.push(`    key_env: ${yamlScalar(e.key_env)}`);
-    if (e.model) lines.push(`    model: ${yamlScalar(e.model)}`);
-    lines.push(`    api_mode: ${yamlScalar(e.api_mode || "chat_completions")}`);
-    lines.push(`    discover_models: ${e.discover_models === true ? "true" : "false"}`);
     const headers: Record<string, string> = { ...e.extra_headers };
-    if (e.mode === "api_token" && e.gateway_id) headers["cf-aig-gateway-id"] = e.gateway_id;
-    if (Object.keys(headers).length) {
-      lines.push(`    extra_headers:`);
-      for (const [k, v] of Object.entries(headers)) lines.push(`      ${yamlScalar(k)}: ${yamlScalar(v)}`);
+    if (e.mode === "api_token" && e.gateway_id) {
+      headers["cf-aig-gateway-id"] = e.gateway_id;
+      headers["cf-aig-metadata"] = JSON.stringify({ user });
     }
-    lines.push(`    models:`);
-    for (const [modelId, info] of Object.entries(e.models)) {
-      const fields: string[] = [];
-      if (typeof info?.context_length === "number") fields.push(`context_length: ${info.context_length}`);
-      if (typeof info?.max_length === "number") fields.push(`max_length: ${info.max_length}`);
-      if (fields.length === 0) continue;
-      lines.push(`      ${yamlScalar(modelId)}:`);
-      for (const f of fields) lines.push(`        ${f}`);
+    const models: Record<string, ProviderModelInfo> = {};
+    for (const [id, info] of Object.entries(e.models)) {
+      const tier = tiers[id];
+      const label = (tier && TIER_MARKS[tier]) || info.name ? modelLabel(id, tier, info) : id;
+      models[label in modelAliases ? id : label] = info;
+      if (label !== id && !(label in modelAliases)) modelAliases[label] = { model: id, provider: e.name, base_url: e.base_url };
     }
-    if (e.model && !defaultModel) defaultModel = e.model;
+    customProviders.push({
+      name: e.name,
+      base_url: e.base_url,
+      key_env: e.key_env,
+      ...(e.model ? { model: e.model } : {}),
+      api_mode: e.api_mode ?? "chat_completions",
+      discover_models: e.discover_models === true,
+      ...(Object.keys(headers).length ? { extra_headers: headers } : {}),
+      models,
+    });
+    candidates.push({ provider: e.name, model: e.model ?? Object.keys(e.models)[0], key_env: e.key_env });
   }
-  lines.push(BANNER_END);
-  return { yaml: lines.join("\n"), envLines, defaultModel, errors };
-}
-
-/**
- * Replace (or append) the bannered custom_providers section. Everything
- * outside the banner is preserved byte-for-byte.
- */
-export function mergeCustomProvidersSection(configYaml: string, newSection: string): string {
-  const lines = configYaml.split("\n");
-  const start = lines.indexOf(BANNER);
-  const end = lines.indexOf(BANNER_END);
-  if (start !== -1 && end !== -1 && end >= start) {
-    const next = [...lines.slice(0, start), newSection, ...lines.slice(end + 1)];
-    return next.join("\n");
-  }
-  const base = configYaml.replace(/\n*$/, "");
-  return `${base ? base + "\n" : ""}\n${newSection}\n`;
-}
-
-// ---------------------------------------------------------------------------
-// Injection into the container
-// ---------------------------------------------------------------------------
-
-export interface InjectResult {
-  providersIngested: number;
-  providersWritten: number;
-  errors: string[];
-}
-
-/**
- * Merge providers into the container's config.yaml + .env.
- *
- * Called from /api/wake AFTER restoreLatest, so the restored tree's
- * config.yaml/.env cannot clobber the injected section (no boot gate since
- * G1 — the wake's container calls complete during container boot in the
- * common case).
- * A failure here must not fail the wake — the caller try/catches and
- * surfaces `providersError` in the response (container boots without the
- * custom providers, same as today).
- */
-export async function injectProviders(sandbox: Sandbox, kv: KVNamespace, bucket: R2Bucket, userId: string, aiApiToken: string): Promise<InjectResult> {
-  const stored = await loadProviders(bucket, userId);
-  if (!stored) return { providersIngested: 0, providersWritten: 0, errors: [] };
-
-  const gatewayJwt = await loadGatewayJwt(kv, userId);
-  const { yaml, envLines, defaultModel, errors } = renderCustomProviders(stored, { aiApiToken, gatewayJwt });
-
-  // 1. config.yaml — read, merge the bannered section, write back (SDK
-  //    writeFile primitive).
-  let config: string;
-  try {
-    const res = await sandbox.exec(`cat ${CONFIG_YAML} 2>/dev/null || true`);
-    config = res.stdout || "";
-  } catch (e: any) {
-    throw new Error(`read ${CONFIG_YAML} failed: ${e?.message || e}`);
-  }
-  let merged = mergeCustomProvidersSection(config, yaml);
-  if (defaultModel) {
-    // Seed the TOP-LEVEL model (column 0) from the first entry's `model`
-    // when the config has none — per-entry `    model:` lines are indented,
-    // so the column-0 anchor is what distinguishes the two. A snapshot's
-    // own top-level model always wins (never overridden).
-    if (!/^model\s*:/m.test(merged)) {
-      merged = `model: ${yamlScalar(defaultModel)}\n` + merged;
-    }
-  }
-  await sandbox.writeFile(CONFIG_YAML, merged);
-
-  // 2. .env — upsert each key_env with python3 (present in the image; avoids
-  //    shell-quoting edge cases). Create the file if hermes hasn't run yet;
-  //    the CMD's dashboard-token watcher appends to this same file, so
-  //    upserts are idempotent.
-  const py = `
-import re
-path = ${JSON.stringify(ENV_FILE)}
-updates = ${JSON.stringify(envLines)}
-try:
-    with open(path) as f:
-        lines = f.read().splitlines()
-except FileNotFoundError:
-    lines = []
-# Drop any existing line for a key we are setting, then append the fresh
-# value — unconditional, so a replaced key never vanishes.
-out = [line for line in lines if not re.match(r"^(?:" + "|".join(re.escape(k) for k in updates) + r")=" , line)]
-out.extend(k + "=" + v for k, v in updates.items())
-with open(path, "w") as f:
-    f.write("\\n".join(out) + "\\n")
-print("OK", len(updates))
-`;
-  const e = await sandbox.exec(
-    `mkdir -p /home/hermes/.hermes && python3 -c '${py.replace(/'/g, "'\\''")}' 2>&1 && ` +
-      `chown hermes:hermes ${ENV_FILE} 2>/dev/null; chmod 600 ${ENV_FILE}; true`,
-  );
-  if (!/^OK \d+/m.test(e.stdout || "")) {
-    throw new Error(`.env upsert failed: ${(e.stderr || e.stdout || "").trim()}`);
-  }
-
-  console.log(`[providers:${userId}] wrote ${Object.keys(envLines).length}/${stored.length} provider(s) into config.yaml + .env`);
-  return { providersIngested: stored.length, providersWritten: Object.keys(envLines).length, errors };
+  return { customProviders, env, modelAliases, candidates, warnings };
 }

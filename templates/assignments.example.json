@@ -1,0 +1,6 @@
+{
+  "default": "example",
+  "users": { "someone@example.com": "example" },
+  "groups": { "Engineering": "example" },
+  "domains": { "example.com": "example" }
+}

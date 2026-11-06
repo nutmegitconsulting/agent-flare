@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "node scripts/check-deploy.mjs wrangler.jsonc && wrangler deploy",
     "tail": "wrangler tail",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "test": "vitest run tests/worker"
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.12.14",
@@ -16,6 +17,8 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260820.1",
     "typescript": "^5.5.0",
-    "wrangler": "^4.156.0"
+    "vitest": "^5.1.0",
+    "wrangler": "^4.156.0",
+    "ws": "^8.22.1"
   }
 }

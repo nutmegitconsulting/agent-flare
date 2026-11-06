@@ -1,0 +1,7 @@
+# Worker secrets. In production: `npx wrangler secret put NAME`. For `wrangler dev`: copy to .dev.vars.
+
+# Required. Root of all per-user secrets. Generate with: openssl rand -base64 48
+MASTER_KEY=
+
+# Credential for api_token providers in templates. Without it those providers are skipped.
+CLOUDFLARE_AI_API_TOKEN=

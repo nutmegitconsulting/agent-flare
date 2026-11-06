@@ -1,4 +1,642 @@
+import { DurableObject } from "cloudflare:workers";
+/**
+ * One Durable Object per Access user, owning that user's container and state.
+ *
+ * Lifecycle rules this class enforces:
+ * - Hydration, snapshots and pruning run one at a time, through `serial`. Durable Object input gates
+ *   don't cover R2 or container calls, so without this they interleave.
+ * - `generation` changes when a container stops. Work started on an old container stops at its next
+ *   check instead of acting on the new one.
+ * - READY_FILE exists only after hydration completes. It releases Hermes from its boot gate and also
+ *   gates snapshots, so a home that was never hydrated can't be snapshotted over a user's history.
+ *   It lives in the container, so it dies with the container.
+ * - A container that idles out gets a final snapshot before it stops. If that fails, it stays up
+ *   and retries, because stopping would lose whatever changed since the last backup.
+ */
 import { Sandbox } from "@cloudflare/sandbox";
+import type { AccessIdentity } from "./access";
 import type { Env } from "./env";
+import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest, type RestoreOutcome } from "./persistence";
+import { keyStatuses, resolveProviderKey } from "./credentials";
+import { configFingerprint, resolveEffective } from "./effective";
+import { capMs, leaseView, nextLease, type LeaseState, type LeaseView } from "./lease";
+import { renderProviders } from "./providers";
+import { pruneSnapshots } from "./prune";
+import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
+import { underAwakeCap } from "./settings";
+import { fetchAccessGroups, loadAssignments, loadTiers, templateSecrets } from "./templates";
 
-export class HermesSandbox extends Sandbox<Env> {}
+/**
+ * Hermes' default webapp port, inside the container only. Browsers reach it on 443 at Cloudflare; TLS
+ * ends there, and nothing but this Worker can address the container. Not 3000: that's the SDK's control port.
+ */
+export const WEBAPP_PORT = 9120;
+const RUN_DIR = "/run/agent-flare";
+const READY_FILE = `${RUN_DIR}/ready`;
+const IDENTITY_KEY = "identity";
+const SEALED_COPY_KEY = "sealed-files";
+const LAST_RESTORE_KEY = "last-restore";
+const CONFIG_STATUS_KEY = "config-status";
+const LEASE_KEY = "lease";
+/** Set when a container stopped so that nothing but a person starts it again. */
+const PARKED_KEY = "parked";
+const ACTIVE_PREFIX = "active/";
+const WEBAPP_START_TIMEOUT_MS = 120_000;
+/** After a failed hydration, keep reporting it for this long before trying again. */
+const HYDRATION_RETRY_MS = 30_000;
+/** Idle cycles to keep a container up when its final snapshot keeps failing. */
+const FINAL_SNAPSHOT_RETRIES = 3;
+/** Webapp preferences a home starts with. Hermes's own store; once there, they're the user's to change. */
+const UI_DEFAULTS = { "hermes-desktop-mode-v1": "dark" };
+
+export type ReadyState =
+  | { state: "ready" }
+  | { state: "parked" }
+  | { state: "asleep" }
+  | { state: "capacity" }
+  | { state: "starting"; step: string }
+  | { state: "failed"; error: string };
+
+/** Names only: never a credential's value. */
+interface InferenceReport {
+  selected: string | null;
+  missing: string[];
+}
+
+export type SnapshotResult = { id: string } | { skipped: string };
+
+interface StoredIdentity extends AccessIdentity {
+  publicUrl: string;
+  groups?: string[];
+}
+
+const IDLE_KEY = "idle";
+const IDLE_DEFAULT_MS = 30 * 60_000;
+/** Longer than a container takes to exit after SIGTERM. Only matters if the stop never arrives. */
+const STOP_WAIT_MS = 2 * 60_000;
+
+function parseIdle(value: string | undefined): number {
+  const match = /^(\d+)(s|m|h)$/.exec((value ?? "").trim());
+  if (!match) return IDLE_DEFAULT_MS;
+  return Number(match[1]) * { s: 1_000, m: 60_000, h: 3_600_000 }[match[2] as "s" | "m" | "h"];
+}
+
+/**
+ * The class SDK 1.0 ran on. Cloudflare's move to the durable_object policy can't be undone for a class, so it stays
+ * as an empty stub to keep its namespace and data, and this SDK runs on AgentSandbox with a new container application.
+ */
+export class HermesSandbox extends DurableObject<Env> {
+  override async alarm(): Promise<void> {}
+}
+
+export class AgentSandbox extends Sandbox<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx as never, env);
+    this.idleMs = parseIdle(env.SLEEP_AFTER);
+    // This object can restart while its container keeps running. Idle time has to survive that.
+    void ctx.blockConcurrencyWhile(async () => {
+      if (!(ctx as unknown as { container?: { running: boolean } }).container?.running) return;
+      const saved = await ctx.storage.get<{ lastActionAt: number; actionIdleAt: number }>(IDLE_KEY);
+      if (saved) {
+        this.lastActionAt = saved.lastActionAt;
+        this.actionIdleAt = saved.actionIdleAt;
+      } else {
+        this.startIdleClock();
+      }
+    });
+  }
+
+  private queue: Promise<unknown> = Promise.resolve();
+  private generation = 0;
+  private hydration: Promise<void> | null = null;
+  private status: ReadyState = { state: "starting", step: "waiting" };
+  private ready = false;
+  /** Set once a stop is signalled: the container's disk can't be trusted from then on. Lapses if no stop arrives. */
+  private stoppingAt = 0;
+  private get stopping(): boolean {
+    return this.stoppingAt > 0 && Date.now() - this.stoppingAt < STOP_WAIT_MS;
+  }
+  private set stopping(value: boolean) {
+    this.stoppingAt = value ? Date.now() : 0;
+  }
+  private readonly idleMs: number;
+  private lastUserActivity = 0;
+  private lastSnapshotAt = 0;
+  private lastSnapshotError: string | null = null;
+  private lastFailureAt = 0;
+  private finalSnapshotFailures = 0;
+  private lastActionAt = 0;
+  /** When idle runs out, counted from the last real tap or keystroke. Null until the chip first reports. */
+  private actionIdleAt: number | null = null;
+
+  /** Runs `work` after everything already queued, whether that succeeded or not. */
+  private serial<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(work, work);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Current state. Starts hydration if needed and returns without waiting for it. */
+  async ensureReady(identity: AccessIdentity, publicUrl: string, accessJwt: string, mayStart = true): Promise<ReadyState> {
+    // An open tab keeps polling. After a planned stop that must not start the container again.
+    if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
+    // A stop is signalled but the container hasn't exited. It still looks running, and a request here would start a new one.
+    if (this.stopping) return { state: "asleep" };
+    // Nor may a tab's retries start one that went to sleep: tested, they do within seconds. That takes a page load.
+    if (!mayStart && !this.hydration && !(await this.isRunning())) return { state: "asleep" };
+    // The cap applies only to starting. Containers already running are left alone.
+    if (!this.hydration && !(await this.isRunning()) && !(await underAwakeCap(this.env.BACKUP_BUCKET, identity.sub))) return { state: "capacity" };
+    this.lastUserActivity = Date.now();
+    if (this.ready && (await this.isRunning())) return { state: "ready" };
+    this.ready = false;
+    if (this.status.state === "failed" && Date.now() - this.lastFailureAt < HYDRATION_RETRY_MS) {
+      return this.status;
+    }
+    if (!this.hydration) {
+      const generation = this.generation;
+      const isCurrent = () => generation === this.generation;
+      this.status = { state: "starting", step: "starting container" };
+      const run: Promise<void> = this.serial(() => this.hydrate({ ...identity, publicUrl }, accessJwt, generation))
+        .then(async () => {
+          if (!isCurrent()) return;
+          // A container always has an idle time, from here on, whether or not a chip ever reports.
+          if (this.actionIdleAt === null) this.startIdleClock();
+          this.ready = true;
+          this.status = { state: "ready" };
+        })
+        .catch(async (err) => {
+          const error = err instanceof Error ? err.message : String(err);
+          console.error(`[hydrate:${identity.sub}] ${error}`);
+          if (!isCurrent()) return; // The container went away; the next request starts over.
+          this.lastFailureAt = Date.now();
+          this.status = { state: "failed", error };
+          // A container that can't serve shouldn't hold an instance slot.
+          this.stopping = true;
+          await this.stop().catch(() => { this.stopping = false; });
+        })
+        .finally(() => {
+          if (this.hydration === run) this.hydration = null;
+        });
+      this.hydration = run;
+      this.ctx.waitUntil(run);
+    }
+    return this.status;
+  }
+
+  private async isRunning(): Promise<boolean> {
+    const state = await this.getState();
+    return state.status === "healthy" || state.status === "running";
+  }
+
+  private async hasReadyFile(): Promise<boolean> {
+    const result = await this.exec(`test -f ${READY_FILE}`);
+    return result.exitCode === 0;
+  }
+
+  private async hydrate(identity: StoredIdentity, accessJwt: string, generation: number): Promise<void> {
+    const assertCurrent = () => {
+      if (generation !== this.generation) throw new Error("container restarted during hydration");
+    };
+    assertCurrent();
+    await this.ctx.storage.put(IDENTITY_KEY, identity);
+    await this.env.BACKUP_BUCKET.put(`${ACTIVE_PREFIX}${identity.sub}`, identity.email);
+
+    // Durable Objects can be evicted while their container keeps running.
+    if (await this.hasReadyFile()) {
+      await this.waitForWebapp(assertCurrent);
+      return;
+    }
+
+    this.status = { state: "starting", step: "restoring your state" };
+    const outcome = await restoreNewest(this, this.env.BACKUP_BUCKET, identity.sub, READY_FILE, assertCurrent);
+    await this.ctx.storage.put<RestoreOutcome & { at: number }>(LAST_RESTORE_KEY, { ...outcome, at: Date.now() });
+    console.log(`[hydrate:${identity.sub}] ${JSON.stringify(outcome)}`);
+
+    assertCurrent();
+    this.status = { state: "starting", step: "applying configuration" };
+    await this.applyConfiguration(identity, accessJwt);
+
+    // Only now can Hermes start, and only now can snapshots run.
+    assertCurrent();
+    await this.ctx.storage.put<LeaseState>(LEASE_KEY, { startedAt: Date.now() });
+    await this.exec(`mkdir -p ${RUN_DIR} && touch ${READY_FILE}`);
+    this.status = { state: "starting", step: "starting Hermes" };
+    await this.waitForWebapp(assertCurrent);
+  }
+
+  private async applyConfiguration(identity: StoredIdentity, accessJwt: string): Promise<void> {
+    const env = this.env;
+    const warnings: string[] = [];
+
+    const assignments = await loadAssignments(env.BACKUP_BUCKET);
+    const groups = assignments?.groups && Object.keys(assignments.groups).length
+      ? await fetchAccessGroups(identity.issuer, accessJwt)
+      : [];
+    const effective = await resolveEffective(env.BACKUP_BUCKET, identity.email, groups, templateSecrets(env));
+    const templateName = effective.role;
+    const template = effective.template;
+    if (templateName && !template) warnings.push(`template ${templateName} is not in R2`);
+    warnings.push(...(template?.warnings ?? []));
+
+    const keys = Object.fromEntries(await Promise.all(effective.providers.map(async (p) =>
+      [p.name, await resolveProviderKey(env, identity.email, templateName, p)] as const)));
+    const tiers = await loadTiers(env.BACKUP_BUCKET);
+    const providers = renderProviders(effective.providers, keys, identity.email, tiers);
+    warnings.push(...providers.warnings);
+    const providerCount = effective.providers.length;
+    const fingerprint = await configFingerprint(
+      effective, await keyStatuses(env, identity.email, templateName, effective.providers), tiers);
+    await this.ctx.storage.put(IDENTITY_KEY, { ...identity, groups });
+
+    // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
+    // secret changed just before a stop. KV stays the durable home for the value.
+    const filesKey = sealedFilesKey(identity.sub);
+    const sealedRaw = (await this.ctx.storage.get<string>(SEALED_COPY_KEY)) ?? (await env.CREDENTIALS_KV.get(filesKey));
+    const sealed = sealedRaw
+      ? (JSON.parse(await unseal(env.MASTER_KEY, filesKey, sealedRaw)) as Record<string, string>)
+      : null;
+    const prefill = await getSealed<Record<string, string>>(
+      env.CREDENTIALS_KV, env.MASTER_KEY, prefillKey(identity.email));
+
+    // Platform keys come last so a template can never move the port or the public URL.
+    const platformConfig = {
+      webapp: { enabled: true, host: "0.0.0.0", port: WEBAPP_PORT, public_url: identity.publicUrl },
+      // Only the Worker can reach this listener, so whatever address it arrives from is the Worker's.
+      dashboard: { trusted_proxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.1", "::1", "fc00::/7"] },
+    };
+    const bundle = {
+      sealed: sealed ?? {},
+      template: template ? { name: template.name, files: template.files } : null,
+      // Inside the home, so that what an agent makes is what gets snapshotted.
+      platform_defaults: { terminal: { cwd: `${HERMES_HOME}/workspace` } },
+      config_defaults: template?.configDefaults ?? {},
+      // The container picks from these, because only it can see which credentials are in .env.
+      provider_candidates: providers.candidates,
+      config_managed: {
+        ...template?.configManaged,
+        ...(providers.customProviders.length ? { custom_providers: providers.customProviders } : {}),
+        ...(Object.keys(providers.modelAliases).length
+          ? { model_aliases: { ...(template?.configManaged.model_aliases as object | undefined), ...providers.modelAliases } }
+          : {}),
+        ...platformConfig,
+      },
+      // A prefill is the user's own value: it applies only while they haven't set one. Template and
+      // provider values are managed and apply on every boot.
+      env_defaults: prefill ?? {},
+      env: { ...template?.env, ...providers.env },
+      ui_defaults: UI_DEFAULTS,
+      session_token: await deriveUserSecret(env.MASTER_KEY, "webapp-browser", identity.sub),
+    };
+
+    await this.exec(`mkdir -p ${RUN_DIR} && chmod 700 ${RUN_DIR}`);
+    await this.writeFile(`${RUN_DIR}/auth.json`, JSON.stringify({
+      secret: await deriveUserSecret(env.MASTER_KEY, "webapp-auth", identity.sub),
+      sub: identity.sub, email: identity.email, name: identity.name ?? "", issuer: identity.issuer,
+    }));
+    await this.exec(`chmod 600 ${RUN_DIR}/auth.json`);
+    await this.writeFile(`${RUN_DIR}/bundle.json`, JSON.stringify(bundle));
+    const result = await this.exec(`${AF_STATE} apply ${HERMES_HOME} ${RUN_DIR}/bundle.json`);
+    await this.exec(`rm -f ${RUN_DIR}/bundle.json`);
+    if (result.exitCode !== 0) {
+      // The detail can quote the user's files, so it goes to the logs and not to the error page.
+      console.error(`[config:${identity.sub}] ${(result.stderr || result.stdout).slice(0, 500)}`);
+      throw new Error("applying configuration failed");
+    }
+    const inference = (JSON.parse(result.stdout) as { inference?: InferenceReport }).inference;
+    if (providerCount && !inference?.selected) {
+      warnings.push(`no inference provider selected: missing ${inference?.missing?.join(", ") || "provider credentials"}`);
+    }
+    await this.ctx.storage.put(CONFIG_STATUS_KEY, { template: templateName, inference, warnings, fingerprint, at: Date.now() });
+    if (warnings.length) console.warn(`[config:${identity.sub}] ${warnings.join("; ")}`);
+    console.log(`[config:${identity.sub}] ${result.stdout}`);
+  }
+
+  private async waitForWebapp(assertCurrent: () => void): Promise<void> {
+    const deadline = Date.now() + WEBAPP_START_TIMEOUT_MS;
+    let lastError = "";
+    while (Date.now() < deadline) {
+      assertCurrent();
+      try {
+        const response = await this.containerFetch(
+          new Request("http://localhost/api/health"), WEBAPP_PORT);
+        // Unread bodies count as in-flight requests, which would keep the container awake forever.
+        await response.body?.cancel();
+        if (response.ok) return;
+        lastError = `status ${response.status}`;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(`Hermes webapp did not come up on port ${WEBAPP_PORT}: ${lastError}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Snapshots
+  // ---------------------------------------------------------------------------
+
+  /** Snapshot a hydrated container and seal its secrets. Refuses when not hydrated. */
+  async snapshotNow(): Promise<SnapshotResult> {
+    return this.serial(() => this.takeSnapshot());
+  }
+
+  private async takeSnapshot(): Promise<SnapshotResult> {
+    const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
+    if (!identity) return { skipped: "no user bound to this sandbox" };
+    if (this.stopping) return { skipped: "container stopping" };
+    if (!(await this.isRunning())) return { skipped: "container not running" };
+    if (!(await this.hasReadyFile())) return { skipped: "container not hydrated" };
+
+    // A failure sealing secrets must not also cost the user their state backup.
+    let sealError: unknown = null;
+    try {
+      await this.sealSecretFiles(identity.sub);
+    } catch (err) {
+      sealError = err;
+    }
+    try {
+      const entry = await createSnapshot(this, this.env.BACKUP_BUCKET, identity.sub);
+      this.lastSnapshotAt = Date.now();
+      this.lastSnapshotError = null;
+      if (sealError) throw sealError;
+      return { id: entry.id };
+    } catch (err) {
+      this.lastSnapshotError = err instanceof Error ? err.message : String(err);
+      throw err;
+    }
+  }
+
+  private async sealSecretFiles(sub: string): Promise<void> {
+    const result = await this.exec(`${AF_STATE} seal-read ${HERMES_HOME}`);
+    if (result.exitCode !== 0) throw new Error(`reading secret files failed: ${result.stderr.slice(0, 500)}`);
+    const { files, dropped } = JSON.parse(result.stdout) as { files: Record<string, string>; dropped: string[] };
+    if (dropped.length) console.warn(`[seal:${sub}] too large to keep: ${dropped.join(", ")}`);
+    const filesKey = sealedFilesKey(sub);
+    const sealedValue = await seal(this.env.MASTER_KEY, filesKey, JSON.stringify(files));
+    await this.env.CREDENTIALS_KV.put(filesKey, sealedValue);
+    try {
+      await this.ctx.storage.put(SEALED_COPY_KEY, sealedValue);
+    } catch {
+      // Too large for Durable Object storage. Drop the old copy so reads fall through to KV.
+      await this.ctx.storage.delete(SEALED_COPY_KEY);
+    }
+  }
+
+  /**
+   * Cron tick. Skips quietly when there's been no activity since the last snapshot: every exec renews
+   * the container's idle timer, so snapshotting on a timer alone would keep it awake forever.
+   */
+  async snapshotIfDue(intervalMs: number): Promise<SnapshotResult> {
+    if (this.stopping) return { skipped: "container stopping" };
+    if (!(await this.isRunning())) {
+      const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
+      if (identity) await this.env.BACKUP_BUCKET.delete(`${ACTIVE_PREFIX}${identity.sub}`);
+      return { skipped: "container not running" };
+    }
+    if (this.hydration) return { skipped: "hydrating" };
+    if (!this.ready) {
+      // Memory is empty after an eviction, so ask the container, once.
+      if (!(await this.hasReadyFile())) {
+        await this.stop();
+        return { skipped: "stopped a container that never hydrated" };
+      }
+      this.ready = true;
+    }
+    const lease = await this.leaseState();
+    if (!lease.startedAt) {
+      // Running from before leases existed: its cap counts from now.
+      await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, startedAt: Date.now() });
+    } else if ((lease.leaseUntil || this.actionIdleAt === null) && leaseView(lease, capMs(this.env.FORGOTTEN_TAB_CAP_HOURS), Date.now()).due) {
+      // The lease's end, or the backstop: 12 hours since a real tap or keystroke, even with an agent still busy.
+      return this.plannedStop(lease.leaseUntil ? "lease" : "cap");
+    }
+    const now = Date.now();
+    if (now - this.lastSnapshotAt < intervalMs) return { skipped: "interval not reached" };
+    const inflight = (this as unknown as { inflightRequests?: number }).inflightRequests ?? 0;
+    if (this.lastSnapshotAt && this.lastUserActivity <= this.lastSnapshotAt && inflight === 0) {
+      return { skipped: "no activity since last snapshot" };
+    }
+    return this.snapshotNow();
+  }
+
+  async prune(): Promise<{ kept: number; deleted: number } | null> {
+    return this.serial(async () => {
+      const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
+      return identity ? pruneSnapshots(this.env.BACKUP_BUCKET, identity.sub) : null;
+    });
+  }
+
+  async describe() {
+    const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
+    return {
+      identity: identity?.email ?? null,
+      groups: identity?.groups ?? [],
+      status: this.status,
+      lastSnapshotAt: this.lastSnapshotAt,
+      lastSnapshotError: this.lastSnapshotError,
+      lastRestore: (await this.ctx.storage.get<RestoreOutcome & { at: number }>(LAST_RESTORE_KEY)) ?? null,
+      config: (await this.ctx.storage.get(CONFIG_STATUS_KEY)) ?? null,
+      lastUserActivity: this.lastUserActivity,
+      parked: (await this.ctx.storage.get<boolean>(PARKED_KEY)) ?? false,
+      lease: await this.leaseStatus(),
+      inflight: (this as unknown as { inflightRequests?: number }).inflightRequests ?? 0,
+    };
+  }
+
+  /** Stop now, taking a final snapshot first. An explicit stop goes ahead even if that fails. */
+  async stopWithSnapshot(): Promise<void> {
+    await this.serial(async () => {
+      await this.finalSnapshot("stop");
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await this.stop();
+    });
+  }
+
+  private async leaseState(): Promise<LeaseState> {
+    return (await this.ctx.storage.get<LeaseState>(LEASE_KEY)) ?? {};
+  }
+
+  /** For the status chip. Reads only: it can't wake a container or count as activity. */
+  async leaseStatus(): Promise<{ state: "awake" | "asleep" | "parked"; idleAt?: number } & Partial<LeaseView>> {
+    if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
+    if (this.stopping || !(await this.isRunning())) return { state: "asleep" };
+    return {
+      state: "awake", ...(this.actionIdleAt === null ? {} : { idleAt: this.actionIdleAt }),
+      ...leaseView(await this.leaseState(), capMs(this.env.FORGOTTEN_TAB_CAP_HOURS), Date.now()),
+    };
+  }
+
+  /** A tap on "Keep awake". The only thing that renews a lease. */
+  async keepAwake(hours: 1 | 2): Promise<{ leaseUntil: number } | { error: string }> {
+    console.log(`[chip] keep awake ${hours}h`);
+    if (!(await this.isRunning())) return { error: "not running" };
+    await this.noteUserAction();
+    const next = nextLease(await this.leaseState(), hours, Date.now());
+    await this.ctx.storage.put<LeaseState>(LEASE_KEY, next);
+    return { leaseUntil: next.leaseUntil };
+  }
+
+  /** A tap on "Stop". If the snapshot fails the container stays up, so a tap can't lose work. */
+  async stopByUser(): Promise<{ status: "stopped" | "not running" } | { error: string }> {
+    console.log("[chip] stop");
+    const result = await this.applyByRestart();
+    if (!("error" in result)) await this.ctx.storage.put(PARKED_KEY, true);
+    return result;
+  }
+
+  /** A person asked for it back. Only this clears a planned stop. */
+  async wake(): Promise<void> {
+    console.log("[chip] wake");
+    await this.ctx.storage.delete(PARKED_KEY);
+  }
+
+  /** Lease or cap ran out: snapshot, then stop, and stay stopped until a person returns. */
+  private async plannedStop(reason: string): Promise<SnapshotResult> {
+    return this.serial(async () => {
+      const saved = await this.finalSnapshot(reason);
+      if (!saved && ++this.finalSnapshotFailures < FINAL_SNAPSHOT_RETRIES) {
+        console.warn(`[planned-stop:${reason}] staying up to retry (${this.finalSnapshotFailures}/${FINAL_SNAPSHOT_RETRIES})`);
+        return { skipped: "final snapshot failed; will retry" };
+      }
+      if (!saved) console.error(`[planned-stop:${reason}] giving up; stopping without a final snapshot`);
+      this.finalSnapshotFailures = 0;
+      await this.ctx.storage.put(PARKED_KEY, true);
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await this.stop();
+      return { skipped: `stopped: ${reason}` };
+    });
+  }
+
+  /** Local tests only: moves a container's lease clock back. See index.ts. */
+  async ageForTest(ms: number): Promise<void> {
+    const lease = await this.leaseState();
+    await this.ctx.storage.put<LeaseState>(LEASE_KEY, {
+      ...(lease.leaseUntil ? { leaseUntil: lease.leaseUntil - ms } : {}),
+      ...(lease.lastTapAt ? { lastTapAt: lease.lastTapAt - ms } : {}),
+      ...(lease.startedAt ? { startedAt: lease.startedAt - ms } : {}),
+    });
+  }
+
+  /**
+   * Apply configuration changes by restarting. Stricter than a stop: if the snapshot fails the container
+   * stays up, so applying a setting can never cost a user their work.
+   */
+  async applyByRestart(): Promise<{ status: "stopped" | "not running" } | { error: string }> {
+    return this.serial(async () => {
+      if (!(await this.isRunning())) return { status: "not running" as const };
+      try {
+        await this.takeSnapshot();
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
+      }
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await this.stop();
+      return { status: "stopped" as const };
+    });
+  }
+
+  private async finalSnapshot(reason: string): Promise<boolean> {
+    try {
+      const result = await this.takeSnapshot();
+      console.log(`[final-snapshot:${reason}] ${JSON.stringify(result)}`);
+      return true;
+    } catch (err) {
+      console.error(`[final-snapshot:${reason}] failed: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  private async clearActiveMarker(): Promise<void> {
+    const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
+    if (identity) await this.env.BACKUP_BUCKET.delete(`${ACTIVE_PREFIX}${identity.sub}`);
+  }
+
+  /**
+   * Idle is 100% chip led. The chip reports a tap, a keystroke, a page load, and an agent mid-turn, and nothing else
+   * counts: not requests, polling or sockets. `busy` marks the last: it holds off idle, but not the 12-hour backstop.
+   */
+  async noteUserAction(busy = false): Promise<void> {
+    if (this.stopping || !(await this.isRunning())) return;
+    console.log(`[chip] activity${busy ? " (agent busy)" : ""}`);
+    this.lastActionAt = Date.now();
+    this.actionIdleAt = this.lastActionAt + this.idleMs;
+    await this.saveIdle();
+    if (busy) return;
+    const lease = await this.leaseState();
+    if (lease.startedAt) await this.ctx.storage.put<LeaseState>(LEASE_KEY, { ...lease, lastTapAt: this.lastActionAt });
+  }
+
+  private saveIdle(): Promise<void> {
+    return this.ctx.storage.put(IDLE_KEY, { lastActionAt: this.lastActionAt, actionIdleAt: this.actionIdleAt });
+  }
+
+  private startIdleClock(): void {
+    this.actionIdleAt = Date.now() + this.idleMs;
+    void this.saveIdle();
+  }
+
+  /** The SDK's alarm loop asks this. There's always an answer from the idle time, so no request can hold it up. */
+  idleExpired(): boolean {
+    if (this.hydration) return false;
+    if (this.actionIdleAt === null) {
+      this.startIdleClock();
+      return false;
+    }
+    return this.actionIdleAt <= Date.now();
+  }
+
+  /** Pushes idle out by one full period. */
+  private holdOffIdle(): void {
+    this.startIdleClock();
+  }
+
+  override async onActivityExpired(): Promise<void> {
+    console.log("[chip] idle time ran out");
+    await this.serial(async () => {
+      // A lease holds off idle sleep. The snapshot cron is what ends it.
+      if ((await this.leaseState()).leaseUntil) {
+        this.holdOffIdle();
+        return;
+      }
+      const started = Date.now();
+      const saved = await this.finalSnapshot("idle");
+      // The snapshot takes a while. A user who came back during it must not be cut off.
+      if (this.lastActionAt > started) {
+        this.holdOffIdle();
+        return;
+      }
+      if (!saved && ++this.finalSnapshotFailures < FINAL_SNAPSHOT_RETRIES) {
+        console.warn(`[final-snapshot:idle] staying up to retry (${this.finalSnapshotFailures}/${FINAL_SNAPSHOT_RETRIES})`);
+        this.holdOffIdle();
+        return;
+      }
+      if (!saved) console.error("[final-snapshot:idle] giving up; stopping without a final snapshot");
+      this.finalSnapshotFailures = 0;
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await super.onActivityExpired();
+    });
+  }
+
+  override async onStop(params?: Parameters<Sandbox<Env>["onStop"]>[0]): Promise<void> {
+    this.generation++;
+    this.ready = false;
+    this.stopping = false;
+    this.actionIdleAt = null;
+    await this.ctx.storage.delete(IDLE_KEY);
+    await this.ctx.storage.delete(LEASE_KEY);
+    this.hydration = null;
+    // A failure stays visible until its retry window passes, even though stopping is what follows it.
+    if (this.status.state !== "failed") this.status = { state: "starting", step: "waiting" };
+    await super.onStop(params);
+  }
+}
+
+// The SDK's alarm loop calls this, and it's private only in the SDK's types, so it can't be overridden in the class.
+// Its own version treats an in-flight request as activity, which on this SDK includes the webapp's socket.
+(AgentSandbox.prototype as unknown as { isActivityExpired(this: AgentSandbox): boolean }).isActivityExpired = function (this: AgentSandbox) {
+  return this.idleExpired();
+};
