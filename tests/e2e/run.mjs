@@ -293,9 +293,10 @@ try {
   await nokey.json("/__af/stop", { method: "POST" });
   await sleep(3000);
 
+  const row = async (who) => (await admin.json("/__af/admin/users")).users.find((u) => u.sub === who.sub);
   console.log("== admin screens");
   const form = (fields) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin: BASE, "sec-fetch-site": "same-origin" }, body: new URLSearchParams(fields).toString() });
-  const adminRoutes = [["GET", "/__af/admin"], ["GET", `/__af/admin/u/${alice.sub}`], ["GET", "/__af/admin/roles"], ["GET", "/__af/admin/roles/new"], ["GET", "/__af/admin/roles/team"], ["GET", "/__af/admin/audit"], ["GET", "/__af/admin/users"],
+  const adminRoutes = [["POST", `/__af/admin/u/${alice.sub}/keep-awake`], ["POST", `/__af/admin/u/${alice.sub}/stop`], ["GET", `/__af/admin/u/${alice.sub}/backups/00000000-0000-4000-8000-000000000000`], ["POST", "/__af/admin/settings"], ["GET", "/__af/admin"], ["GET", `/__af/admin/u/${alice.sub}`], ["GET", "/__af/admin/roles"], ["GET", "/__af/admin/roles/new"], ["GET", "/__af/admin/roles/team"], ["GET", "/__af/admin/audit"], ["GET", "/__af/admin/users"],
     ["POST", `/__af/admin/u/${alice.sub}/role`], ["POST", `/__af/admin/u/${alice.sub}/override`], ["POST", `/__af/admin/u/${alice.sub}/key`], ["POST", `/__af/admin/u/${alice.sub}/apply`],
     ["POST", "/__af/admin/assign"], ["POST", "/__af/admin/roles/team"], ["POST", "/__af/admin/roles/team/key"]];
   const adminForged = jwt(admin.sub, admin.email, generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey);
@@ -331,6 +332,59 @@ try {
   const overrideHostile = await admin.fetch(`/__af/admin/u/${alice.sub}/override`, form({ role: "", gateway_id: "", models: hostile, default_model: "" }));
   const overrideHtml = await overrideHostile.text();
   expect(overrideHostile.status === 400 && !overrideHtml.includes("<img") && overrideHtml.includes("&#60;img"), "a hostile override is refused, and escaped", overrideHtml.slice(0, 300));
+
+  console.log("== admin: container, backups, cap");
+  const adminKeep = await admin.fetch(`/__af/admin/u/${alice.sub}/keep-awake`, form({ hours: "2" }));
+  await adminKeep.body?.cancel();
+  const adminLease = (await row(alice)).lease;
+  expect(adminKeep.status === 303 && adminLease.reason === "lease" && adminLease.stopsAt - Date.now() <= 7_200_000, "an admin keeps a user's container awake, 2 hours at most", JSON.stringify(adminLease));
+  const adminBad = await admin.fetch(`/__af/admin/u/${alice.sub}/keep-awake`, form({ hours: "8" }));
+  await adminBad.body?.cancel();
+  expect(adminBad.status === 400, "and can't choose 8 hours");
+  const adminSnap = await alice.json("/__af/snapshot", { method: "POST" });
+  expect(!!adminSnap.id, "a backup exists to list", JSON.stringify(adminSnap));
+  const adminPage = await (await admin.fetch(`/__af/admin/u/${alice.sub}`)).text();
+  expect(adminPage.includes("Kept awake until") && adminPage.includes("(newest)") && adminPage.includes("any passwords or keys"), "the user's page shows state, backups and the warning", adminPage.slice(0, 300));
+  const downloadPath = `/__af/admin/u/${alice.sub}/backups/${adminSnap.id}`;
+  const download = await admin.fetch(downloadPath);
+  const downloaded = Buffer.from(await download.arrayBuffer());
+  expect(download.status === 200 && downloaded.length > 1000 && download.headers.get("content-disposition").includes(adminSnap.id), "an admin downloads a backup", `${download.status} ${downloaded.length}`);
+  const notAdmin = await alice.fetch(downloadPath);
+  await notAdmin.body?.cancel();
+  expect(notAdmin.status === 403, "a non-admin can't, even their own");
+  for (const [label, path] of [["another user's ID", `/__af/admin/u/${bob.sub}/backups/${adminSnap.id}`], ["a made-up ID", `/__af/admin/u/${alice.sub}/backups/00000000-0000-4000-8000-000000000000`], ["a path", `/__af/admin/u/${alice.sub}/backups/..%2F..%2Fconfig%2Fassignments.json`], ["an object key", `/__af/admin/u/${alice.sub}/backups/config%2Fassignments.json`]]) {
+    const r = await admin.fetch(path);
+    await r.body?.cancel();
+    expect(r.status === 404, `${label} can't fetch anything`, String(r.status));
+  }
+  const auditPage = await (await admin.fetch("/__af/admin/audit")).text();
+  expect(auditPage.includes("backup.download") && auditPage.includes(adminSnap.id) && auditPage.includes("keep-awake"), "the audit shows the download and who did it");
+  const capSet = await admin.fetch("/__af/admin/settings", form({ maxAwake: "1" }));
+  await capSet.body?.cancel();
+  const capBad = await admin.fetch("/__af/admin/settings", form({ maxAwake: "lots" }));
+  await capBad.body?.cancel();
+  expect(capSet.status === 303 && capBad.status === 400, "an admin sets the cap, with a valid number only");
+  const dave = new Browser("77777777-abab-4bab-8bab-777777777777", "dave@example.com");
+  const atCapacity = await dave.fetch("/", { headers: { accept: "text/html" } });
+  const capacityBody = await atCapacity.text();
+  expect(atCapacity.status === 503 && capacityBody.includes("At capacity"), "over the cap, a user sees the capacity page", capacityBody.slice(0, 200));
+  await sleep(3000);
+  expect(!containerOf(dave) && containerOf(alice), "and gets no container, and a running one isn't stopped");
+  const capOff = await admin.fetch("/__af/admin/settings", form({ maxAwake: "0" }));
+  await capOff.body?.cancel();
+  const daveOk = await dave.fetch("/", { headers: { accept: "text/html" } });
+  await daveOk.text();
+  expect((await dave.waitReady()).state === "ready", "with the cap at 0, they start");
+  await dave.json("/__af/stop", { method: "POST" });
+  await sleep(3000);
+  const adminStop = await admin.fetch(`/__af/admin/u/${alice.sub}/stop`, form({}));
+  await adminStop.body?.cancel();
+  expect(adminStop.status === 303, "an admin stops a user's container, saving first");
+  await sleep(3000);
+  expect(!containerOf(alice), "and it's gone");
+  const aliceWake = await alice.fetch("/__af/wake", { method: "POST", headers: { origin: BASE, "sec-fetch-site": "same-origin" } });
+  await aliceWake.body?.cancel();
+  expect((await alice.waitReady()).state === "ready", "the user wakes it");
 
   const appliedBefore = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).config.fingerprint;
   const assignedAlice = await admin.fetch(`/__af/admin/u/${alice.sub}/role`, form({ role: "engineers" }));
@@ -385,7 +439,6 @@ try {
   console.log("== keep awake and stop");
   const tick = () => fetch(`${BASE}/cdn-cgi/handler/scheduled?cron=*/5+*+*+*+*`).catch(() => {});
   const jsonPost = (body) => ({ method: "POST", headers: { "content-type": "application/json", origin: BASE, "sec-fetch-site": "same-origin" }, body: JSON.stringify(body ?? {}) });
-  const row = async (who) => (await admin.json("/__af/admin/users")).users.find((u) => u.sub === who.sub);
   const backupsOf = async (who) => (await row(who))?.backups ?? 0;
   expect((await carol.json("/__af/lease")).state === "asleep", "the chip's read shows asleep, and doesn't start anything");
   await sleep(2000);

@@ -11,7 +11,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "containers": [
     {
-      "class_name": "HermesSandbox",
+      "class_name": "AgentSandbox",
       "image": "./Dockerfile",
       "instance_type": "standard-2",
       // One container per active user.
@@ -22,10 +22,12 @@
     }
   ],
   "durable_objects": {
-    "bindings": [{ "name": "Sandbox", "class_name": "HermesSandbox" }]
+    "bindings": [{ "name": "Sandbox", "class_name": "AgentSandbox" }]
   },
   "migrations": [
-    { "new_sqlite_classes": ["HermesSandbox"], "tag": "v1" }
+    { "new_sqlite_classes": ["HermesSandbox"], "tag": "v1" },
+    // HermesSandbox moved to the durable_object policy on SDK 1.0, which is one-way. It stays as an empty stub.
+    { "new_sqlite_classes": ["AgentSandbox"], "tag": "v2" }
   ],
   "r2_buckets": [
     { "binding": "BACKUP_BUCKET", "bucket_name": "agent-flare-state" }

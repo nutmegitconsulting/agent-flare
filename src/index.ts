@@ -15,12 +15,13 @@ import { AccessError, verifyAccessJwt, type AccessIdentity } from "./access";
 import { adminScreens } from "./admin";
 import type { Env } from "./env";
 import { parseLeaseHours } from "./lease";
-import { parkedPage, startingPage } from "./pages";
+import { capacityPage, parkedPage, startingPage } from "./pages";
 import { getIndex } from "./persistence";
-import { HermesSandbox, WEBAPP_PORT, type ReadyState } from "./sandbox";
+import { AgentSandbox, HermesSandbox, WEBAPP_PORT, type ReadyState } from "./sandbox";
 import { putSealed, prefillKey } from "./secrets";
+import { forbiddenTestSettings } from "./test-settings";
 
-export { HermesSandbox };
+export { AgentSandbox, HermesSandbox };
 
 type Vars = { identity: AccessIdentity; jwt: string };
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -30,10 +31,15 @@ const DEFAULT_SNAPSHOT_INTERVAL_MINUTES = 10;
 function sandboxFor(env: Env, sub: string) {
   return getSandbox(env.Sandbox as never, sub.toLowerCase(), {
     sleepAfter: env.SLEEP_AFTER || "30m",
-  }) as unknown as DurableObjectStub<HermesSandbox> & HermesSandbox;
+  }) as unknown as DurableObjectStub<AgentSandbox> & AgentSandbox;
 }
 
 app.use("*", async (c, next) => {
+  const forbidden = forbiddenTestSettings(c.env, new URL(c.req.url).hostname);
+  if (forbidden.length) {
+    console.error(`[config] refusing to serve: test settings are set: ${forbidden.join(", ")}`);
+    return c.text("This deployment is misconfigured", 500);
+  }
   const jwt = c.req.header("Cf-Access-Jwt-Assertion");
   if (!jwt) return c.text("Access token required", 401);
   try {
@@ -196,6 +202,12 @@ function notReady(request: Request, status: ReadyState): Response {
     return new Response(parkedPage(), {
       status: 503,
       headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
+  if (status.state === "capacity" && isDocumentLoad(request)) {
+    return new Response(capacityPage(), {
+      status: 503,
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "retry-after": "60" },
     });
   }
   if (isDocumentLoad(request)) {

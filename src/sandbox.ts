@@ -1,3 +1,4 @@
+import { DurableObject } from "cloudflare:workers";
 /**
  * One Durable Object per Access user, owning that user's container and state.
  *
@@ -22,6 +23,7 @@ import { capMs, leaseView, nextLease, type LeaseState, type LeaseView } from "./
 import { renderProviders } from "./providers";
 import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
+import { underAwakeCap } from "./settings";
 import { fetchAccessGroups, loadAssignments, loadTiers, templateSecrets } from "./templates";
 
 /**
@@ -51,6 +53,7 @@ export type ReadyState =
   | { state: "ready" }
   | { state: "parked" }
   | { state: "asleep" }
+  | { state: "capacity" }
   | { state: "starting"; step: string }
   | { state: "failed"; error: string };
 
@@ -67,7 +70,15 @@ interface StoredIdentity extends AccessIdentity {
   groups?: string[];
 }
 
-export class HermesSandbox extends Sandbox<Env> {
+/**
+ * The class SDK 1.0 ran on. Cloudflare's move to the durable_object policy can't be undone for a class, so it stays
+ * as an empty stub to keep its namespace and data, and this SDK runs on AgentSandbox with a new container application.
+ */
+export class HermesSandbox extends DurableObject<Env> {
+  override async alarm(): Promise<void> {}
+}
+
+export class AgentSandbox extends Sandbox<Env> {
   private queue: Promise<unknown> = Promise.resolve();
   private generation = 0;
   private hydration: Promise<void> | null = null;
@@ -98,6 +109,8 @@ export class HermesSandbox extends Sandbox<Env> {
     if (await this.ctx.storage.get<boolean>(PARKED_KEY)) return { state: "parked" };
     // Nor may a tab's retries start one that went to sleep: tested, they do within seconds. That takes a page load.
     if (!mayStart && !this.hydration && !(await this.isRunning())) return { state: "asleep" };
+    // The cap applies only to starting. Containers already running are left alone.
+    if (!this.hydration && !(await this.isRunning()) && !(await underAwakeCap(this.env.BACKUP_BUCKET, identity.sub))) return { state: "capacity" };
     this.lastUserActivity = Date.now();
     if (this.ready && (await this.isRunning())) return { state: "ready" };
     this.ready = false;

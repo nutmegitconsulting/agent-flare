@@ -75,6 +75,7 @@ TAG=agent-flare:$(git rev-parse --short HEAD)
 AF_NO_CACHE=1 AF_BUILD_CA=/path/to/ca-bundle.crt AF_FORBIDDEN_CA=/path/to/proxy-ca.crt scripts/build-image.sh "$TAG"   # stops if the guard fails
 npx wrangler containers push "$TAG"                                                                                    # prints the registry image
 AF_IMAGE=<that registry image> AF_WRANGLER_OUT=wrangler.prod.jsonc node scripts/render-wrangler.mjs
+node scripts/check-deploy.mjs wrangler.prod.jsonc
 npx wrangler deploy --config wrangler.prod.jsonc
 ```
 

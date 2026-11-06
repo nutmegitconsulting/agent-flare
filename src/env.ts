@@ -1,7 +1,7 @@
-import type { HermesSandbox } from "./sandbox";
+import type { AgentSandbox } from "./sandbox";
 
 export interface Env {
-  Sandbox: DurableObjectNamespace<HermesSandbox>;
+  Sandbox: DurableObjectNamespace<AgentSandbox>;
   /** Snapshots, indexes, templates and assignments. No secrets. */
   BACKUP_BUCKET: R2Bucket;
   /** Per-user secrets, always encrypted with MASTER_KEY. See secrets.ts. */

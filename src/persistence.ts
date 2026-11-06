@@ -29,8 +29,12 @@ export interface BackupEntry {
   createdAt: string;
   /** Size of the staged tree, for observability. */
   stagedBytes?: number;
+  stagedFiles?: number;
   handle: DirectoryBackup;
 }
+
+/** The one archive of a backup. */
+export const backupKey = (id: string) => `backups/${id}/data.sqsh`;
 
 const indexKey = (sub: string) => `users/${sub}/backups-index.json`;
 
@@ -38,7 +42,8 @@ export async function getIndex(bucket: R2Bucket, sub: string): Promise<BackupEnt
   const object = await bucket.get(indexKey(sub));
   if (!object) return [];
   // A corrupt index must not read as "no backups": that would start the user fresh over real data.
-  return (await object.json()) as BackupEntry[];
+  // Backups from SDK 1.0 are tar+zstd, which this SDK can't restore. They're kept under hold/ in R2.
+  return ((await object.json()) as (BackupEntry & { handle: { format?: string } })[]).filter((entry) => !entry.handle.format);
 }
 
 async function run(sandbox: Sandbox, command: string, label: string): Promise<string> {
@@ -136,14 +141,16 @@ export async function createSnapshot(sandbox: Sandbox, bucket: R2Bucket, sub: st
   const stdout = await run(sandbox, `${AF_STATE} stage ${HERMES_HOME} ${STAGE_DIR}`, "stage");
   const staged = JSON.parse(stdout) as { files: number; bytes: number; databases: string[] };
   const handle = await sandbox.createBackup({ dir: STAGE_DIR, ttl: BACKUP_TTL_SECONDS, localBucket: true });
+  // Names and sizes of the top level only, to show where the size goes.
+  const largest = await sandbox.exec(`cd ${STAGE_DIR} && du -sk -- * .[!.]* 2>/dev/null | sort -rn | head -8 | awk '{print $2"="$1"k"}' | paste -sd' '`).then((r) => r.stdout.trim(), () => "");
   await sandbox.exec(`rm -rf ${STAGE_DIR}`);
 
   const entry: BackupEntry = {
-    id: handle.id, dir: handle.dir, createdAt: new Date().toISOString(), stagedBytes: staged.bytes, handle,
+    id: handle.id, dir: handle.dir, createdAt: new Date().toISOString(), stagedBytes: staged.bytes, stagedFiles: staged.files, handle,
   };
   const index = await getIndex(bucket, sub);
   index.push(entry);
   await bucket.put(indexKey(sub), JSON.stringify(index));
-  console.log(`[snapshot:${sub}] ${handle.id}: ${staged.files} files, ${staged.bytes} bytes, ${Date.now() - t0}ms`);
+  console.log(`[snapshot:${sub}] ${handle.id}: ${staged.files} files, ${staged.bytes} bytes, ${(await bucket.head(backupKey(handle.id)))?.size ?? "?"} compressed, ${Date.now() - t0}ms, largest: ${largest}`);
   return entry;
 }

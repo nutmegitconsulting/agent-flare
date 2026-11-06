@@ -14,15 +14,17 @@ import { clearProviderKey, keyStatuses, setProviderKey, type KeyScope, type KeyS
 import { configFingerprint, overrideKey, resolveEffective, type Effective, type UserOverride } from "./effective";
 import type { Env } from "./env";
 import { escapeHtml as e } from "./pages";
-import { getIndex } from "./persistence";
+import { backupKey, getIndex, type BackupEntry } from "./persistence";
+import { awakeCount, loadSettings, saveSettings } from "./settings";
+import { parseLeaseHours } from "./lease";
 import { TIER_MARKS, validateProviders, type GatewayProviderEntry, type ModelTier, type ModelTiers } from "./providers";
-import type { HermesSandbox } from "./sandbox";
+import type { AgentSandbox } from "./sandbox";
 import { loadAssignments, loadTiers, templateSecrets, TIERS_KEY, type Assignments, type TemplateDefinition } from "./templates";
 
 type Vars = { identity: AccessIdentity; jwt: string };
 type App = Hono<{ Bindings: Env; Variables: Vars }>;
 type Ctx = Context<{ Bindings: Env; Variables: Vars }>;
-type SandboxFor = (env: Env, sub: string) => HermesSandbox;
+type SandboxFor = (env: Env, sub: string) => AgentSandbox;
 
 const ROLE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const EMAIL_RE = /^[^\s@<>"']{1,128}@[^\s@<>"']{1,128}$/;
@@ -126,7 +128,7 @@ async function readDefinition(bucket: R2Bucket, role: string): Promise<TemplateD
 interface UserView {
   sub: string;
   email: string | null;
-  details: Awaited<ReturnType<HermesSandbox["describe"]>>;
+  details: Awaited<ReturnType<AgentSandbox["describe"]>>;
   backups: number;
   effective: Effective | null;
   keys: Record<string, KeyStatus>;
@@ -144,6 +146,23 @@ async function readUser(c: Ctx, sandboxFor: SandboxFor, sub: string): Promise<Us
   const tiers = await loadTiers(c.env.BACKUP_BUCKET);
   const applied = (details.config as { fingerprint?: string } | null)?.fingerprint;
   return { sub, email, details, backups, effective, keys, tiers, pending: !!applied && applied !== await configFingerprint(effective, keys, tiers) };
+}
+
+const minutesFrom = (at: number | null | undefined) => (at ? `${Math.max(0, Math.ceil((at - Date.now()) / 60_000))} min` : "unknown");
+const when2 = (ms: number | null | undefined) => (ms ? when(new Date(ms).toISOString()) : "unknown");
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function backupRows(base: string, backups: BackupEntry[], lastRestore: { id?: string; at?: number; skipped?: string[] } | null): string {
+  const newest = backups.at(-1)?.id;
+  return [...backups].reverse().map((b) => {
+    const size = b.stagedBytes;
+    const status = lastRestore?.id === b.id ? `Restored and verified ${when2(lastRestore.at)}`
+      : lastRestore?.skipped?.includes(b.id) ? "Failed verification" : "Not restored yet";
+    return `<tr><td>${when(b.createdAt)}${b.id === newest ? " <strong>(newest)</strong>" : ""}</td>
+      <td>${size ? `${(size / 1_048_576).toFixed(1)} MB` : "unknown"}</td>
+      <td>${e(status)}</td>
+      <td><a href="${base}/backups/${encodeURIComponent(b.id)}">Download</a></td></tr>`;
+  }).join("");
 }
 
 const PENDING = `<span class="warn">Change waiting for next boot</span>`;
@@ -183,6 +202,10 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
       <td>${u.pending ? PENDING : "Up to date"}</td></tr>`).join("");
     return page("Users", `<div class="scroll"><table><tr><th>User</th><th>Status</th><th>Backups</th><th>Role</th><th>Provider</th><th>Config</th></tr>
       ${rows || `<tr><td colspan="6" class="muted">Nobody has logged in yet.</td></tr>`}</table></div>
+      <h2>Containers awake at once</h2>
+      <p>${await awakeCount(c.env.BACKUP_BUCKET)} awake now. Containers already running are never stopped by this. Someone over the limit sees an "at capacity" page.</p>
+      <form method="post" action="/__af/admin/settings"><label for="max-awake">Limit, 0 for no limit</label>
+        <input id="max-awake" type="text" inputmode="numeric" name="maxAwake" value="${(await loadSettings(c.env.BACKUP_BUCKET)).maxAwake}"> <button>Save</button></form>
       <p class="muted">Admins come from the ADMIN_EMAILS Worker variable. These screens can't change it.</p>`);
   });
 
@@ -208,6 +231,20 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return page(user.email, `
       <p>${statusText(user)}. ${user.backups} backup(s). ${user.pending ? PENDING : "Running config is up to date."}</p>
       ${user.details.status.state === "failed" ? `<p class="warn">${e(user.details.status.error)}</p>` : ""}
+      <h2>Container</h2>
+      ${(() => {
+        const lease = user.details.lease as { state: string; reason?: string; stopsAt?: number; idleAt?: number };
+        return lease.state === "awake"
+          ? `<p>Awake. ${lease.reason === "lease" ? `Kept awake until ${when2(lease.stopsAt)}.` : lease.idleAt ? `Idle time runs out in ${minutesFrom(lease.idleAt)}.` : "The user's status chip hasn't reported yet."}</p>
+             <form method="post" action="${base}/keep-awake" class="inline"><button name="hours" value="1">Keep awake 1 hour</button> <button name="hours" value="2">Keep awake 2 hours</button></form>
+             <form method="post" action="${base}/stop" class="inline"><button>Stop, saving first</button></form>`
+          : `<p>${lease.state === "parked" ? "Stopped, until the user wakes it." : "Asleep. It starts when the user opens the page."}</p>`;
+      })()}
+      <h2>Backups</h2>
+      <p class="warn">A download holds this person's chats and files, and any passwords or keys in them.</p>
+      <div class="scroll"><table><tr><th>When</th><th>Size</th><th>Status</th><th></th></tr>
+      ${backupRows(base, await getIndex(c.env.BACKUP_BUCKET, sub).catch(() => []), user.details.lastRestore as never) || `<tr><td colspan="4" class="muted">No backups yet.</td></tr>`}</table></div>
+
       <h2>Effective config</h2>
       <p>Role: <strong>${e(eff.role ?? "none")}</strong>, from ${e(SOURCE_TEXT[eff.source])}. Order: per-user override, then assigned role, then group, domain and default assignments.</p>
       ${providers || `<p class="muted">No providers. This user opens Hermes's own setup.</p>`}
@@ -236,6 +273,65 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
       <p>A default model applies only if the user hasn't picked their own. Their conversations, files and their own settings stay as they are. A model list and default make choosing easy, and they aren't access limits.</p>
       <form method="post" action="${base}/apply"><button>Apply now: save a snapshot, then restart on next visit</button></form>
       <p class="muted">If the snapshot fails, the container stays up and nothing changes. This ends any turn in progress.</p>`);
+  });
+
+  admin.post("/u/:sub/keep-awake", async (c) => {
+    const sub = c.req.param("sub");
+    const back = `/__af/admin/u/${encodeURIComponent(sub)}`;
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return problem("No one with this ID has logged in.", "/__af/admin");
+    const hours = parseLeaseHours(Number(String((await c.req.parseBody()).hours ?? "")));
+    if (!hours) return problem("Keep awake is 1 or 2 hours.", back);
+    const result = await sandboxFor(c.env, sub).keepAwake(hours);
+    if ("error" in result) return problem("The container isn't running.", back);
+    await audit(c, "keep-awake", email, { hours });
+    return seeOther(back);
+  });
+
+  admin.post("/u/:sub/stop", async (c) => {
+    const sub = c.req.param("sub");
+    const back = `/__af/admin/u/${encodeURIComponent(sub)}`;
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return problem("No one with this ID has logged in.", "/__af/admin");
+    const result = await sandboxFor(c.env, sub).stopByUser();
+    if ("error" in result) {
+      await audit(c, "stop.failed", email);
+      return problem("The snapshot failed, so the container stays up and nothing changed.", back);
+    }
+    await audit(c, "stop", email, { result: result.status });
+    return seeOther(back);
+  });
+
+  // Only an ID in this user's own index resolves, and it only ever names that backup's archive, so this can't
+  // reach any other object in the bucket. Streams from R2: nothing is held in memory.
+  admin.get("/u/:sub/backups/:id", async (c) => {
+    const sub = c.req.param("sub");
+    const id = c.req.param("id");
+    if (!UUID_RE.test(id)) return c.text("Not found", 404);
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    const entry = (await getIndex(c.env.BACKUP_BUCKET, sub).catch(() => [])).find((b) => b.id === id);
+    if (!email || !entry) return c.text("Not found", 404);
+    const key = backupKey(entry.id);
+    const object = await c.env.BACKUP_BUCKET.get(key);
+    if (!object) return c.text("Not found", 404);
+    await audit(c, "backup.download", email, { backup: id });
+    return new Response(object.body, {
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-length": String(object.size),
+        "content-disposition": `attachment; filename="agent-flare-${id}.sqsh"`,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  });
+
+  admin.post("/settings", async (c) => {
+    const value = Number(String((await c.req.parseBody()).maxAwake ?? ""));
+    if (!Number.isInteger(value) || value < 0 || value > 10_000) return problem("That has to be a whole number, 0 for no limit.", "/__af/admin");
+    await saveSettings(c.env.BACKUP_BUCKET, { maxAwake: value });
+    await audit(c, "settings.max-awake", "all", { maxAwake: value });
+    return seeOther("/__af/admin");
   });
 
   admin.post("/u/:sub/role", async (c) => {

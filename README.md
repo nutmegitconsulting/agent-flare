@@ -16,6 +16,8 @@ Browser ── HTTPS ──▶ Cloudflare Access ──▶ Worker ──▶ that
 - **State survives.** Snapshots go to R2 every 10 minutes while in use and on every stop. Restores are verified, and a bad backup never replaces a good one.
 - **Inference ready on first launch.** A template assigned by email, Access group or domain gives a user a working provider and model, with nothing to set up.
 
+For people using it: [the user guide](docs/USER-GUIDE.md).
+
 ## How state works
 
 Container disks are ephemeral, so a user's Hermes home (`/home/hermes/.hermes`) is rebuilt on every boot.
@@ -29,7 +31,7 @@ Container disks are ephemeral, so a user's Hermes home (`/home/hermes/.hermes`) 
 
 If backups exist and none can be restored, **the container doesn't start**. The user sees an error, and the backups stay as they are. Starting empty would soon snapshot an empty home over their history.
 
-**Snapshot.** `container/af_state.py` builds a staged copy first: SQLite through its backup API (consistent even while Hermes writes), without Hermes' logs and caches, without secrets. The SDK archives that copy. What counts as a secret is Hermes' own list of credential stores, at the home's root and inside each profile. Those files are encrypted into KV separately, so the bucket is safe to replicate. KV holds about 12 MB per user; past that the largest files, usually browser data, are left out and logged.
+**Snapshot.** `container/af_state.py` builds a staged copy first: SQLite through its backup API (consistent even while Hermes writes), without Hermes' logs and caches, without secrets. The SDK archives that copy. What counts as a secret is Hermes' own list of credential stores, at the home's root and inside each profile. Those files are encrypted into KV separately. **A backup can still hold plaintext credentials:** `config.yaml`, chat history, memories and `workspace/` go in as they are. Treat the bucket as sensitive. KV holds about 12 MB per user; past that the largest files, usually browser data, are left out and logged.
 
 Hydration, snapshots and pruning for a user run one at a time inside their Durable Object.
 
@@ -132,6 +134,8 @@ It's used only while the user hasn't set that variable themselves.
 `/__af/admin`, for people in `ADMIN_EMAILS`: users with status and backups, a user's effective config, roles, per-user overrides, keys, and an audit trail.
 
 A role is a template, so the screens and `scripts/templates.mjs` work on the same thing. Precedence: per-user override, then assigned role, then group, domain and default assignments. Roles set which models appear in the picker, the default, and the provider settings. They make choosing easy and aren't access limits: a provider key is in each user's `.env`, so their agent can use whatever it allows.
+
+An admin can also see and control a user's container from their page, and download a backup: streamed from R2 and recorded in the audit trail. A download holds that person's chats and files, and any passwords or keys in them. There's an optional limit on containers awake at once, 0 for none, checked only when starting one.
 
 Keys are write-only, and sealed in KV. Screens show only whether one is set and when it changed. Order: user, then role, then the Worker secret the provider names.
 
