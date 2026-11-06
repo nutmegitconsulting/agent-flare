@@ -16,3 +16,4 @@ templates/*
 !templates/example/
 !templates/assignments.example.json
 !templates/model-tiers.example.json
+AGENTS.md
