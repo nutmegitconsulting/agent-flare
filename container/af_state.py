@@ -297,6 +297,22 @@ def _deep_merge(base, overlay):
     return base
 
 
+def _block_style(node):
+    """Lay every mapping and list out in block style, in place. A document pasted as JSON or flow
+    YAML loads as flow nodes, and ruamel writes merged values into them unquoted: "::1" in a flow
+    list round-trips through ruamel but Hermes' safe parser rejects the file, and the webapp never
+    starts. Block style keeps keys, order, values and comments; only the layout changes."""
+    if hasattr(node, "fa"):
+        node.fa.set_block_style()
+    if isinstance(node, dict):
+        for value in node.values():
+            _block_style(value)
+    elif isinstance(node, list):
+        for value in node:
+            _block_style(value)
+    return node
+
+
 def _fill_defaults(base, defaults):
     """Base wins: add only what's absent, so a user's later edits to a default survive."""
     for key, value in defaults.items():
@@ -473,7 +489,8 @@ def apply(home: Path, bundle_path: Path) -> dict:
     }
 
     buffer = StringIO()
-    yaml.dump(config, buffer)
+    yaml.default_flow_style = False
+    yaml.dump(_block_style(config), buffer)
     _write(config_path, buffer.getvalue().encode())
 
     _write(marker_path, json.dumps({

@@ -62,7 +62,7 @@ WORKDIR /home/hermes
 ENV HOME=/home/hermes
 # Tested Hermes commit. The webapp and its auth internals move fast, so bump this
 # deliberately and re-run tests/container/run.sh.
-ARG HERMES_COMMIT=ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df
+ARG HERMES_COMMIT=31ce88f86e6cf4a66ef6aa315e4657a31bcf9915
 RUN --mount=type=secret,id=build_ca,uid=1000,required=false \
     . /usr/local/lib/af-build-ca-env \
     && UV_PYTHON_INSTALL_DIR=/opt/uv/python \

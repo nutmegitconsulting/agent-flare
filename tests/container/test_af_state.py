@@ -278,6 +278,30 @@ class Apply(Base):
         self.assertEqual(config["model"], "chosen")
         self.assertEqual(dict(config["webapp"]), {"port": 9120, "extra": "keep", "enabled": True})
 
+    # Hermes reads config.yaml with ruamel's strict safe parser (hermes_yaml), not the round-trip one.
+    def strict_load(self):
+        from ruamel.yaml import YAML
+        return YAML(typ="safe").load((self.home / "config.yaml").read_text())
+
+    PROXIES = ["10.0.0.0/8", "127.0.0.1", "::1", "fc00::/7"]
+
+    def test_a_json_document_comes_out_readable_by_hermes(self):
+        doc = json.dumps({"model": {"default": "m1"}, "custom_providers": [{"name": "p", "base_url": "http://x/v1"}]})
+        self.bundle(config_yaml=doc, config_platform={"webapp": {"port": 9120, "public_url": "https://a.example.com"},
+                                                      "dashboard": {"trusted_proxies": self.PROXIES}})
+        config = self.strict_load()
+        self.assertEqual(config["dashboard"]["trusted_proxies"], self.PROXIES)
+        self.assertEqual(config["model"]["default"], "m1")
+        self.assertEqual(config["custom_providers"][0]["name"], "p")
+        self.assertNotIn("{", (self.home / "config.yaml").read_text())
+
+    def test_a_block_document_keeps_its_layout_and_comments(self):
+        doc = "# my notes\nmodel:\n  default: m1  # the one I use\nterminal:\n  backend: local\n"
+        self.bundle(config_yaml=doc, config_platform={"dashboard": {"trusted_proxies": self.PROXIES}})
+        text = (self.home / "config.yaml").read_text()
+        self.assertTrue(text.startswith(doc), text)
+        self.assertEqual(self.strict_load()["dashboard"]["trusted_proxies"], self.PROXIES)
+
     def test_a_document_that_is_not_a_mapping_fails_the_boot(self):
         with self.assertRaises(ValueError):
             self.bundle(config_yaml="- a\n- b\n")
