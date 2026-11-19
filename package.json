@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.12.14",
-    "hono": "^4.5.0"
+    "hono": "^4.5.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260820.1",

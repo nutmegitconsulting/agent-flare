@@ -43,6 +43,13 @@
   "kv_namespaces": [
     { "binding": "CREDENTIALS_KV", "id": "YOUR_KV_NAMESPACE_ID" }
   ],
+  // Optional per-user dev-sandbox sidecar (route A). scripts/render-wrangler.mjs renders the
+  // service name in when AF_DEV_SANDBOX_WORKER is set, and strips this block otherwise.
+  // The sidecar Worker must have workers_dev: false and no routes: it is reachable only
+  // through this binding.
+  // BEGIN_DEV_SANDBOX
+  "services": [{ "binding": "DEV_SANDBOX", "service": "DEV_SANDBOX_WORKER_NAME" }],
+  // END_DEV_SANDBOX
   // Keeps secrets set with `wrangler secret put` across deploys.
   "keep_vars": true,
   "vars": {

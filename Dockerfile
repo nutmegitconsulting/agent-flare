@@ -112,6 +112,9 @@ RUN chown root:root /opt/hermes-install /opt/hermes-install/hermes-agent /opt/uv
 # --- Agent Flare additions ---
 # Bundled plugin location: discovered like Hermes' own dashboard auth providers.
 COPY --chown=root:root container/plugins/cloudflare_access /opt/hermes-install/hermes-agent/plugins/dashboard_auth/cloudflare_access
+# Baked dev-sandbox terminal backend (route A). Per-user installs also work; baking makes it
+# present for every user at the next image build. It stays inert until CF_DEV_SANDBOX_URL is set.
+COPY --chown=root:root container/plugins/cloudflare_sandbox /opt/hermes-install/hermes-agent/plugins/cloudflare_sandbox
 COPY --chown=root:root container/af_state.py /usr/local/lib/af_state.py
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
 COPY --chown=root:root container/desktop-plugins/agent-flare/plugin.js /usr/local/lib/af-desktop-plugin.js

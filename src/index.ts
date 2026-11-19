@@ -21,7 +21,8 @@ import { AgentSandbox, HermesSandbox, WEBAPP_PORT, type ReadyState } from "./san
 import { putSealed, prefillKey } from "./secrets";
 import { forbiddenTestSettings } from "./test-settings";
 
-export { AgentSandbox, HermesSandbox };
+export { AgentSandbox, HermesSandbox } from "./sandbox";
+export { SandboxGateway } from "./gateway";
 
 type Vars = { identity: AccessIdentity; jwt: string };
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();

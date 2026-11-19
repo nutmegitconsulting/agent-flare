@@ -11,7 +11,8 @@
  *   files              relative paths, copied on first launch unless the file already exists
  *   mode               optional map of path -> POSIX mode
  *   config_defaults    config.yaml values set on first launch; the user can change them later
- *   config_managed     config.yaml values reapplied on every boot; these always win
+ *   config_managed     no longer applied. A warning says so. The role's config.yaml (templates/<name>/config.yaml,
+ *                      see userconfig.ts) is what seeds a new account's config.yaml.
  *   env                .env values reapplied on every boot. "$NAME" reads Worker secret NAME, which
  *                      must be listed in the TEMPLATE_SECRETS var.
  *   providers          AI Gateway custom providers (see providers.ts)
@@ -44,7 +45,6 @@ export interface ResolvedTemplate {
   name: string;
   files: { path: string; content: string; mode?: number }[];
   configDefaults: Record<string, unknown>;
-  configManaged: Record<string, unknown>;
   env: Record<string, string>;
   providers: GatewayProviderEntry[];
   warnings: string[];
@@ -179,6 +179,10 @@ export async function loadTemplate(
     });
   }
 
+  if (definition.config_managed && Object.keys(definition.config_managed).length) {
+    warnings.push("config_managed is no longer applied; edit the role's config.yaml in the admin screens");
+  }
+
   let providers: GatewayProviderEntry[] = [];
   if (definition.providers !== undefined) {
     const parsed = validateProviders(definition.providers);
@@ -190,7 +194,6 @@ export async function loadTemplate(
     name,
     files,
     configDefaults: definition.config_defaults ?? {},
-    configManaged: definition.config_managed ?? {},
     env: resolveEnv(definition.env ?? {}, secrets, warnings),
     providers,
     warnings,

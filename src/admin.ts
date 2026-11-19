@@ -21,6 +21,7 @@ import { awakeCount, loadSettings, saveSettings } from "./settings";
 import { parseLeaseHours } from "./lease";
 import { TIER_MARKS, validateProviders, type GatewayProviderEntry, type ModelTier, type ModelTiers } from "./providers";
 import type { AgentSandbox } from "./sandbox";
+import { checkConfigText, loadRoleConfig, loadUserConfig, saveRoleConfig } from "./userconfig";
 import { loadAssignments, loadTiers, templateSecrets, TIERS_KEY, type Assignments, type TemplateDefinition } from "./templates";
 
 type Vars = { identity: AccessIdentity; jwt: string };
@@ -125,6 +126,15 @@ const problem = (message: string, back: string) =>
   page("That didn't save", `<p class="warn">${e(message)}</p><p>Nothing was changed. <a href="${e(back)}">Back</a></p>`, 400);
 
 const seeOther = (location: string) => new Response(null, { status: 303, headers: { location } });
+
+/** The config.yaml editor, shared by a user's page and a role's page. The text is the whole file. */
+const configForm = (action: string, text: string | null) => `
+  <form method="post" action="${e(action)}">
+    <label for="cfg">config.yaml</label>
+    <textarea id="cfg" name="config" rows="32" spellcheck="false" style="font-family:monospace">${e(text ?? "")}</textarea>
+    <p class="muted">Put a secret in <code>.env</code> and name it with <code>key_env</code>; a literal key is refused. Hermes sets <code>_config_version</code> itself: leave it in place. The webapp and dashboard settings are set by the platform and overwrite this file's values on every start.</p>
+    <button>Save</button>
+  </form>`;
 const when = (iso: string | null | undefined) => (iso ? e(iso.replace("T", " ").slice(0, 16)) + " UTC" : "not recorded");
 
 function keyText(status: KeyStatus | undefined): string {
@@ -293,6 +303,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return page(user.email, `
       <p>${statusText(user)}. ${user.backups} backup(s). ${user.pending ? PENDING : "Running config is up to date."}</p>
       ${user.details.status.state === "failed" ? `<p class="warn">${e(user.details.status.error)}</p>` : ""}
+      <p><a href="${base}/config">Edit config.yaml</a></p>
       <h2>Container</h2>
       ${(() => {
         const lease = user.details.lease as { state: string; reason?: string; stopsAt?: number; idleAt?: number };
@@ -310,7 +321,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
       <h2>Effective config</h2>
       <p>Role: <strong>${e(eff.role ?? "none")}</strong>, from ${e(SOURCE_TEXT[eff.source])}. Order: per-user override, then assigned role, then group, domain and default assignments.</p>
       ${providers || `<p class="muted">No providers. This user opens Hermes's own setup.</p>`}
-      <p>Reapplied every boot, and the role wins: ${e(Object.keys(templateKeys?.configManaged ?? {}).join(", ") || "none")}.<br>
+      <p>This account's config.yaml is <a href="${base}/config">edited here</a>. Saving restarts a running container, so an open session is disconnected.<br>
          Set once, then the user's to change: ${e(Object.keys(templateKeys?.configDefaults ?? {}).join(", ") || "none")}.<br>
          Environment variables from the role: ${e(Object.keys(templateKeys?.env ?? {}).join(", ") || "none")}.</p>
 
@@ -439,6 +450,37 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return saveKey(c, { kind: "user", email }, email, back);
   });
 
+  admin.get("/u/:sub/config", async (c) => {
+    const sub = c.req.param("sub");
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return page("Unknown user", `<p>No one with this ID has logged in.</p>`, 404);
+    const text = await loadUserConfig(c.env.BACKUP_BUCKET, sub);
+    const base = `/__af/admin/u/${encodeURIComponent(sub)}`;
+    return page(`config.yaml: ${email}`, `
+      <p><a href="${base}">Back to ${e(email)}</a></p>
+      ${text === null ? `<p class="muted">No config.yaml yet. It's created from the role's on this account's first start.</p>` : ""}
+      ${configForm(`${base}/config`, text)}`);
+  });
+
+  admin.post("/u/:sub/config", async (c) => {
+    const sub = c.req.param("sub");
+    const back = `/__af/admin/u/${encodeURIComponent(sub)}/config`;
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return problem("No one with this ID has logged in.", "/__af/admin");
+    const text = String((await c.req.parseBody()).config ?? "").replace(/\r\n/g, "\n");
+    const check = checkConfigText(text);
+    if (!check.ok) return problem(check.error, back);
+    const result = await sandboxFor(c.env, sub).applyConfigEdit(check.text);
+    if ("error" in result) {
+      // The detail can quote files or logs, so it goes to the logs and not the page.
+      console.error(`[admin:config:${sub}] ${result.error}`);
+      await audit(c, "config.failed", email);
+      return problem("The snapshot failed, so the container stays up and nothing changed. Check the logs and try again.", back);
+    }
+    await audit(c, "config.save", email, { result: result.status, bytes: new TextEncoder().encode(check.text).length });
+    return seeOther(`/__af/admin/u/${encodeURIComponent(sub)}`);
+  });
+
   admin.post("/u/:sub/apply", async (c) => {
     const sub = c.req.param("sub");
     const back = `/__af/admin/u/${encodeURIComponent(sub)}`;
@@ -490,6 +532,30 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return seeOther(`/__af/admin/roles/${encodeURIComponent(name)}`);
   });
 
+  admin.get("/roles/:name/config", async (c) => {
+    const role = c.req.param("name");
+    if (!ROLE_RE.test(role)) return page("Unknown role", `<p>That isn't a role name.</p>`, 404);
+    const text = await loadRoleConfig(c.env.BACKUP_BUCKET, role);
+    const base = `/__af/admin/roles/${encodeURIComponent(role)}`;
+    return page(`config.yaml: role ${role}`, `
+      <p><a href="${base}">Back to role ${e(role)}</a></p>
+      <p class="muted">Seeds each account in this role that has no config.yaml yet, on its first start. Accounts that already have one keep it: change those on the account's page.</p>
+      ${text === null ? `<p class="muted">This role has no config.yaml yet.</p>` : ""}
+      ${configForm(`${base}/config`, text)}`);
+  });
+
+  admin.post("/roles/:name/config", async (c) => {
+    const role = c.req.param("name");
+    const back = `/__af/admin/roles/${encodeURIComponent(role)}/config`;
+    if (!ROLE_RE.test(role)) return problem("Role names are letters, digits, dashes and underscores.", "/__af/admin/roles");
+    const text = String((await c.req.parseBody()).config ?? "").replace(/\r\n/g, "\n");
+    const check = checkConfigText(text);
+    if (!check.ok) return problem(check.error, back);
+    await saveRoleConfig(c.env.BACKUP_BUCKET, role, check.text);
+    await audit(c, "role.config.save", role, { bytes: new TextEncoder().encode(check.text).length });
+    return seeOther(`/__af/admin/roles/${encodeURIComponent(role)}`);
+  });
+
   admin.get("/roles/:name", async (c) => {
     const role = c.req.param("name");
     if (!ROLE_RE.test(role)) return page("Unknown role", `<p>That isn't a role name.</p>`, 404);
@@ -522,8 +588,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
       <form method="post" action="${base}/key"><input type="hidden" name="provider" value="${e(provider.name)}">
         <label for="r-key">New key</label><input id="r-key" type="password" name="value" autocomplete="off">
         <button name="action" value="set">Save key</button><button name="action" value="clear">Remove this role's key</button></form>` : ""}
+      <h2>config.yaml</h2>
+      <p class="warn">Only the keys and the selected model come from this form. Models, endpoints, gateway names and headers are not written into config.yaml: the role's config.yaml sets those.</p>
+      <p><a href="${base}/config">Edit the role's config.yaml</a></p>
       <h2>When changes take effect</h2>
-      <p>At each assigned user's next boot. The Users screen shows who is waiting, and their page can apply it now. Other settings in this role's template, such as <code>config_managed</code>, stay as they are.</p>`);
+      <p>Keys and environment variables apply at each assigned user's next boot. The config.yaml applies only to accounts that don't have one yet.</p>`);
   });
 
   admin.post("/roles/:name", async (c) => {

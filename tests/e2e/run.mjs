@@ -156,7 +156,6 @@ writeFileSync(join(persist, "byo.json"), JSON.stringify({
 writeFileSync(join(persist, "template.json"), JSON.stringify({
   files: ["SOUL.md"],
   config_defaults: { display: { theme: "from-template" } },
-  config_managed: { agent: { managed_key: "managed-value" } },
   env: { TEMPLATE_PLAIN: "plain-value", TEMPLATE_SECRET: "$SHARED_FROM_SECRET", STOLEN: "$MASTER_KEY" },
   providers: [{ name: "gw", mode: "api_token", base_url: "https://x.example/v1", key_env: "GW_KEY",
     gateway_id: "slug", model: "m", models: { m: { context_length: 1000 } } }],
@@ -259,11 +258,8 @@ try {
   expect(inside(alice, `cat ${HOME}/SOUL.md`) === "template soul", "template file applied");
   const config = inside(alice, `cat ${HOME}/config.yaml`);
   expect(config.includes("from-template"), "template default applied", config);
-  expect(config.includes("managed-value"), "managed key applied", config);
-  expect(config.includes("cf-aig-metadata") && config.includes(alice.email), "provider tagged with the user", config);
   const modelInfo = await alice.json("/api/model/info");
   expect(modelInfo.provider === "gw" && modelInfo.model === "m", "first launch has the template's provider selected", JSON.stringify(modelInfo));
-  expect(config.includes("model_aliases") && config.includes(".$$\u2800m") && config.includes("model: m"), "the tier mark is in the model's name, aliased to the real ID", config);
   expect(JSON.parse(inside(alice, `cat ${HOME}/ui-preferences.json`)).values["hermes-desktop-mode-v1"] === "dark", "a new home starts in dark mode");
   const aliceConfig = (await admin.json("/__af/admin/users")).users.find((u) => u.sub === alice.sub).config;
   expect(aliceConfig.inference.selected === "gw" && !aliceConfig.warnings.some((w) => w.includes("provider")), "admin sees the provider selected", JSON.stringify(aliceConfig));
@@ -638,7 +634,6 @@ try {
   expect(restored.state === "ready", "woke and hydrated", JSON.stringify(restored));
   expect(sql(alice, "print(c.execute('select v from e2e').fetchone()[0])") === "survived", "database row survived");
   expect(inside(alice, `cat ${HOME}/SOUL.md`) === "mine", "user's edit survived");
-  expect(inside(alice, `cat ${HOME}/config.yaml`).includes("managed-value"), "managed key still applied");
   expect(inside(alice, `cat ${HOME}/.env`).includes("USER_ADDED_KEY=e2e-user-secret"), "user's secret survived, via KV");
   expect(inside(alice, `stat -c %a ${HOME}/.env`) === "600", ".env is private");
   expect((await alice.load()).status === 200, "webapp loads again after restore");

@@ -52,6 +52,7 @@ Fork this repo, then in the dashboard: Workers & Pages → Create → Import a r
 | `AF_R2_BUCKET` | default `agent-flare-state` | No |
 | `AF_MAX_INSTANCES` | default `10`: at most this many users awake at once | No |
 | `AF_WORKER_NAME` | default `agent-flare` | No |
+| `AF_DEV_SANDBOX_WORKER` | `cf-dev-sandbox` | No — enables per-user dev sandboxes (route A). Requires the sidecar Worker deployed in the same account; unset strips the feature entirely. See below. |
 
 Every push to your production branch redeploys.
 
@@ -88,6 +89,17 @@ npx wrangler deploy --config wrangler.prod.jsonc
 ```
 
 The `Dockerfile` pins its base by digest, so a local image with the same tag can't become the base without an explicit `AF_BASE_IMAGE`. `scripts/check-image.sh` refuses an image with the CA or its settings in its env, history or files.
+
+## Optional: per-user dev sandboxes (route A)
+
+Each user's terminal/`execute_code`/file tools run in their own Cloudflare Sandbox container instead of the agent container, reached through an internal gateway (no public hostname). Setup:
+
+```bash
+# Sidecar — once per account, same account as this Worker (no secret needed):
+git clone <cf-dev-sandbox repo> && cd worker && npm install && npx wrangler deploy
+```
+
+Then set `AF_DEV_SANDBOX_WORKER=cf-dev-sandbox` as a build variable. Feature is per-Worker: tenants that don't set it are unaffected. One sidecar can serve several agent-flare Workers in the same account — sandbox keys derive from the verified Access `sub`, so the same person's dev sandbox follows them across tenants that bind the same sidecar; deploy a second sidecar (same code, another `--name`) if you want tenant-isolated sandboxes. Users pick it up with `hermes plugins enable cloudflare-sandbox` (baked in images built after the Dockerfile COPY, or install the plugin per user) and `hermes config set terminal.backend cloudflare_sandbox`. Sidecar container time bills separately from this Worker's `max_instances` cap.
 
 ## 5. Add a provider template
 
@@ -129,7 +141,7 @@ Check `/__af/admin/users` for backup counts, and `npx wrangler tail` for logs.
 | "MASTER_KEY must be set" | Set the Worker secret (step 3) |
 | Starting page never finishes | `wrangler tail`; also check `max_instances`. A user past the limit can't get a container |
 | Sent to `/login` instead of straight in | The webapp credential changed. Click Sign in with Cloudflare Access once |
-| User's settings reverted | The key is in the template's `config_managed` or `env`, which reapply on every boot |
+| User's settings reverted | The account's config.yaml in R2 is the one that counts: check its page. `env` reapplies on every boot |
 | Hermes asks to connect a provider | No provider has a credential. `/__af/admin/users` shows `config.inference.missing` and `config.warnings`. Set the secret and the user's next boot selects it |
 | Messages fail with 401 or 403 | The credential was refused: check the Worker secret can use that gateway |
 

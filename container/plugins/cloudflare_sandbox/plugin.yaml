@@ -1,0 +1,7 @@
+name: cloudflare-sandbox
+version: 0.1.0
+description: "Terminal backend: persistent per-user Cloudflare Sandbox container behind a Worker (agent-flare dev sandboxes)."
+author: Agent Flare
+kind: backend
+requires_env:
+  - CF_DEV_SANDBOX_URL

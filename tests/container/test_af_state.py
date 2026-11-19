@@ -1,6 +1,7 @@
 """Run with the image's Python: see tests/container/run.sh."""
 import base64
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -9,7 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, os.environ.get("AF_STATE_LIB", "/usr/local/lib"))  # the repo copy in CI
 import af_state  # noqa: E402
 
 
@@ -261,26 +262,35 @@ class Apply(Base):
 
     def test_a_broken_config_is_set_aside_not_fatal(self):
         (self.home / "config.yaml").write_text("a: [unclosed\n  b: :\n")
-        report = self.bundle(config_managed={"webapp": {"port": 9120}})
+        report = self.bundle(config_platform={"webapp": {"port": 9120}})
         self.assertTrue(report["config_recovered"])
         self.assertEqual(self.config()["webapp"]["port"], 9120)
         self.assertEqual(len(list(self.home.glob("config.yaml.corrupt.*"))), 1)
 
-    def test_managed_keys_win_every_boot_and_keep_user_keys_and_comments(self):
-        (self.home / "config.yaml").write_text("# my note\nmodel: mine\nwebapp:\n  port: 1\n  extra: keep\n")
-        self.bundle(config_managed={"webapp": {"port": 9120, "enabled": True}})
+    def test_the_account_document_replaces_the_file_and_platform_keys_win(self):
+        (self.home / "config.yaml").write_text("# old restored copy\nmodel: stale\nwebapp:\n  port: 1\n")
+        self.bundle(config_yaml="# admin note\nmodel: chosen\nwebapp:\n  port: 1\n  extra: keep\n",
+                    config_platform={"webapp": {"port": 9120, "enabled": True}})
         text = (self.home / "config.yaml").read_text()
-        self.assertIn("# my note", text)
+        self.assertIn("# admin note", text)
+        self.assertNotIn("stale", text)
         config = self.config()
-        self.assertEqual(config["model"], "mine")
+        self.assertEqual(config["model"], "chosen")
         self.assertEqual(dict(config["webapp"]), {"port": 9120, "extra": "keep", "enabled": True})
 
-    def test_named_lists_merge_by_name(self):
-        (self.home / "config.yaml").write_text(
-            "custom_providers:\n- name: mine\n  base_url: u\n- name: gw\n  base_url: old\n")
-        self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "new"}]})
-        providers = {p["name"]: p["base_url"] for p in self.config()["custom_providers"]}
-        self.assertEqual(providers, {"mine": "u", "gw": "new"})
+    def test_a_document_that_is_not_a_mapping_fails_the_boot(self):
+        with self.assertRaises(ValueError):
+            self.bundle(config_yaml="- a\n- b\n")
+
+    def test_a_provider_removed_from_the_document_is_gone_on_the_next_boot(self):
+        self.bundle(config_yaml="custom_providers:\n- name: gw\n  base_url: b\n- name: mine\n  base_url: u\n")
+        self.bundle(config_yaml="custom_providers:\n- name: mine\n  base_url: u\n")
+        self.assertEqual([p["name"] for p in self.config()["custom_providers"]], ["mine"])
+
+    def test_a_restored_file_is_replaced_by_the_document_each_boot(self):
+        (self.home / "config.yaml").write_text("custom_providers:\n- name: left-over\n  base_url: old\n")
+        self.bundle(config_yaml="model: m\n")
+        self.assertNotIn("custom_providers", self.config())
 
     def test_env_defaults_yield_to_the_user_and_managed_env_does_not(self):
         (self.home / ".env").write_text("USER_KEY=mine\nMANAGED=old\n")
@@ -394,15 +404,9 @@ class Apply(Base):
         self.assertEqual(self.bundle(ui_defaults={mode: "dark"})["ui_defaults"], [])
         self.assertEqual(store.read_text(), "not json")
 
-    def test_a_provider_the_template_dropped_leaves_and_a_users_own_stays(self):
-        (self.home / "config.yaml").write_text("custom_providers:\n- name: mine\n  base_url: u\n")
-        self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "b"}]})
-        self.bundle(config_managed={})
-        self.assertEqual([p["name"] for p in self.config()["custom_providers"]], ["mine"])
-
     def test_provider_credentials_stay_out_of_config_and_the_stage(self):
         self.bundle(env={"GW_KEY": "s3cret-value"}, provider_candidates=[self.GW],
-                    config_managed={"custom_providers": [{"name": "gw", "base_url": "b", "key_env": "GW_KEY"}]})
+                    config_yaml="custom_providers:\n- name: gw\n  base_url: b\n  key_env: GW_KEY\n")
         self.assertNotIn("s3cret-value", (self.home / "config.yaml").read_text())
 
     def test_paths_cannot_escape_home(self):

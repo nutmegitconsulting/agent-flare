@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { renderProviders, validateProviders } from "../../src/providers";
 import { fetchAccessGroups, loadTemplate, pickTemplate, resolveEnv, templateSecrets } from "../../src/templates";
@@ -12,7 +11,6 @@ function fakeBucket(objects: Record<string, string>) {
   } as unknown as R2Bucket;
 }
 
-const blank = (label: string) => label.replace(/ /g, "\u2800");
 
 describe("pickTemplate", () => {
   const assignments = {
@@ -67,7 +65,9 @@ describe("loadTemplate", () => {
     const template = await loadTemplate(bucket, "t", {});
     expect(template?.files.map((f) => f.path)).toEqual(["SOUL.md"]);
     expect(atob(template!.files[0].content)).toBe("hello");
-    expect(template?.warnings).toHaveLength(3);
+    // Three unsafe or missing files, and config_managed, which is no longer applied.
+    expect(template?.warnings).toHaveLength(4);
+    expect(template?.warnings).toContain("config_managed is no longer applied; edit the role's config.yaml in the admin screens");
   });
   it("refuses a template name that could escape its prefix", async () => {
     await expect(loadTemplate(fakeBucket({}), "../users", {})).rejects.toThrow("invalid template name");
@@ -97,61 +97,25 @@ describe("providers", () => {
     expect(validateProviders([entry, entry]).ok).toBe(false);
     expect(validateProviders([{ ...entry, gateway_id: undefined }]).ok).toBe(false);
   });
-  it("renders the credential only into env, never config", () => {
+  it("renders the credential into env and the selection only", () => {
     const parsed = validateProviders([entry]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, { gw: "tok", byo: "" }, "a@b.com");
+    const rendered = renderProviders(parsed.entries, { gw: "tok", byo: "" });
     expect(rendered.env).toEqual({ GW_KEY: "tok" });
-    expect(JSON.stringify(rendered.customProviders)).not.toContain("tok");
-    expect(rendered.customProviders[0].extra_headers).toEqual({
-      "cf-aig-gateway-id": "g1", "cf-aig-metadata": JSON.stringify({ user: "a@b.com" }),
-    });
+    expect(Object.keys(rendered).sort()).toEqual(["candidates", "env", "warnings"]);
     expect(rendered.candidates).toEqual([{ provider: "gw", model: "m1", key_env: "GW_KEY" }]);
   });
   it("selects the first listed model when none is named", () => {
     const parsed = validateProviders([{ ...entry, model: undefined, models: { first: {}, second: {} } }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    expect(renderProviders(parsed.entries, { gw: "tok", byo: "" }, "a@b.com").candidates[0].model).toBe("first");
+    expect(renderProviders(parsed.entries, { gw: "tok", byo: "" }).candidates[0].model).toBe("first");
   });
   it("names a user_env provider without injecting anything", () => {
     const parsed = validateProviders([{ name: "byo", mode: "user_env", base_url: "https://x/v1", key_env: "BYO", models: { m: {} } }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, { gw: "tok", byo: "" }, "a@b.com");
+    const rendered = renderProviders(parsed.entries, { gw: "tok", byo: "" });
     expect(rendered.env).toEqual({});
     expect(rendered.candidates).toEqual([{ provider: "byo", model: "m", key_env: "BYO" }]);
-  });
-  it("shows a tier as the first character of the name, and aliases it to the real ID", () => {
-    const parsed = validateProviders([{ ...entry, model: "@cf/a/low-one", models: {
-      "@cf/a/low-one": { context_length: 1 }, "@cf/b/mid": {}, "@cf/c/high": {}, "anthropic/top": {}, "@cf/d/unscored": {} } }]);
-    if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com",
-      { "@cf/a/low-one": "low", "@cf/b/mid": "medium", "@cf/c/high": "high", "anthropic/top": "premium" });
-    expect(Object.keys(rendered.customProviders[0].models as object)).toEqual(["..$ CF low one (1)", ".$$ CF mid", "$$$ CF high", "*$$$ top"].map(blank).concat("@cf/d/unscored"));
-    expect((rendered.customProviders[0].models as Record<string, unknown>)[blank("..$ CF low one (1)")]).toEqual({ context_length: 1 });
-    expect(rendered.modelAliases[blank("$$$ CF high")]).toEqual({ model: "@cf/c/high", provider: "gw", base_url: "https://x/v1" });
-    expect(rendered.candidates[0].model).toBe("@cf/a/low-one");
-    expect(rendered.customProviders[0].model).toBe("@cf/a/low-one");
-  });
-  it("maps every tiered model to its own real ID, with no leading hyphen or space", () => {
-    const tiers = JSON.parse(readFileSync("templates/model-tiers.example.json", "utf8"));
-    const models = Object.fromEntries(Object.keys(tiers).map((id) => [id, {}]));
-    const parsed = validateProviders([{ ...entry, model: undefined, models }]);
-    if (!parsed.ok) throw new Error(parsed.error);
-    const { modelAliases } = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com", tiers);
-    expect(Object.values(modelAliases).map((a) => a.model).sort()).toEqual(Object.keys(tiers).sort());
-    for (const label of Object.keys(modelAliases)) expect(label).toMatch(/^(\.\.\$|\.\$\$|\$\$\$|\*\$\$\$)\u2800\S+$/);
-  });
-  it("shows a display name and context length, and sends only the real ID", () => {
-    const parsed = validateProviders([{ ...entry, model: undefined, models: {
-      "anthropic/claude-haiku-4-5": { name: "Claude Haiku 4.5", context_length: 200000 },
-      "@cf/qwen/qwen3.8-27b": { name: "Qwen 3.8 27b", context_length: 262144 },
-      "@cf/zai-org/glm-5.3": { context_length: 1048576 } } }]);
-    if (!parsed.ok) throw new Error(parsed.error);
-    const { modelAliases } = renderProviders(parsed.entries, { gw: "tok" }, "a@b.com",
-      { "anthropic/claude-haiku-4-5": "high", "@cf/qwen/qwen3.8-27b": "medium", "@cf/zai-org/glm-5.3": "high" });
-    expect(Object.keys(modelAliases)).toEqual(["$$$ Claude Haiku 4.5 (200k)", ".$$ CF Qwen 3.8 27b (262k)", "$$$ CF glm 5.3 (1M)"].map(blank));
-    expect(modelAliases[blank("$$$ Claude Haiku 4.5 (200k)")].model).toBe("anthropic/claude-haiku-4-5");
-    expect(validateProviders([{ ...entry, models: { m: { name: "bad\nname" } }, model: undefined }]).ok).toBe(false);
   });
   it("refuses a credential reference to MASTER_KEY", () => {
     expect(validateProviders([{ ...entry, credential: "MASTER_KEY" }]).ok).toBe(false);
@@ -171,8 +135,7 @@ describe("providers", () => {
   it("skips api_token entries when the Worker secret is unset", () => {
     const parsed = validateProviders([entry]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, {}, "a@b.com");
-    expect(rendered.customProviders).toEqual([]);
+    const rendered = renderProviders(parsed.entries, {});
     expect(rendered.candidates).toEqual([]);
     expect(rendered.warnings).toHaveLength(1);
     expect(rendered.warnings[0]).toContain("CLOUDFLARE_AI_API_TOKEN");
@@ -180,8 +143,7 @@ describe("providers", () => {
   it("uses a key an admin set for a user_env provider, in .env only", () => {
     const parsed = validateProviders([{ name: "byo", mode: "user_env", base_url: "https://x/v1", key_env: "BYO", models: { m: {} } }]);
     if (!parsed.ok) throw new Error(parsed.error);
-    const rendered = renderProviders(parsed.entries, { byo: "sealed-value" }, "a@b.com");
+    const rendered = renderProviders(parsed.entries, { byo: "sealed-value" });
     expect(rendered.env).toEqual({ BYO: "sealed-value" });
-    expect(JSON.stringify(rendered.customProviders)).not.toContain("sealed-value");
   });
 });

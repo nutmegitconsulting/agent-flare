@@ -423,8 +423,15 @@ def apply(home: Path, bundle_path: Path) -> dict:
     yaml = YAML()
     yaml.preserve_quotes = True
     config_path = home / "config.yaml"
+    # The account's own document, kept in R2. The Worker checks it before saving, so a parse failure
+    # here means something outside the Worker wrote it, and the boot fails loudly rather than guess.
+    config_text = bundle.get("config_yaml")
     config = None
-    if config_path.exists():
+    if config_text is not None:
+        config = yaml.load(config_text)
+        if not isinstance(config, dict):
+            raise ValueError("config.yaml from R2 is not a mapping")
+    elif config_path.exists():
         try:
             config = yaml.load(config_path.read_text(encoding="utf-8"))
         except (YAMLError, UnicodeDecodeError):
@@ -437,14 +444,8 @@ def apply(home: Path, bundle_path: Path) -> dict:
         _fill_defaults(config, bundle.get("platform_defaults") or {})
     if first_launch or new_template:
         _fill_defaults(config, bundle.get("config_defaults") or {})
-    managed_config = bundle.get("config_managed") or {}
-    # Providers the last boot managed and this one doesn't must leave, or Hermes keeps listing them.
-    current_providers = {p["name"] for p in managed_config.get("custom_providers", [])}
-    dropped_providers = set(marker.get("managed_providers", [])) - current_providers
-    if dropped_providers and isinstance(config.get("custom_providers"), list):
-        config["custom_providers"] = [p for p in config["custom_providers"]
-                                      if not (isinstance(p, dict) and p.get("name") in dropped_providers)]
-    _deep_merge(config, managed_config)
+    # Platform keys win every boot, so a document can't move the port or the public URL.
+    _deep_merge(config, bundle.get("config_platform") or {})
 
     env_path = home / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
@@ -477,7 +478,7 @@ def apply(home: Path, bundle_path: Path) -> dict:
 
     _write(marker_path, json.dumps({
         "name": template.get("name"), "applied": int(time.time()), "managed_env": sorted(managed),
-        "managed_providers": sorted(current_providers), "selected_provider": selected,
+        "selected_provider": selected,
         "selected_model": model.get("default") if selected and isinstance(model, dict) else None,
     }).encode())
 
