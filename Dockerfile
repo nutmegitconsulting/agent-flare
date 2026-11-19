@@ -33,9 +33,20 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # build-essential is required by install.sh's node-pty native build.
 # squashfs-tools: createBackup/restoreBackup run mksquashfs/unsquashfs in-container.
 # openssh-client: for an agent's outbound git over SSH. There's no SSH server in this image.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# AF_APT_MIRROR (optional): another Ubuntu mirror for this one step, for when archive.ubuntu.com can't be
+# reached from the build host, e.g. http://mirrors.edge.kernel.org/ubuntu. apt checks Ubuntu's signatures
+# whichever server answers, and the image keeps the stock sources.list.
+# There is no browser in this image: with a dev sandbox bound, the browser is in the sandbox image, next to
+# the terminal's files (cf-dev-sandbox/Dockerfile).
+ARG AF_APT_MIRROR=
+RUN cp /etc/apt/sources.list /tmp/sources.list.stock \
+    && if [ -n "$AF_APT_MIRROR" ]; then \
+         sed -i -E "s#http://(archive|security)\.ubuntu\.com/ubuntu/?#${AF_APT_MIRROR%/}/#g" /etc/apt/sources.list; \
+       fi \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
          curl ca-certificates git squashfs-tools build-essential openssh-client \
+    && mv /tmp/sources.list.stock /etc/apt/sources.list \
     && rm -rf /var/lib/apt/lists/*
 
 # --- hermes user (install + runtime data owner) ---
