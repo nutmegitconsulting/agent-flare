@@ -36,13 +36,16 @@ NOT_SEALED_STORES = ("webapp", "backups", "state-snapshots")
 # KV holds 25 MB per value, and sealing grows data by about 1.8x.
 MAX_SEALED_BYTES = 12_000_000
 
-# Rebuildable or process-bound, and only where Hermes itself puts them. Names like "logs" or "cache"
-# inside a skill or a project are the user's data.
+# Rebuildable or process-bound, and only where Hermes itself puts them: at the top of the home and at
+# the top of each profile, which is a home of its own. Names like "logs" or "cache" inside a skill or
+# a project are the user's data.
 EXCLUDED_TOP_LEVEL = {
     "logs", "cache", "image_cache", "audio_cache", "document_cache", "browser_screenshots", "sandboxes",
     "tmp", "hermes-agent", "source-checks", "telemetry", "runtime", "plugin-update-checks",
 }
-EXCLUDED_TOP_LEVEL_FILES = ("*.lock", ".startup-status", "gateway_state.json", "gateway.pid", "gateway.sock")
+EXCLUDED_TOP_LEVEL_FILES = ("*.lock", ".startup-status", "gateway_state.json", "gateway.pid", "gateway.sock",
+                            # The models.dev catalogue and its etag: megabytes per profile, refetched on start.
+                            "models_dev_cache.*")
 # Never meaningful, anywhere.
 EXCLUDED_DIRS = {"__pycache__", "node_modules"}
 EXCLUDED_FILES = ("*.db-wal", "*.db-shm", "*.db-journal", "*.pid", "*.sock", "*.pyc")
@@ -65,27 +68,38 @@ def _credential_check():
     return profile_path_is_private
 
 
-def _is_secret(rel: str) -> bool:
+def _home_parts(rel: str) -> tuple[str, ...]:
+    """Path parts relative to the home that owns them. A profile is a home of its own, with the same
+    stores, caches and logs."""
     parts = tuple(Path(rel).parts)
-    # A profile is a home of its own, with the same stores.
     if len(parts) >= 3 and parts[0] == "profiles":
-        parts = parts[2:]
-    return _credential_check()(parts)
+        return parts[2:]
+    return parts
+
+
+def _is_secret(rel: str) -> bool:
+    return _credential_check()(_home_parts(rel))
+
+
+def _is_excluded_dir(rel: str, name: str) -> bool:
+    if name in EXCLUDED_DIRS:
+        return True
+    if "/" not in rel and name in INSTALL_LINKS:
+        return True
+    return len(_home_parts(rel)) == 1 and name in EXCLUDED_TOP_LEVEL
 
 
 def _is_critical_db(rel: str) -> bool:
     """Databases Hermes can't run without. Others are the user's project files: copied as well as
     possible, and never a reason to refuse a snapshot or distrust a restore."""
-    parts = Path(rel).parts
-    if len(parts) >= 3 and parts[0] == "profiles":
-        parts = parts[2:]
+    parts = _home_parts(rel)
     return parts in (("state.db",), ("cron", "executions.db"))
 
 
 def _is_excluded_file(rel: str, name: str) -> bool:
     if any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_FILES):
         return True
-    return "/" not in rel and any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_TOP_LEVEL_FILES)
+    return len(_home_parts(rel)) == 1 and any(fnmatch.fnmatch(name, pattern) for pattern in EXCLUDED_TOP_LEVEL_FILES)
 
 
 def _is_sqlite(path: Path) -> bool:
@@ -130,7 +144,7 @@ def stage(home: Path, stage_dir: Path) -> dict:
         kept = []
         for name in dirs:
             rel = os.path.join(rel_root, name)
-            if name in EXCLUDED_DIRS or _is_secret(rel) or (not rel_root and (name in EXCLUDED_TOP_LEVEL or name in INSTALL_LINKS)):
+            if _is_excluded_dir(rel, name) or _is_secret(rel):
                 continue
             if os.path.islink(os.path.join(root, name)):
                 os.symlink(os.readlink(os.path.join(root, name)), stage_dir / rel)
@@ -202,8 +216,8 @@ def seal_read(home: Path) -> dict:
     for root, dirs, names in os.walk(home, followlinks=False):
         rel_root = os.path.relpath(root, home)
         rel_root = "" if rel_root == "." else rel_root
-        dirs[:] = [d for d in dirs if not (not rel_root and (d in EXCLUDED_TOP_LEVEL or d in INSTALL_LINKS or d in NOT_SEALED_STORES))
-                   and d not in EXCLUDED_DIRS]
+        dirs[:] = [d for d in dirs if not _is_excluded_dir(os.path.join(rel_root, d), d)
+                   and not (not rel_root and d in NOT_SEALED_STORES)]
         for name in names:
             rel = os.path.join(rel_root, name)
             path = Path(root) / name
@@ -313,6 +327,60 @@ def _block_style(node):
     return node
 
 
+DEV_SANDBOX_PLUGIN = "cloudflare-sandbox"
+DEV_SANDBOX_BACKEND = "cloudflare_sandbox"
+
+
+def _dev_sandbox(config: dict, bound: bool) -> None:
+    """With a dev sandbox bound to this deployment, the plugin is on and the terminal runs there from the
+    first boot, with nothing for the user to enable. Both yield to a choice in the document: a plugin
+    listed under plugins.disabled stays off, and a terminal.backend that names something stays. Without
+    the binding the backend can't work, so both are taken out again and the terminal is Hermes' default."""
+    plugins = config.get("plugins")
+    terminal = config.get("terminal")
+    if bound:
+        if not isinstance(plugins, dict):
+            plugins = config["plugins"] = {}
+        enabled = plugins.get("enabled")
+        if not isinstance(enabled, list):
+            enabled = plugins["enabled"] = []
+        off = plugins.get("disabled")
+        if DEV_SANDBOX_PLUGIN not in enabled and DEV_SANDBOX_PLUGIN not in (off if isinstance(off, list) else []):
+            enabled.append(DEV_SANDBOX_PLUGIN)
+        if not isinstance(terminal, dict):
+            terminal = config["terminal"] = {}
+        if not terminal.get("backend") and DEV_SANDBOX_PLUGIN in enabled:
+            terminal["backend"] = DEV_SANDBOX_BACKEND
+        return
+    if isinstance(plugins, dict) and isinstance(plugins.get("enabled"), list) and DEV_SANDBOX_PLUGIN in plugins["enabled"]:
+        plugins["enabled"].remove(DEV_SANDBOX_PLUGIN)
+    if isinstance(terminal, dict) and terminal.get("backend") == DEV_SANDBOX_BACKEND:
+        del terminal["backend"]
+
+
+def _profiles_dev_sandbox(home: Path, bound: bool, yaml) -> list[str]:
+    """Each Hermes profile has its own config.yaml, and its terminal follows that file, not the account's.
+    The same dev-sandbox rule is applied to each. A profile's file is otherwise the user's: it's written
+    only when the rule changes it, and one that won't load is left alone. Returns the profiles changed."""
+    from ruamel.yaml import YAMLError
+    changed = []
+    for path in sorted((home / "profiles").glob("*/config.yaml")):
+        try:
+            before = path.read_text(encoding="utf-8")
+            config = yaml.load(before)
+        except (OSError, YAMLError, UnicodeDecodeError):
+            continue
+        if not isinstance(config, dict):
+            continue
+        _dev_sandbox(config, bound)
+        buffer = StringIO()
+        yaml.dump(config, buffer)
+        if buffer.getvalue() != before:
+            _write(path, buffer.getvalue().encode())
+            changed.append(path.parent.name)
+    return changed
+
+
 def _fill_defaults(base, defaults):
     """Base wins: add only what's absent, so a user's later edits to a default survive."""
     for key, value in defaults.items():
@@ -344,6 +412,10 @@ def _select_provider(config: dict, candidates: list[dict], env: dict[str, str], 
     secret added later takes effect, but it never overrides a choice the user made. A selection this
     code made is replaced once its credential has gone, or when the role's default changes.
     Returns what this code has selected, if anything."""
+    # With no role offering a provider there is nothing to select or withdraw: the document's model stays
+    # as it is. This is what keeps the model a restored backup brings into a deployment with no roles.
+    if not candidates:
+        return None
     usable = [c for c in candidates if env.get(c["key_env"])]
     model = config.get("model")
     current = model.get("provider") if isinstance(model, dict) else None
@@ -438,6 +510,12 @@ def apply(home: Path, bundle_path: Path) -> dict:
 
     yaml = YAML()
     yaml.preserve_quotes = True
+    # ruamel folds a value past 80 columns onto the next line. A gateway base_url is longer than that,
+    # and the file is edited by hand, so every value stays on its key's line.
+    yaml.width = 4096
+    # Hermes writes list items indented under their key. Writing them the same way means a boot doesn't
+    # re-lay-out the file a backup restored or a user edited.
+    yaml.indent(mapping=2, sequence=4, offset=2)
     config_path = home / "config.yaml"
     # The account's own document, kept in R2. The Worker checks it before saving, so a parse failure
     # here means something outside the Worker wrote it, and the boot fails loudly rather than guess.
@@ -462,6 +540,7 @@ def apply(home: Path, bundle_path: Path) -> dict:
         _fill_defaults(config, bundle.get("config_defaults") or {})
     # Platform keys win every boot, so a document can't move the port or the public URL.
     _deep_merge(config, bundle.get("config_platform") or {})
+    _dev_sandbox(config, bool(bundle.get("dev_sandbox")))
 
     env_path = home / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
@@ -492,6 +571,7 @@ def apply(home: Path, bundle_path: Path) -> dict:
     yaml.default_flow_style = False
     yaml.dump(_block_style(config), buffer)
     _write(config_path, buffer.getvalue().encode())
+    report["profiles_dev_sandbox"] = _profiles_dev_sandbox(home, bool(bundle.get("dev_sandbox")), yaml)
 
     _write(marker_path, json.dumps({
         "name": template.get("name"), "applied": int(time.time()), "managed_env": sorted(managed),

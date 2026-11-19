@@ -133,6 +133,22 @@ class UserDataStays(Hydrated):
         names = {str(p.relative_to(self.stage)) for p in self.stage.rglob("*") if p.is_file()}
         self.assertEqual(names, {*keep, "config.yaml", af_state.MANIFEST})
 
+    def test_each_profile_drops_the_same_rebuildable_files_as_the_home(self):
+        keep = ["profiles/r/config.yaml", "profiles/r/sessions/a.json", "profiles/r/skills/x/cache/data.json",
+                "profiles/r/workspace/app/logs/out.txt", "workspace/models_dev_cache.json",
+                "profiles/notes.lock"]
+        drop = ["profiles/r/cache/scratch/big.bin", "profiles/r/logs/agent.log", "profiles/r/tmp/x",
+                "profiles/r/models_dev_cache.json", "profiles/r/models_dev_cache.etag", "profiles/r/gateway.pid",
+                "profiles/r/auth.lock", "models_dev_cache.json", "models_dev_cache.etag", "cache/web/a.md"]
+        for rel in keep + drop:
+            path = self.home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x")
+        af_state.stage(self.home, self.stage)
+        names = {str(p.relative_to(self.stage)) for p in self.stage.rglob("*") if p.is_file()}
+        self.assertEqual(names, {*keep, "config.yaml", af_state.MANIFEST})
+        self.assertFalse((self.stage / "profiles/r/cache").exists())
+
     def test_a_broken_project_database_does_not_block_snapshots_or_restores(self):
         (self.home / "workspace").mkdir()
         (self.home / "workspace/trunc.sqlite").write_bytes(b"SQLite format 3\x00" + b"\x01" * 50)
@@ -302,6 +318,55 @@ class Apply(Base):
         self.assertTrue(text.startswith(doc), text)
         self.assertEqual(self.strict_load()["dashboard"]["trusted_proxies"], self.PROXIES)
 
+    def test_a_long_value_stays_on_its_keys_line(self):
+        url = "https://gateway.ai.cloudflare.com/v1/0123456789abcdef0123456789abcdef/a-team-gateway/compat"
+        doc = f"custom_providers:\n- name: gw\n  base_url: {url}\n"
+        self.bundle(config_yaml=doc)
+        self.assertIn(f"  base_url: {url}\n", (self.home / "config.yaml").read_text())
+
+    def test_a_bound_dev_sandbox_is_on_from_the_first_boot(self):
+        self.bundle(config_yaml="terminal:\n  cwd: /w\n", dev_sandbox=True)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], ["cloudflare-sandbox"])
+        self.assertEqual(config["terminal"], {"cwd": "/w", "backend": "cloudflare_sandbox"})
+        self.bundle(dev_sandbox=True)
+        self.assertEqual(self.strict_load()["plugins"]["enabled"], ["cloudflare-sandbox"])
+
+    def test_a_dev_sandbox_keeps_other_plugins_and_yields_to_the_users_choices(self):
+        self.bundle(config_yaml="plugins:\n  enabled:\n  - mine\nterminal:\n  backend: docker\n", dev_sandbox=True)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], ["mine", "cloudflare-sandbox"])
+        self.assertEqual(config["terminal"]["backend"], "docker")
+        self.bundle(config_yaml="plugins:\n  disabled:\n  - cloudflare-sandbox\n", dev_sandbox=True)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], [])
+        self.assertNotIn("backend", config.get("terminal") or {})
+
+    def test_without_the_binding_the_dev_sandbox_is_taken_out_again(self):
+        doc = "plugins:\n  enabled:\n  - mine\n  - cloudflare-sandbox\nterminal:\n  cwd: /w\n  backend: cloudflare_sandbox\n"
+        self.bundle(config_yaml=doc)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], ["mine"])
+        self.assertEqual(config["terminal"], {"cwd": "/w"})
+        self.bundle(config_yaml="terminal:\n  backend: docker\n")
+        self.assertEqual(self.strict_load()["terminal"]["backend"], "docker")
+
+    def test_a_dev_sandbox_reaches_every_profile_and_leaves_the_rest_of_its_file_alone(self):
+        doc = "# mine\nterminal:\n  cwd: /w\ncustom_providers:\n  - name: gw\n    base_url: https://example.com/a/very/long/path/that/goes/past/eighty/columns/of/text/v1\n"
+        for name in ("researcher", "tester"):
+            (self.home / "profiles" / name).mkdir(parents=True)
+            (self.home / "profiles" / name / "config.yaml").write_text(doc)
+        (self.home / "profiles" / "broken").mkdir()
+        (self.home / "profiles" / "broken" / "config.yaml").write_text("a: [unclosed\n")
+        report = self.bundle(dev_sandbox=True)
+        self.assertEqual(report["profiles_dev_sandbox"], ["researcher", "tester"])
+        text = (self.home / "profiles/researcher/config.yaml").read_text()
+        self.assertEqual(text, doc.replace("  cwd: /w\n", "  cwd: /w\n  backend: cloudflare_sandbox\n") + "plugins:\n  enabled:\n    - cloudflare-sandbox\n")
+        self.assertEqual((self.home / "profiles/broken/config.yaml").read_text(), "a: [unclosed\n")
+        self.assertEqual(self.bundle(dev_sandbox=True)["profiles_dev_sandbox"], [])
+        self.assertEqual(self.bundle()["profiles_dev_sandbox"], ["researcher", "tester"])
+        self.assertEqual((self.home / "profiles/researcher/config.yaml").read_text(), doc + "plugins:\n  enabled: []\n")
+
     def test_a_document_that_is_not_a_mapping_fails_the_boot(self):
         with self.assertRaises(ValueError):
             self.bundle(config_yaml="- a\n- b\n")
@@ -385,6 +450,21 @@ class Apply(Base):
         self.assertEqual(self.config()["model"]["provider"], "byo")
         self.bundle(provider_candidates=[self.GW, self.BYO])
         self.assertNotIn("model", self.config())
+
+    def test_with_no_role_offering_a_provider_the_documents_model_is_left_alone(self):
+        self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        self.assertEqual(self.config()["model"]["provider"], "gw")
+        # What a backup brings into a deployment that has no roles: our earlier selection, and no candidates.
+        self.bundle()
+        self.assertEqual(self.config()["model"]["provider"], "gw")
+
+    def test_a_restored_layout_survives_a_boot_unchanged(self):
+        doc = ("custom_providers:\n  - name: gw\n    base_url: https://example.com/v1\n    models:\n      m1:\n        context_length: 64000\n"
+               "dashboard:\n  trusted_proxies:\n    - 127.0.0.1\n")
+        (self.home / "config.yaml").write_text(doc)
+        (self.home / ".agent-flare-template.json").write_text("{}")
+        self.bundle(config_yaml=doc, config_platform={"dashboard": {"trusted_proxies": ["127.0.0.1"]}})
+        self.assertEqual((self.home / "config.yaml").read_text(), doc)
 
     def test_a_role_change_moves_our_default_but_not_a_users_pick(self):
         self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])

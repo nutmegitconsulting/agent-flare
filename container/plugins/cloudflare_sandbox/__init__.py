@@ -119,8 +119,10 @@ _KEY_RE = re.compile(r"[^A-Za-z0-9_-]")
 def _sanitize_part(part: str, max_len: int) -> str:
     cleaned = _KEY_RE.sub("-", (part or "").strip()) or "default"
     if len(cleaned) > max_len:
-        cleaned = cleaned[:32] + "-" + hashlib.sha256(cleaned.encode()).hexdigest()[:16]
-    return cleaned[:max_len]
+        # The hash stays inside the limit, so two long keys with the same start stay different.
+        digest = hashlib.sha256(cleaned.encode()).hexdigest()[:12]
+        cleaned = cleaned[:max_len - len(digest) - 1] + "-" + digest
+    return cleaned
 
 
 def _base_url(value: str) -> str:
@@ -191,6 +193,9 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
         client_env["CF_SANDBOX_TOKEN"] = self._token
         client_env["CF_SANDBOX_KEY"] = self._sandbox_key
         client_env["CF_SANDBOX_TIMEOUT"] = str(int(timeout))
+        # The client reads its own names, so the Access pair has to be handed over like the token is.
+        client_env["CF_SANDBOX_ACCESS_ID"] = os.environ.get("CF_DEV_SANDBOX_ACCESS_CLIENT_ID") or ""
+        client_env["CF_SANDBOX_ACCESS_SECRET"] = os.environ.get("CF_DEV_SANDBOX_ACCESS_CLIENT_SECRET") or ""
         if self._image:
             client_env["CF_SANDBOX_IMAGE"] = self._image
         cmd = [sys.executable, "-c", _CLIENT_SCRIPT, cmd_string]
