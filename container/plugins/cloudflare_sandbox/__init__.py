@@ -132,6 +132,24 @@ def _base_url(value: str) -> str:
     return value if "://" in value else "http://" + value
 
 
+# Where the user's uploads and skills land in the sandbox. Hermes names the same base to the model
+# (``cache_path_base`` below), so a path it is told about exists where its commands run.
+_SYNC_BASE = "/root/.hermes"
+# Raw bytes per download request: the Worker returns at most 1 MiB of output, and base64 adds a third.
+_GET_CHUNK = 512 * 1024
+# Raw bytes per upload request: the Worker takes 8 MiB of stdin, and base64 adds a third.
+_PUT_CHUNK = 4 * 1024 * 1024
+
+
+def _sync_files() -> list:
+    """(host_path, sandbox_path) for what the agent must be able to read where its commands run: files
+    the user attached or Hermes generated (``cache/``), and skills. Credential files are left out: the
+    sandbox never holds secrets."""
+    from tools.credential_files import iter_cache_files, iter_skills_files
+    return [(entry["host_path"], entry["container_path"])
+            for entry in (*iter_skills_files(container_base=_SYNC_BASE), *iter_cache_files(container_base=_SYNC_BASE))]
+
+
 class CloudflareSandboxEnvironment(BaseEnvironment):
     """One sandbox: a durable-object-named Cloudflare container, resumed by key."""
 
@@ -150,12 +168,27 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
             _sanitize_part(part, 24) for part in (base_key, str(task_id))
         )
 
+        # Hermes delivers a file the agent made (a screenshot, a PDF) only from a backend that says where
+        # its home is; without this a MEDIA: path in the sandbox is dropped and the user gets nothing.
+        self._remote_home = "/root"
         if cwd in ("", "~"):
-            cwd = self._resolve_home()
+            cwd = self._remote_home = self._resolve_home()
         super().__init__(cwd=cwd, timeout=int(timeout), **kwargs)
 
+        # The sandbox has its own disk: without this an attached file exists only beside Hermes, and the
+        # model is handed a path its commands can't open.
+        self._sync_manager = None
+        try:
+            from tools.environments.file_sync import FileSyncManager
+            self._sync_manager = FileSyncManager(
+                get_files_fn=_sync_files, upload_fn=self._upload, delete_fn=self._delete,
+                bulk_upload_fn=self._bulk_upload)
+        except Exception as exc:
+            logger.warning("cloudflare_sandbox: file sync is off (%s)", exc)
+        self._sync(force=True)
+
     # --- Worker transport -------------------------------------------------
-    def _request(self, path: str, payload: dict | None = None) -> dict:
+    def _request(self, path: str, payload: dict | None = None, *, timeout: float = 30) -> dict:
         headers = {
             "X-Sandbox-Key": self._sandbox_key,
             "Content-Type": "application/json",
@@ -173,8 +206,109 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
             method="POST" if payload is not None else "GET",
             headers=headers,
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
+
+    # --- Files between Hermes' side and the sandbox --------------------------
+    def _exec(self, command: str, *, stdin: str = "", timeout: int = 120) -> str:
+        result = self._request("/exec", {"command": command, "timeout_s": timeout, "stdin": stdin},
+                               timeout=timeout + 30)
+        if int(result.get("exit_code") or 0) != 0:
+            raise RuntimeError("sandbox command failed (exit %s): %s"
+                               % (result.get("exit_code"), (result.get("stderr") or "")[-300:]))
+        return result.get("stdout") or ""
+
+    def fetch_file(self, remote_path: str, local_dest, *, max_bytes: int) -> None:
+        """A file out of the sandbox, for delivery to the user. In pieces, because one command's output
+        is capped well below the size of an ordinary screenshot."""
+        import base64
+        import binascii
+        import shlex
+        from tools.environments.base import FileFetchError
+        quoted = shlex.quote(remote_path)
+        try:
+            size = int(self._exec("[ -f %s ] && stat -c %%s %s" % (quoted, quoted), timeout=30).strip())
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise FileFetchError("could not read %r in the sandbox (missing, not a regular file, or unreadable)"
+                                 % remote_path) from exc
+        if size > max_bytes:
+            raise FileFetchError("%r exceeds the %d MB delivery limit" % (remote_path, max_bytes // (1024 * 1024)))
+        data = bytearray()
+        try:
+            while len(data) < size:
+                piece = self._exec("tail -c +%d %s | head -c %d | base64 -w0"
+                                   % (len(data) + 1, quoted, min(_GET_CHUNK, size - len(data))), timeout=60)
+                chunk = base64.b64decode(piece.strip(), validate=True)
+                if not chunk:
+                    break
+                data += chunk
+        except (RuntimeError, ValueError, binascii.Error, OSError) as exc:
+            raise FileFetchError("transfer of %r failed: %s" % (remote_path, exc)) from exc
+        if len(data) != size:
+            raise FileFetchError("%r changed while it was being read" % remote_path)
+        with open(local_dest, "wb") as handle:
+            handle.write(bytes(data))
+
+    def _upload(self, host_path: str, remote_path: str) -> None:
+        """One file, in as many requests as its size needs."""
+        import base64
+        import shlex
+        target = shlex.quote(remote_path)
+        self._exec("mkdir -p %s && : > %s" % (shlex.quote(os.path.dirname(remote_path) or "/"), target))
+        with open(host_path, "rb") as handle:
+            while True:
+                chunk = handle.read(_PUT_CHUNK)
+                if not chunk:
+                    break
+                self._exec("base64 -d >> %s" % target, stdin=base64.b64encode(chunk).decode("ascii"))
+
+    def _bulk_upload(self, files: list) -> None:
+        """Many files as gzipped tars, each small enough for one request. A file too large for one goes
+        by itself, in pieces."""
+        import base64
+        import io
+        import tarfile
+        batch: list = []
+        batch_bytes = 0
+
+        def flush() -> None:
+            nonlocal batch, batch_bytes
+            if not batch:
+                return
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+                for host_path, remote_path in batch:
+                    tar.add(host_path, arcname=remote_path.lstrip("/"))
+            self._exec("base64 -d | tar xzf - -C /", stdin=base64.b64encode(buffer.getvalue()).decode("ascii"))
+            batch, batch_bytes = [], 0
+
+        for host_path, remote_path in files:
+            size = os.path.getsize(host_path)
+            if size > _PUT_CHUNK:
+                self._upload(host_path, remote_path)
+                continue
+            if batch_bytes + size > _PUT_CHUNK:
+                flush()
+            batch.append((host_path, remote_path))
+            batch_bytes += size
+        flush()
+
+    def _delete(self, remote_paths: list) -> None:
+        import shlex
+        for start in range(0, len(remote_paths), 200):
+            self._exec("rm -f " + " ".join(shlex.quote(path) for path in remote_paths[start:start + 200]), timeout=30)
+
+    def _sync(self, *, force: bool = False) -> None:
+        """Never a reason for a command to fail: a file that didn't arrive is retried on the next one."""
+        if self._sync_manager is None:
+            return
+        try:
+            self._sync_manager.sync(force=force)
+        except Exception as exc:
+            logger.warning("cloudflare_sandbox: file sync failed, will retry (%s)", exc)
+
+    def _before_execute(self) -> None:
+        self._sync()  # rate-limited by the manager
 
     def _resolve_home(self) -> str:
         try:
@@ -234,6 +368,11 @@ class CloudflareSandboxProvider(TerminalEnvironmentProvider):
     @property
     def default_cwd(self):
         return "~"
+
+    @property
+    def cache_path_base(self):
+        # Attached and generated files are copied here before each command; see _sync_files.
+        return _SYNC_BASE
 
     def is_available(self) -> bool:
         # Network-free: runs during UI paints and requirement checks.
