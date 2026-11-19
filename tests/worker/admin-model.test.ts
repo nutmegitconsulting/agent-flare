@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { clearProviderKey, keyStatus, resolveProviderKey, setProviderKey } from "../../src/credentials";
+import {
+  bootKeyStatuses, clearEnvValue, clearProviderKey, envStatuses, keyStatus, resolveEnv, resolveProviderKey, setEnvValue,
+  setProviderKey,
+} from "../../src/credentials";
 import { applyOverride, configFingerprint, resolveEffective, withGateway } from "../../src/effective";
 import type { Env } from "../../src/env";
 import type { GatewayProviderEntry } from "../../src/providers";
@@ -22,6 +25,10 @@ function fakeKv() {
       getWithMetadata: async (k: string) => ({ value: store.get(k)?.value ?? null, metadata: store.get(k)?.metadata ?? null }),
       put: async (k: string, value: string, o?: { metadata?: unknown }) => void store.set(k, { value, metadata: o?.metadata }),
       delete: async (k: string) => void store.delete(k),
+      list: async ({ prefix }: { prefix: string }) => ({
+        keys: [...store].filter(([k]) => k.startsWith(prefix)).map(([name, v]) => ({ name, metadata: v.metadata })),
+        list_complete: true,
+      }),
     } as unknown as KVNamespace,
   };
 }
@@ -72,6 +79,39 @@ describe("overrides", () => {
   });
   it("leave entries alone when there are none", () => {
     expect(applyOverride([provider()], null)).toEqual([provider()]);
+  });
+});
+
+describe("environment variables set by name", () => {
+  const env = () => {
+    const { kv, store } = fakeKv();
+    return { env: { CREDENTIALS_KV: kv, MASTER_KEY: "m".repeat(40) } as Env, store };
+  };
+  it("need no role: one for everyone reaches every account, and a user's own is theirs alone", async () => {
+    const { env: e } = env();
+    await setEnvValue(e, { kind: "base" }, "TEAM_GATEWAY_API_KEY", "shared");
+    await setEnvValue(e, { kind: "user", email: "A@x.com" }, "TEAM_GATEWAY_API_KEY", "mine");
+    await setEnvValue(e, { kind: "user", email: "a@x.com" }, "OTHER", "o");
+    expect(await resolveEnv(e, "a@x.com")).toEqual({ base: { TEAM_GATEWAY_API_KEY: "shared" }, user: { OTHER: "o", TEAM_GATEWAY_API_KEY: "mine" } });
+    expect(await resolveEnv(e, "b@x.com")).toEqual({ base: { TEAM_GATEWAY_API_KEY: "shared" }, user: {} });
+    await clearEnvValue(e, { kind: "user", email: "a@x.com" }, "TEAM_GATEWAY_API_KEY");
+    expect((await resolveEnv(e, "a@x.com")).user).toEqual({ OTHER: "o" });
+  });
+  it("are sealed in KV, and the listing holds names and times only", async () => {
+    const { env: e, store } = env();
+    await setEnvValue(e, { kind: "base" }, "TEAM_GATEWAY_API_KEY", "plain-env-value");
+    expect(JSON.stringify([...store])).not.toContain("plain-env-value");
+    const statuses = await envStatuses(e, { kind: "base" });
+    expect(Object.keys(statuses)).toEqual(["TEAM_GATEWAY_API_KEY"]);
+    expect(statuses.TEAM_GATEWAY_API_KEY).toMatch(/^20/);
+  });
+  it("change the boot fingerprint only once one is set", async () => {
+    const { env: e } = env();
+    const before = await bootKeyStatuses(e, "a@x.com", null, []);
+    expect(before).toEqual({});
+    await setEnvValue(e, { kind: "base" }, "K", "v");
+    const eff = await resolveEffective(fakeBucket({}), "a@x.com", [], {});
+    expect(await configFingerprint(eff, await bootKeyStatuses(e, "a@x.com", null, []))).not.toBe(await configFingerprint(eff, before));
   });
 });
 

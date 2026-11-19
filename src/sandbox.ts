@@ -17,8 +17,8 @@ import { Sandbox } from "@cloudflare/sandbox";
 import type { AccessIdentity } from "./access";
 import type { Env } from "./env";
 import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest, type RestoreOutcome } from "./persistence";
-import { checkConfigText, loadRoleConfig, loadUserConfig, saveUserConfig } from "./userconfig";
-import { keyStatuses, resolveProviderKey } from "./credentials";
+import { accountConfigFor, checkConfigText, saveUserConfig, syncAccountConfig } from "./userconfig";
+import { bootKeyStatuses, resolveEnv, resolveProviderKey } from "./credentials";
 import { configFingerprint, resolveEffective } from "./effective";
 import { capMs, leaseView, nextLease, type LeaseState, type LeaseView } from "./lease";
 import { renderProviders } from "./providers";
@@ -39,6 +39,8 @@ const IDENTITY_KEY = "identity";
 const SEALED_COPY_KEY = "sealed-files";
 const LAST_RESTORE_KEY = "last-restore";
 const CONFIG_STATUS_KEY = "config-status";
+/** Set while R2's config.yaml is behind the container's: the last snapshot couldn't copy it over. */
+const CONFIG_UNSYNCED_KEY = "config-unsynced";
 const LEASE_KEY = "lease";
 /** Set when a container stopped so that nothing but a person starts it again. */
 const PARKED_KEY = "parked";
@@ -273,7 +275,8 @@ export class AgentSandbox extends Sandbox<Env> {
     warnings.push(...providers.warnings);
     const providerCount = effective.providers.length;
     const fingerprint = await configFingerprint(
-      effective, await keyStatuses(env, identity.email, templateName, effective.providers), tiers);
+      effective, await bootKeyStatuses(env, identity.email, templateName, effective.providers), tiers);
+    const namedEnv = await resolveEnv(env, identity.email);
     await this.ctx.storage.put(IDENTITY_KEY, { ...identity, groups });
 
     // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
@@ -305,12 +308,16 @@ export class AgentSandbox extends Sandbox<Env> {
       config_yaml: configYaml,
       // Forced over the document on every boot. Nothing else in config.yaml is managed.
       config_platform: platformConfig,
+      // With the sidecar bound, the container turns its plugin on and points the terminal at it, unless the
+      // document says otherwise. Without it, the container takes both out again.
+      dev_sandbox: Boolean(this.env.DEV_SANDBOX),
       // The container picks from these, because only it can see which credentials are in .env.
       provider_candidates: providers.candidates,
       // A prefill is the user's own value: it applies only while they haven't set one. Template and
       // provider values are managed and apply on every boot.
       env_defaults: prefill ?? {},
-      env: { ...template?.env, ...providers.env, ...platformEnv },
+      // Variables set by name for everyone, then the role's, then this user's own.
+      env: { ...namedEnv.base, ...template?.env, ...providers.env, ...namedEnv.user, ...platformEnv },
       ui_defaults: UI_DEFAULTS,
       session_token: await deriveUserSecret(env.MASTER_KEY, "webapp-browser", identity.sub),
     };
@@ -339,23 +346,16 @@ export class AgentSandbox extends Sandbox<Env> {
   }
 
   /**
-   * The account's config.yaml. It's seeded once, on first use: from the file a restored snapshot brought back if
-   * that's usable, else from the role's document. After that, R2 is the only copy that counts.
+   * The account's config.yaml: R2's document, or on first use the file a restored snapshot brought back.
+   * Null leaves the container's own file in place. See accountConfigFor.
    */
   private async accountConfig(identity: StoredIdentity, templateName: string | null, warnings: string[]): Promise<string | null> {
-    const bucket = this.env.BACKUP_BUCKET;
-    const stored = await loadUserConfig(bucket, identity.sub);
-    if (stored !== null) return stored;
-    const restored = await this.containerConfig();
-    let seed: string | null = null;
-    if (restored !== null) {
-      const check = checkConfigText(restored);
-      if (check.ok) seed = restored;
-      else warnings.push(`the config.yaml from your last session was not kept (${check.error}); the role's is used`);
-    }
-    seed ??= templateName ? await loadRoleConfig(bucket, templateName) : null;
-    if (seed !== null) await saveUserConfig(bucket, identity.sub, seed);
-    return seed;
+    const unsynced = (await this.ctx.storage.get<boolean>(CONFIG_UNSYNCED_KEY)) === true;
+    const { text, warning } = await accountConfigFor(
+      this.env.BACKUP_BUCKET, identity.sub, () => this.containerConfig(), templateName, unsynced);
+    if (warning) warnings.push(warning);
+    else if (unsynced) await this.ctx.storage.delete(CONFIG_UNSYNCED_KEY);
+    return text;
   }
 
   /** The container's config.yaml as it is now, or null when there isn't one. */
@@ -366,17 +366,21 @@ export class AgentSandbox extends Sandbox<Env> {
 
   /**
    * Hermes changes its own config.yaml (a /model switch, a dashboard save), so a snapshot copies the container's
-   * file back to R2. A document that doesn't pass the checks stays local, with a warning in the logs.
+   * file back to R2, and that file wins. See syncAccountConfig for the one case that's held back.
    */
   private async syncConfigFromContainer(sub: string): Promise<void> {
-    const text = await this.containerConfig();
-    if (text === null || text === (await loadUserConfig(this.env.BACKUP_BUCKET, sub))) return;
-    const check = checkConfigText(text);
-    if (!check.ok) {
-      console.warn(`[config-sync:${sub}] not saved to R2: ${check.error}`);
-      return;
+    let failure: string | null = null;
+    try {
+      const result = await syncAccountConfig(this.env.BACKUP_BUCKET, sub, await this.containerConfig());
+      if (typeof result === "object") failure = result.refused;
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
     }
-    await saveUserConfig(this.env.BACKUP_BUCKET, sub, text);
+    // The archive still carries the file. Remembering that R2 missed it lets the next boot use the archive's
+    // copy, where R2's older one would otherwise be written over it.
+    if (failure === null) return void (await this.ctx.storage.delete(CONFIG_UNSYNCED_KEY));
+    await this.ctx.storage.put(CONFIG_UNSYNCED_KEY, true);
+    console.warn(`[config-sync:${sub}] not saved to R2: ${failure}`);
   }
 
   /**
@@ -398,6 +402,8 @@ export class AgentSandbox extends Sandbox<Env> {
         }
       }
       await saveUserConfig(this.env.BACKUP_BUCKET, identity.sub, text);
+      // An admin's document is the newest there is, whatever the last snapshot managed.
+      await this.ctx.storage.delete(CONFIG_UNSYNCED_KEY);
       if (!running) return { status: "saved" as const };
       await this.clearActiveMarker();
       this.stopping = true;
