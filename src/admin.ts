@@ -458,8 +458,31 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const base = `/__af/admin/u/${encodeURIComponent(sub)}`;
     return page(`config.yaml: ${email}`, `
       <p><a href="${base}">Back to ${e(email)}</a></p>
-      ${text === null ? `<p class="muted">No config.yaml yet. It's created from the role's on this account's first start.</p>` : ""}
+      ${text === null ? `<p class="muted">No config.yaml yet. It's created from the role's on this account's first start.</p>`
+        : `<p><a href="${base}/config.yaml">Download config.yaml</a></p>`}
+      <form method="post" action="${base}/config" enctype="multipart/form-data">
+        <label for="cfg-file">Upload a config.yaml</label>
+        <input type="file" id="cfg-file" name="file" accept=".yaml,.yml,text/yaml,text/plain" required>
+        <button>Upload and save</button>
+        <p class="muted">Replaces the whole file, with the same checks as Save below.</p>
+      </form>
       ${configForm(`${base}/config`, text)}`);
+  });
+
+  admin.get("/u/:sub/config.yaml", async (c) => {
+    const sub = c.req.param("sub");
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    const text = email ? await loadUserConfig(c.env.BACKUP_BUCKET, sub) : null;
+    if (!email || text === null) return c.text("Not found", 404);
+    await audit(c, "config.download", email);
+    return new Response(text, {
+      headers: {
+        "content-type": "text/yaml; charset=utf-8",
+        "content-disposition": `attachment; filename="config.yaml"`,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    });
   });
 
   admin.post("/u/:sub/config", async (c) => {
@@ -467,7 +490,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     const back = `/__af/admin/u/${encodeURIComponent(sub)}/config`;
     const { identity: email } = await sandboxFor(c.env, sub).describe();
     if (!email) return problem("No one with this ID has logged in.", "/__af/admin");
-    const text = String((await c.req.parseBody()).config ?? "").replace(/\r\n/g, "\n");
+    const body = await c.req.parseBody();
+    // The upload form sends a file, the editor sends text. Either way it's the whole document.
+    const raw = body.file instanceof File ? await body.file.text() : String(body.config ?? "");
+    // Editors on Windows can save a byte-order mark and CRLF line ends.
+    const text = raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
     const check = checkConfigText(text);
     if (!check.ok) return problem(check.error, back);
     const result = await sandboxFor(c.env, sub).applyConfigEdit(check.text);
