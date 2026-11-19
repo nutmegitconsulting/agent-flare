@@ -288,7 +288,7 @@ export class AgentSandbox extends Sandbox<Env> {
 
     // Platform keys come last so a template can never move the port or the public URL.
     // Platform-owned .env values likewise win over template/provider values and carry no secrets.
-    const platformEnv = this.env.DEV_SANDBOX ? { CF_DEV_SANDBOX_URL: DEV_SANDBOX_INTERNAL_HOST } : {};
+    const platformEnv = this.env.DEV_SANDBOX ? { CF_DEV_SANDBOX_URL: `http://${DEV_SANDBOX_INTERNAL_HOST}` } : {};
     const platformConfig = {
       webapp: { enabled: true, host: "0.0.0.0", port: WEBAPP_PORT, public_url: identity.publicUrl },
       // Only the Worker can reach this listener, so whatever address it arrives from is the Worker's.

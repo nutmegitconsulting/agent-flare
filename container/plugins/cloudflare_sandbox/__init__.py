@@ -123,6 +123,13 @@ def _sanitize_part(part: str, max_len: int) -> str:
     return cleaned[:max_len]
 
 
+def _base_url(value: str) -> str:
+    """CF_DEV_SANDBOX_URL with a scheme: a bare host (``cfsandbox.internal``) gets ``http://``,
+    since urllib refuses a URL without one and every command would fail."""
+    value = (value or "").strip().rstrip("/")
+    return value if "://" in value else "http://" + value
+
+
 class CloudflareSandboxEnvironment(BaseEnvironment):
     """One sandbox: a durable-object-named Cloudflare container, resumed by key."""
 
@@ -132,7 +139,7 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
 
     def __init__(self, cwd: str, timeout: int, *, task_id: str = "default",
                  image=None, **kwargs):
-        self._url = os.environ["CF_DEV_SANDBOX_URL"].rstrip("/")
+        self._url = _base_url(os.environ["CF_DEV_SANDBOX_URL"])
         self._token = os.environ.get("CF_DEV_SANDBOX_TOKEN") or ""
         self._image = image or None
 
