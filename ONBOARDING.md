@@ -51,6 +51,7 @@ Fork this repo, then in the dashboard: Workers & Pages → Create → Import a r
 | `AF_ADMIN_EMAILS` | `you@example.com` | No |
 | `AF_R2_BUCKET` | default `agent-flare-state` | No |
 | `AF_MAX_INSTANCES` | default `10`: at most this many users awake at once | No |
+| `AF_INSTANCE_TYPE` | default `standard-2` (1 vCPU, 6 GiB); `standard-1` is 1/2 vCPU, 4 GiB, 8 GB disk | No |
 | `AF_WORKER_NAME` | default `agent-flare` | No |
 | `AF_DEV_SANDBOX_WORKER` | `cf-dev-sandbox` | No — enables per-user dev sandboxes (route A). Requires the sidecar Worker deployed in the same account; unset strips the feature entirely. See below. |
 

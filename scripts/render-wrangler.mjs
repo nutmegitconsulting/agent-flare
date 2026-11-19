@@ -3,6 +3,7 @@
 // tracked repo holds no deployment details. Used locally and by the GitHub deploy workflow.
 //   AF_HOSTNAME  ACCESS_TEAM_DOMAIN  ACCESS_AUD_TAG  AF_KV_ID   required
 //   AF_R2_BUCKET  AF_ADMIN_EMAILS  AF_MAX_INSTANCES  AF_WORKER_NAME  AF_TEMPLATE_SECRETS   optional
+//   AF_INSTANCE_TYPE   container size per user, e.g. standard-1; default standard-2
 //   AF_IMAGE   a pushed registry image to run instead of building ./Dockerfile
 //   AF_DEV_SANDBOX_WORKER  optional: sidecar Worker name; enables the per-user dev-sandbox feature
 //   AF_WRANGLER_OUT   file to write; default wrangler.jsonc
@@ -24,6 +25,7 @@ const replacements = [
   ['"bucket_name": "agent-flare-state"', `"bucket_name": "${env.AF_R2_BUCKET || "agent-flare-state"}"`],
   ['"ADMIN_EMAILS": ""', `"ADMIN_EMAILS": "${env.AF_ADMIN_EMAILS || ""}"`],
   ['"max_instances": 10', `"max_instances": ${Number(env.AF_MAX_INSTANCES) || 10}`],
+  ['"instance_type": "standard-2"', `"instance_type": "${env.AF_INSTANCE_TYPE || "standard-2"}"`],
   ['"TEMPLATE_SECRETS": ""', `"TEMPLATE_SECRETS": "${env.AF_TEMPLATE_SECRETS || ""}"`],
   ['"image": "./Dockerfile"', `"image": "${env.AF_IMAGE || "./Dockerfile"}"`],
 ];
