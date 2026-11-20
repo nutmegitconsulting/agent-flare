@@ -55,6 +55,7 @@ DOC=$(printf '{%s}' "$PROVIDER" | "$PYHOST" -c 'import json,sys; print(json.dump
 
 echo "== unit tests"
 docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_af_state.py 2>&1 | tail -4
+docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_sandbox_fs.py 2>&1 | tail -4
 
 echo "== webapp"
 dx() { docker exec -i "$NAME" bash -c "$1"; }

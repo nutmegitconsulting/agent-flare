@@ -13,6 +13,8 @@ Design notes:
 - ``_run_bash`` spawns a *local* client subprocess (stdlib ``urllib``) that
   POSTs the command to the Worker and streams the result back, so the base
   machinery operates on a real ``Popen`` exactly as it does for SSH.
+- Hermes' file browser, previews and downloads read the sandbox too: see
+  ``_install_workspace_fs``.
 - No environment variables are forwarded into the sandbox (the sandbox must
   never hold secrets; see CF sandbox security guidance). The backend's own
   token reaches the client under ``CF_SANDBOX_TOKEN`` — a different name from
@@ -36,7 +38,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
+import threading
 import urllib.request
 import urllib.error
 
@@ -158,7 +162,7 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
     cleanup_stops_processes = False
 
     def __init__(self, cwd: str, timeout: int, *, task_id: str = "default",
-                 image=None, **kwargs):
+                 image=None, sync_files: bool = True, **kwargs):
         self._url = _base_url(os.environ["CF_DEV_SANDBOX_URL"])
         self._token = os.environ.get("CF_DEV_SANDBOX_TOKEN") or ""
         self._image = image or None
@@ -178,6 +182,8 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
         # The sandbox has its own disk: without this an attached file exists only beside Hermes, and the
         # model is handed a path its commands can't open.
         self._sync_manager = None
+        if not sync_files:  # the file browser's reader: it runs no agent command, so it has nothing to bring
+            return
         try:
             from tools.environments.file_sync import FileSyncManager
             self._sync_manager = FileSyncManager(
@@ -233,21 +239,32 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
                                  % remote_path) from exc
         if size > max_bytes:
             raise FileFetchError("%r exceeds the %d MB delivery limit" % (remote_path, max_bytes // (1024 * 1024)))
-        data = bytearray()
         try:
-            while len(data) < size:
-                piece = self._exec("tail -c +%d %s | head -c %d | base64 -w0"
-                                   % (len(data) + 1, quoted, min(_GET_CHUNK, size - len(data))), timeout=60)
-                chunk = base64.b64decode(piece.strip(), validate=True)
-                if not chunk:
-                    break
-                data += chunk
+            data = b"".join(self.read_range(remote_path, 0, size))
         except (RuntimeError, ValueError, binascii.Error, OSError) as exc:
             raise FileFetchError("transfer of %r failed: %s" % (remote_path, exc)) from exc
         if len(data) != size:
             raise FileFetchError("%r changed while it was being read" % remote_path)
         with open(local_dest, "wb") as handle:
-            handle.write(bytes(data))
+            handle.write(data)
+
+    def read_range(self, remote_path: str, offset: int, length: int | None):
+        """Bytes of a sandbox file from ``offset``, a piece per request, until ``length`` are read or the
+        file ends. Raises what ``_exec`` raises, or ``ValueError`` on output that isn't base64."""
+        import base64
+        import shlex
+        quoted = shlex.quote(remote_path)
+        done = 0
+        while length is None or done < length:
+            want = _GET_CHUNK if length is None else min(_GET_CHUNK, length - done)
+            piece = self._exec("tail -c +%d %s | head -c %d | base64 -w0" % (offset + done + 1, quoted, want),
+                               timeout=60)
+            chunk = base64.b64decode(piece.strip(), validate=True)
+            if chunk:
+                done += len(chunk)
+                yield chunk
+            if len(chunk) < want:
+                return
 
     def _upload(self, host_path: str, remote_path: str) -> None:
         """One file, in as many requests as its size needs."""
@@ -396,5 +413,111 @@ class CloudflareSandboxProvider(TerminalEnvironmentProvider):
         )
 
 
+# --- Hermes' file browser, previews and downloads ----------------------------------------------
+_FS_LOCK = threading.Lock()
+_FS_CACHE: dict = {}
+
+
+def _browser_cwd(configured) -> str:
+    """Where the file browser opens: where the terminal starts. A ``terminal.cwd`` that is a folder beside
+    Hermes names nothing in the sandbox, and the terminal drops it for the sandbox's home the same way."""
+    cwd = str(configured or "").strip()
+    if not cwd or cwd.startswith("~"):
+        return cwd or "~"
+    try:
+        from tools.terminal_tool_config import _is_unusable_container_cwd
+        return "~" if _is_unusable_container_cwd(cwd) else cwd
+    except Exception:
+        return cwd if cwd.startswith("/") and not os.path.isdir(cwd) else "~"
+
+
+def _install_workspace_fs() -> None:
+    """Point Hermes' file routes at the sandbox. They follow the terminal to another machine only when
+    the backend is ``ssh``; for any other backend the file browser, a file opened from a chat, an image
+    the agent made and every download read the disk beside Hermes, where nothing the agent does lands.
+    Those routes ask one function for the SSH machine's reader, so that function is wrapped here to
+    answer for this backend too, with a reader that speaks to the Worker."""
+    from hermes_cli import ssh_workspace_fs as module
+
+    original = module.get_ssh_workspace_fs
+    if getattr(original, "_cloudflare_sandbox", False):
+        return
+    error = module.SshWorkspaceFsError
+
+    class SandboxWorkspaceFs(module.SshWorkspaceFs):
+        """The SSH reader's commands, sent to the Worker. Reads go a piece per request: one command's
+        output is capped at 1 MiB."""
+
+        def _execute(self, command, *, stdin_data=None, timeout=None):
+            try:
+                result = self._env._request(
+                    "/exec", {"command": command, "timeout_s": 60, "stdin": stdin_data or ""}, timeout=90)
+            except Exception as exc:
+                raise error("ECONN", "The sandbox did not answer") from exc
+            return {"output": result.get("stdout") or "", "returncode": int(result.get("exit_code") or 0)}
+
+        def read_bytes(self, path, *, max_bytes, read_limit=None):
+            target, size = self._stat(path)
+            if size > max_bytes:
+                raise error("EFBIG")
+            return self._read(target, 0, size if read_limit is None else min(size, int(read_limit))), size, target
+
+        def stream_file(self, path, chunk_size=64 * 1024, *, offset=0, length=None):
+            target = self.normalize(path)
+            try:
+                yield from self._env.read_range(target, int(offset), None if length is None else int(length))
+            except Exception as exc:
+                raise error("EIO", "The sandbox file could not be read") from exc
+
+        def _stat(self, path):
+            """A regular file's path and size, with the SSH reader's error codes."""
+            target = self.normalize(path)
+            result = self._execute(
+                'p=%s\n'
+                'if [ ! -e "$p" ] && [ ! -L "$p" ]; then echo __HERMES_FS_ERROR__:ENOENT; exit 44; fi\n'
+                'if [ ! -f "$p" ]; then echo __HERMES_FS_ERROR__:ENOTREG; exit 45; fi\n'
+                'if [ ! -r "$p" ]; then echo __HERMES_FS_ERROR__:EACCES; exit 46; fi\n'
+                'echo "__HERMES_FS_SIZE__:$(stat -c %%s "$p")"\n' % shlex.quote(target))
+            output = result.get("output") or ""
+            if result.get("returncode") != 0:
+                raise error(self._error_code(output))
+            try:
+                return target, int(next(line.split(":", 1)[1] for line in output.splitlines()
+                                        if line.startswith("__HERMES_FS_SIZE__:")))
+            except (StopIteration, ValueError) as exc:
+                raise error("EIO", "The sandbox did not return a file size") from exc
+
+        def _read(self, target, offset, length) -> bytes:
+            try:
+                return b"".join(self._env.read_range(target, offset, length))
+            except Exception as exc:
+                raise error("EIO", "The sandbox file could not be read") from exc
+
+    def get_workspace_fs(profile_key, terminal_config):
+        backend = str(terminal_config.get("backend") or os.environ.get("TERMINAL_ENV") or "").strip().lower()
+        if backend != CloudflareSandboxProvider.name:
+            return original(profile_key, terminal_config)
+        cwd = _browser_cwd(terminal_config.get("cwd"))
+        with _FS_LOCK:
+            cached = _FS_CACHE.get(profile_key)
+            if cached and cached[0] == cwd:
+                return cached[1]
+            try:
+                # Under the gateway route the sandbox is the signed-in user's whatever key is sent. On a
+                # public route each chat has its own sandbox, and this reads the one named "default".
+                env = CloudflareSandboxEnvironment(cwd=cwd, timeout=60, sync_files=False)
+            except Exception as exc:
+                raise error("ECONN", "The sandbox is not reachable") from exc
+            fs = _FS_CACHE[profile_key] = (cwd, SandboxWorkspaceFs(env))
+            return fs[1]
+
+    get_workspace_fs._cloudflare_sandbox = True
+    module.get_ssh_workspace_fs = get_workspace_fs
+
+
 def register(ctx):
     ctx.register_terminal_environment_provider(CloudflareSandboxProvider())
+    try:
+        _install_workspace_fs()
+    except Exception as exc:  # the terminal still works; the file browser shows Hermes' own disk
+        logger.warning("cloudflare_sandbox: the file browser will not show the sandbox (%s)", exc)
