@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -139,6 +140,9 @@ def _base_url(value: str) -> str:
 # Where the user's uploads and skills land in the sandbox. Hermes names the same base to the model
 # (``cache_path_base`` below), so a path it is told about exists where its commands run.
 _SYNC_BASE = "/root/.hermes"
+# The agent's working folder in the sandbox: where the terminal starts and what the file browser shows.
+# Hermes' own workspace folder (``terminal.cwd``) is beside Hermes, where no command of the agent's runs.
+_WORKSPACE = "/workspace"
 # Raw bytes per download request: the Worker returns at most 1 MiB of output, and base64 adds a third.
 _GET_CHUNK = 512 * 1024
 # Raw bytes per upload request: the Worker takes 8 MiB of stdin, and base64 adds a third.
@@ -174,10 +178,15 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
 
         # Hermes delivers a file the agent made (a screenshot, a PDF) only from a backend that says where
         # its home is; without this a MEDIA: path in the sandbox is dropped and the user gets nothing.
-        self._remote_home = "/root"
+        self._remote_home = self._resolve_home()
         if cwd in ("", "~"):
-            cwd = self._remote_home = self._resolve_home()
+            cwd = self._remote_home
         super().__init__(cwd=cwd, timeout=int(timeout), **kwargs)
+        if cwd == _WORKSPACE:  # a sandbox saved before its image had the folder
+            try:
+                self._exec("mkdir -p %s" % shlex.quote(cwd), timeout=30)
+            except Exception as exc:
+                logger.warning("cloudflare_sandbox: could not make %s (%s)", cwd, exc)
 
         # The sandbox has its own disk: without this an attached file exists only beside Hermes, and the
         # model is handed a path its commands can't open.
@@ -384,7 +393,7 @@ class CloudflareSandboxProvider(TerminalEnvironmentProvider):
 
     @property
     def default_cwd(self):
-        return "~"
+        return _WORKSPACE
 
     @property
     def cache_path_base(self):
@@ -418,17 +427,24 @@ _FS_LOCK = threading.Lock()
 _FS_CACHE: dict = {}
 
 
-def _browser_cwd(configured) -> str:
-    """Where the file browser opens: where the terminal starts. A ``terminal.cwd`` that is a folder beside
-    Hermes names nothing in the sandbox, and the terminal drops it for the sandbox's home the same way."""
+def _browser_cwd(configured) -> tuple:
+    """``(folder the file browser opens in, Hermes-side folder that stands for it or None)``. The
+    browser opens where the terminal starts. A ``terminal.cwd`` that is a folder beside Hermes names
+    nothing in the sandbox: the terminal drops it for the sandbox's workspace, and the UI still asks
+    for files under it, so those requests are answered from the workspace."""
     cwd = str(configured or "").strip()
-    if not cwd or cwd.startswith("~"):
-        return cwd or "~"
+    if not cwd:
+        return _WORKSPACE, None
+    if cwd.startswith("~"):
+        return cwd, None
     try:
         from tools.terminal_tool_config import _is_unusable_container_cwd
-        return "~" if _is_unusable_container_cwd(cwd) else cwd
+        beside_hermes = _is_unusable_container_cwd(cwd)
     except Exception:
-        return cwd if cwd.startswith("/") and not os.path.isdir(cwd) else "~"
+        beside_hermes = not cwd.startswith("/") or os.path.isdir(cwd)
+    if not beside_hermes:
+        return cwd, None
+    return _WORKSPACE, (posixpath.normpath(cwd) if cwd.startswith("/") else None)
 
 
 def _install_workspace_fs() -> None:
@@ -447,6 +463,26 @@ def _install_workspace_fs() -> None:
     class SandboxWorkspaceFs(module.SshWorkspaceFs):
         """The SSH reader's commands, sent to the Worker. Reads go a piece per request: one command's
         output is capped at 1 MiB."""
+
+        host_root = None  # Hermes' own workspace folder, when the UI names files under it
+
+        def _under_host_root(self, path) -> bool:
+            root = self.host_root
+            return bool(root) and (path == root or path.startswith(root + "/"))
+
+        def normalize(self, path):
+            raw = str(path or "").strip()
+            if self._under_host_root(raw):
+                raw = self._env.cwd + raw[len(self.host_root):]
+            return super().normalize(raw)
+
+        def list_dir(self, path, hidden_names):
+            listing = super().list_dir(path, hidden_names)
+            asked = posixpath.normpath(str(path or "").strip() or "/")
+            if self._under_host_root(asked):  # the UI places each entry under the folder it asked for
+                for entry in listing["entries"]:
+                    entry["path"] = posixpath.join(asked, entry["name"])
+            return listing
 
         def _execute(self, command, *, stdin_data=None, timeout=None):
             try:
@@ -497,10 +533,10 @@ def _install_workspace_fs() -> None:
         backend = str(terminal_config.get("backend") or os.environ.get("TERMINAL_ENV") or "").strip().lower()
         if backend != CloudflareSandboxProvider.name:
             return original(profile_key, terminal_config)
-        cwd = _browser_cwd(terminal_config.get("cwd"))
+        cwd, host_root = key = _browser_cwd(terminal_config.get("cwd"))
         with _FS_LOCK:
             cached = _FS_CACHE.get(profile_key)
-            if cached and cached[0] == cwd:
+            if cached and cached[0] == key:
                 return cached[1]
             try:
                 # Under the gateway route the sandbox is the signed-in user's whatever key is sent. On a
@@ -508,8 +544,10 @@ def _install_workspace_fs() -> None:
                 env = CloudflareSandboxEnvironment(cwd=cwd, timeout=60, sync_files=False)
             except Exception as exc:
                 raise error("ECONN", "The sandbox is not reachable") from exc
-            fs = _FS_CACHE[profile_key] = (cwd, SandboxWorkspaceFs(env))
-            return fs[1]
+            fs = SandboxWorkspaceFs(env)
+            fs.host_root = host_root
+            _FS_CACHE[profile_key] = (key, fs)
+            return fs
 
     get_workspace_fs._cloudflare_sandbox = True
     module.get_ssh_workspace_fs = get_workspace_fs

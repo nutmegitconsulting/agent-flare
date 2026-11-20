@@ -18,6 +18,7 @@ from pathlib import Path
 PLUGIN = os.environ.get(
     "AF_SANDBOX_PLUGIN", "/opt/hermes-install/hermes-agent/plugins/cloudflare_sandbox/__init__.py")
 MAX_OUTPUT = 1024 * 1024
+HOST_WORKSPACE = "/home/hermes/.hermes/workspace"  # what agent-flare sets as terminal.cwd
 
 
 class Worker(BaseHTTPRequestHandler):
@@ -72,13 +73,18 @@ class SandboxFs(unittest.TestCase):
             def register_terminal_environment_provider(self, provider):
                 cls.provider = provider
 
+        cls.work = cls.home / "workspace"
+        cls.plugin._WORKSPACE = str(cls.work)  # /workspace in a real sandbox
         cls.plugin.register(Ctx())
         cls.plugin.register(Ctx())  # a second load must not wrap the wrapper
 
         from hermes_cli import ssh_workspace_fs
         cls.module = ssh_workspace_fs
-        cls.fs = ssh_workspace_fs.get_ssh_workspace_fs("current", {"backend": "cloudflare_sandbox", "cwd": "/home/hermes/x"})
+        cls.fs = ssh_workspace_fs.get_ssh_workspace_fs("current", {"backend": "cloudflare_sandbox", "cwd": HOST_WORKSPACE})
 
+        (cls.work / "made-by-agent.txt").write_text("in the sandbox\n")
+        (cls.work / "sub").mkdir()
+        (cls.work / "sub" / "deep.txt").write_text("deep\n")
         (cls.home / "project").mkdir()
         (cls.home / "project" / "notes.txt").write_text("hello\n")
         (cls.home / "b.txt").write_text("b")
@@ -97,16 +103,28 @@ class SandboxFs(unittest.TestCase):
         self.assertIsNone(self.module.get_ssh_workspace_fs("current", {"backend": "local"}))
         self.assertIsNone(self.module.get_ssh_workspace_fs("current", {}))
 
-    def test_opens_in_the_sandbox_home_not_a_folder_beside_hermes(self):
-        self.assertEqual(self.fs.cwd, str(self.home))
+    def test_opens_in_the_sandbox_workspace_and_the_terminal_starts_there(self):
+        self.assertEqual(self.fs.cwd, str(self.work))  # made on first use: the folder did not exist
+        self.assertEqual(self.provider.default_cwd, str(self.work))
+
+    def test_hermes_own_workspace_folder_shows_the_sandbox_workspace(self):
+        listing = self.fs.list_dir(HOST_WORKSPACE, frozenset())
+        self.assertEqual([(e["name"], e["path"]) for e in listing["entries"]],
+                         [("sub", HOST_WORKSPACE + "/sub"), ("made-by-agent.txt", HOST_WORKSPACE + "/made-by-agent.txt")])
+        self.assertEqual(self.fs.list_dir(HOST_WORKSPACE + "/sub", frozenset())["entries"][0]["path"], HOST_WORKSPACE + "/sub/deep.txt")
+        self.assertEqual(self.fs.read_bytes(HOST_WORKSPACE + "/sub/deep.txt", max_bytes=100)[0], b"deep\n")
+        self.assertEqual(self.fs.read_bytes(str(self.work / "made-by-agent.txt"), max_bytes=100)[0], b"in the sandbox\n")
+        self.assertEqual(self.fs.normalize(HOST_WORKSPACE + "-other/x"), HOST_WORKSPACE + "-other/x")
+
+    def test_home_paths(self):
         self.assertEqual(self.fs.normalize("~/project"), str(self.home / "project"))
 
     def test_one_reader_per_profile(self):
-        again = self.module.get_ssh_workspace_fs("current", {"backend": "cloudflare_sandbox", "cwd": "/home/hermes/x"})
+        again = self.module.get_ssh_workspace_fs("current", {"backend": "cloudflare_sandbox", "cwd": HOST_WORKSPACE})
         self.assertIs(again, self.fs)
 
     def test_lists_a_folder(self):
-        listing = self.fs.list_dir("~", frozenset({"empty"}))
+        listing = self.fs.list_dir("~", frozenset({"empty", "workspace"}))
         self.assertEqual([e["name"] for e in listing["entries"]], ["project", "A.txt", "b.txt", "shot.png"])
         self.assertTrue(listing["entries"][0]["isDirectory"])
         self.assertEqual(listing["entries"][1]["path"], str(self.home / "A.txt"))
@@ -149,7 +167,10 @@ class SandboxFs(unittest.TestCase):
 
     def test_the_routes_read_the_sandbox(self):
         from hermes_cli.web_routers import files
-        self.assertEqual(asyncio.run(files.fs_default_cwd())["cwd"], str(self.home))
+        self.assertEqual(asyncio.run(files.fs_default_cwd())["cwd"], str(self.work))
+        shown = asyncio.run(files.fs_list(HOST_WORKSPACE, None))
+        self.assertEqual([e["name"] for e in shown["entries"]], ["sub", "made-by-agent.txt"])
+        self.assertEqual(asyncio.run(files.fs_read_text(HOST_WORKSPACE + "/made-by-agent.txt"))["text"], "in the sandbox\n")
         listing = asyncio.run(files.fs_list(str(self.home / "project"), None))
         self.assertEqual([e["name"] for e in listing["entries"]], ["new.md", "notes.txt"] if (self.home / "project" / "new.md").exists() else ["notes.txt"])
         text = asyncio.run(files.fs_read_text(str(self.home / "project" / "notes.txt")))
