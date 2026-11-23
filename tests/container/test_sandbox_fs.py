@@ -1,4 +1,4 @@
-"""Hermes' file routes read the dev sandbox. Run with the image's Python: see tests/container/run.sh.
+"""Hermes' file routes and its git read the dev sandbox. Run with the image's Python: see tests/container/run.sh.
 
 The Worker here is a stand-in that runs each command in a local bash and cuts output at 1 MiB, as the
 real one does. Its "sandbox" is a temp folder, so every path in these tests is under it.
@@ -7,6 +7,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -177,6 +178,108 @@ class SandboxFs(unittest.TestCase):
         self.assertEqual((text["text"], text["binary"]), ("hello\n", False))
         image = asyncio.run(files.fs_read_data_url(str(self.home / "shot.png"), None))
         self.assertTrue(image["dataUrl"].startswith("data:image/png;base64,"))
+
+    # --- git, and a session's folder ---------------------------------------------------------------
+    def _repo(self, name):
+        """A folder of the workspace, in the sandbox only, gone again after the test."""
+        (self.work / name).mkdir()
+        self.addCleanup(shutil.rmtree, self.work / name, True)
+        self.addCleanup(shutil.rmtree, HOST_WORKSPACE + "/" + name, True)
+        return HOST_WORKSPACE + "/" + name
+
+    def test_the_git_functions_the_plugin_wraps_are_still_there(self):
+        # A Hermes that renamed one of these leaves git in the UI acting on the wrong disk, and says so
+        # only in a log line.
+        from hermes_cli import web_git
+        from tui_gateway import git_probe
+        self.assertTrue(getattr(web_git._run, "_cloudflare_sandbox", False))
+        for name in self.plugin._WEB_GIT_NAMES:
+            self.assertEqual(getattr(web_git, name).__module__, self.plugin.__name__, name)
+        self.assertEqual(git_probe.run_git.__module__, self.plugin.__name__)
+
+    def test_a_worktree_is_made_in_the_sandbox(self):
+        from hermes_cli import web_git
+        repo = self._repo("app")
+        made = web_git.worktree_add(repo, {"name": "feat", "branch": "feat"})
+        self.assertEqual(made, {"path": repo + "/.worktrees/feat", "branch": "feat", "repoRoot": repo})
+        self.assertTrue((self.work / "app" / ".worktrees" / "feat" / ".git").exists())
+        self.assertFalse(os.path.exists(repo + "/.git"))  # nothing of the repository beside Hermes
+        self.assertEqual(os.listdir(made["path"]), [])  # only the empty folder a session's check needs
+        self.assertEqual([tree["path"] for tree in web_git.worktree_list(repo)], [repo, made["path"]])
+        self.assertEqual(web_git.repo_status(made["path"])["branch"], "feat")
+        again = web_git.worktree_add(repo, {"name": "feat", "branch": "feat-2"})
+        self.assertEqual(again["path"], repo + "/.worktrees/feat-2")
+        web_git.worktree_remove(repo, again["path"], False)
+        self.assertFalse((self.work / "app" / ".worktrees" / "feat-2").exists())
+
+    def test_git_answers_in_the_name_it_was_asked_in(self):
+        from hermes_cli import web_git
+        repo = self._repo("named")
+        web_git.worktree_add(repo, {"name": "one"})
+        inside = str(self.work / "named")
+        self.assertEqual([tree["path"] for tree in web_git.worktree_list(inside)], [inside, inside + "/.worktrees/one"])
+        self.assertIsNone(web_git.repo_status(HOST_WORKSPACE + "/no-such-folder"))
+
+    def test_the_review_pane_reads_the_sandbox(self):
+        from hermes_cli import web_git
+        repo = self._repo("review")
+        web_git._ensure_repo(repo)
+        (self.work / "review" / "new.txt").write_text("made by the agent\n")
+        status = web_git.repo_status(repo)
+        self.assertEqual([entry["path"] for entry in status["files"]], ["new.txt"])
+        self.assertIn("+made by the agent", web_git.review_diff(repo, "new.txt", "uncommitted", None, False))
+
+    def test_a_session_shows_its_branch(self):
+        from hermes_cli import web_git
+        from tui_gateway import git_probe
+        repo = self._repo("probe")
+        tree = web_git.worktree_add(repo, {"name": "lane", "branch": "lane"})["path"]
+        self.assertEqual(git_probe.branch(tree), "lane")
+        self.assertEqual(git_probe.resolve(tree), {"repo_root": repo, "worktree_root": tree})
+        self.assertIsNone(git_probe.resolve(HOST_WORKSPACE + "/sub"))
+
+    def test_only_git_settings_go_to_the_sandbox(self):
+        command = self.plugin._git_command(
+            ["git", "worktree", "add", HOST_WORKSPACE + "/.worktrees/x"], HOST_WORKSPACE + "/app",
+            {"GIT_PAGER": "cat", "GIT_CONFIG_KEY_0": "core.hooksPath", "TEAM_KEY": "secret", "GIT_TOKEN": "secret",
+             "CF_DEV_SANDBOX_TOKEN": "secret"}, HOST_WORKSPACE)
+        self.assertNotIn("secret", command)
+        self.assertIn("GIT_PAGER=cat", command)
+        self.assertIn("GIT_CONFIG_KEY_0=core.hooksPath", command)
+        self.assertTrue(command.startswith("cd -- %s/app " % self.work))
+        self.assertTrue(command.endswith("git worktree add %s/.worktrees/x" % self.work))
+
+    def test_a_session_folder_in_the_workspace_is_that_folder_in_the_sandbox(self):
+        self.addCleanup(os.environ.pop, "TERMINAL_CWD", None)
+        for asked, starts in ((HOST_WORKSPACE + "/app/.worktrees/feat", str(self.work / "app" / ".worktrees" / "feat")),
+                              (HOST_WORKSPACE, str(self.work)), (HOST_WORKSPACE + "-other", str(self.work)),
+                              ("/home/hermes/elsewhere", str(self.work)), ("", str(self.work))):
+            os.environ["TERMINAL_CWD"] = asked
+            self.assertEqual(self.provider.default_cwd, starts, asked)
+        # What Hermes' file tools and a moved session read off the environment.
+        from tools.terminal_tool_config import translate_mounted_host_path
+        env = self.plugin.CloudflareSandboxEnvironment(cwd=str(self.work), timeout=30, sync_files=False)
+        self.assertEqual(translate_mounted_host_path(HOST_WORKSPACE + "/app/a.txt", env.host_cwd, env.host_cwd_mount),
+                         str(self.work / "app" / "a.txt"))
+
+    def test_a_folder_the_ui_is_shown_can_hold_a_session(self):
+        # Hermes checks beside itself that a session's folder exists; the folder is only in the sandbox.
+        self.addCleanup(shutil.rmtree, HOST_WORKSPACE, True)
+        self.fs.list_dir(HOST_WORKSPACE, frozenset())
+        self.assertEqual(os.listdir(HOST_WORKSPACE), ["sub"])
+        self.assertEqual(os.listdir(HOST_WORKSPACE + "/sub"), [])
+        self.fs.list_dir("~", frozenset())  # outside the workspace: nothing is made beside Hermes
+        self.assertFalse(os.path.exists(str(self.home / "project").replace(str(self.work), HOST_WORKSPACE) + "-x"))
+        self.assertEqual(os.listdir(HOST_WORKSPACE), ["sub"])
+
+    def test_noted_folders_come_back_after_a_restart(self):
+        self.addCleanup(shutil.rmtree, HOST_WORKSPACE, True)
+        self.addCleanup(shutil.rmtree, self.work / "kept", True)
+        os.makedirs(HOST_WORKSPACE + "/kept/deeper")
+        os.makedirs(HOST_WORKSPACE + "/kept/node_modules/pkg")
+        self.plugin._restore_noted_folders(HOST_WORKSPACE)
+        self.assertTrue((self.work / "kept" / "deeper").is_dir())
+        self.assertFalse((self.work / "kept" / "node_modules").exists())
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ plugin's URL simply doesn't resolve and Hermes reports a command failure. No sil
 | `wrangler.example.jsonc` | optional `services` block between `// BEGIN_DEV_SANDBOX` / `// END_DEV_SANDBOX` markers |
 | `scripts/render-wrangler.mjs` | `AF_DEV_SANDBOX_WORKER` renders the service name in; unset **strips the block entirely** |
 | `Dockerfile` | `COPY container/plugins/cloudflare_sandbox` → `plugins/cloudflare_sandbox` in the Hermes install (inert until the env value arrives; per-user installs work without a rebuild) |
-| `container/plugins/cloudflare_sandbox/` | the plugin, copied into the image. It also points Hermes' file routes (`/api/fs/*`, `/api/files/stream`) at the sandbox, so the file browser, previews, images and downloads read where the terminal writes |
+| `container/plugins/cloudflare_sandbox/` | the plugin, copied into the image. It also points Hermes' file routes (`/api/fs/*`, `/api/files/stream`) at the sandbox, so the file browser, previews, images and downloads read where the terminal writes. The webapp's git (`/api/git/*`: worktrees, branches, the review pane) and a session's branch run there too, and a session started in a folder of the workspace runs in that folder of `/workspace` |
 | `ONBOARDING.md` | build-variable row + "per-user dev sandboxes" section |
 
 **Sidecar** (`~/cf-dev-sandbox/`, tarball at `~/cf-dev-sandbox.tar.gz`): `worker/` (Worker + `DevSandbox` DO:

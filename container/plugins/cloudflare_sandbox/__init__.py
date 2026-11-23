@@ -15,6 +15,9 @@ Design notes:
   machinery operates on a real ``Popen`` exactly as it does for SSH.
 - Hermes' file browser, previews and downloads read the sandbox too: see
   ``_install_workspace_fs``.
+- So does the webapp's git (worktrees, branches, the review pane): see
+  ``_install_git``. A session started in a folder of the workspace runs in that
+  folder in the sandbox.
 - No environment variables are forwarded into the sandbox (the sandbox must
   never hold secrets; see CF sandbox security guidance). The backend's own
   token reaches the client under ``CF_SANDBOX_TOKEN`` — a different name from
@@ -158,6 +161,84 @@ def _sync_files() -> list:
             for entry in (*iter_skills_files(container_base=_SYNC_BASE), *iter_cache_files(container_base=_SYNC_BASE))]
 
 
+# --- One workspace, named two ways ------------------------------------------------------------
+# The UI names a workspace folder either by where it is in the sandbox (/workspace/app) or under
+# Hermes' own workspace folder (``terminal.cwd``, e.g. /home/hermes/.hermes/workspace/app). The files
+# are only in the sandbox. Hermes still checks beside itself that a session's folder exists, so each
+# sandbox folder the UI is shown gets an empty folder of the same name there.
+_SKIP_FOLDERS = frozenset({".git", "node_modules"})
+_MAX_FOLDERS = 2000
+
+
+def _under(path: str, root) -> bool:
+    return bool(root) and (path == root or path.startswith(root + "/"))
+
+
+def _to_sandbox(path: str, host_root) -> str:
+    """Where ``path`` is in the sandbox: a path under Hermes' workspace folder is under /workspace there."""
+    return _WORKSPACE + path[len(host_root):] if _under(path, host_root) else path
+
+
+def _to_host(path: str, host_root) -> str:
+    return host_root + path[len(_WORKSPACE):] if host_root and _under(path, _WORKSPACE) else path
+
+
+def _note_folders(paths, host_root) -> None:
+    """Empty folders beside Hermes for these sandbox folders, under both names. Only for folders of
+    the workspace: a sandbox folder elsewhere gets nothing made beside Hermes."""
+    for path in paths:
+        path = posixpath.normpath(str(path))
+        inside = _to_sandbox(path, host_root)
+        if not _under(inside, _WORKSPACE):
+            continue
+        for twin in {inside, _to_host(inside, host_root)}:
+            try:
+                os.makedirs(twin, exist_ok=True)
+            except OSError:
+                pass
+
+
+def _restore_noted_folders(host_root) -> None:
+    """Hermes' workspace folder is in the account's backup and /workspace beside Hermes is not: after
+    a restart, the second is filled in from the first."""
+    if not host_root or not os.path.isdir(host_root):
+        return
+    seen = 0
+    for folder, names, _files in os.walk(host_root):
+        names[:] = [name for name in names if name not in _SKIP_FOLDERS]
+        _note_folders([folder], host_root)
+        seen += 1
+        if seen >= _MAX_FOLDERS:
+            return
+
+
+_CONFIG_LOCK = threading.Lock()
+_CONFIG_CACHE: dict = {}
+
+
+def _terminal_config() -> dict:
+    """``terminal`` from the current profile's config.yaml, re-read at most every few seconds."""
+    import time
+    home = os.environ.get("HERMES_HOME") or ""
+    with _CONFIG_LOCK:
+        cached = _CONFIG_CACHE.get(home)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+    try:
+        from hermes_cli.config import load_config
+        terminal = dict(load_config().get("terminal") or {})
+    except Exception:
+        terminal = {}
+    with _CONFIG_LOCK:
+        _CONFIG_CACHE[home] = (time.monotonic() + 5, terminal)
+    return terminal
+
+
+def _host_workspace():
+    """Hermes' own workspace folder when ``terminal.cwd`` names one, else None."""
+    return _browser_cwd(_terminal_config().get("cwd"))[1]
+
+
 class CloudflareSandboxEnvironment(BaseEnvironment):
     """One sandbox: a durable-object-named Cloudflare container, resumed by key."""
 
@@ -182,6 +263,11 @@ class CloudflareSandboxEnvironment(BaseEnvironment):
         if cwd in ("", "~"):
             cwd = self._remote_home
         super().__init__(cwd=cwd, timeout=int(timeout), **kwargs)
+        # Hermes reads these two off an environment to turn a path beside itself into the sandbox's (it
+        # does so for a folder Docker mounts). With them a session in <terminal.cwd>/app runs its
+        # commands and file tools in /workspace/app, not in /workspace.
+        self.host_cwd = _host_workspace()
+        self.host_cwd_mount = _WORKSPACE if self.host_cwd else None
         if cwd == _WORKSPACE:  # a sandbox saved before its image had the folder
             try:
                 self._exec("mkdir -p %s" % shlex.quote(cwd), timeout=30)
@@ -393,7 +479,16 @@ class CloudflareSandboxProvider(TerminalEnvironmentProvider):
 
     @property
     def default_cwd(self):
-        return _WORKSPACE
+        # Hermes asks this each time it finds the session's folder unusable in a container, and any
+        # folder beside Hermes is. A session in a folder of Hermes' workspace starts in that folder of
+        # the sandbox's workspace; every other session starts in the workspace itself.
+        try:
+            from tools.terminal_scope import terminal_env
+            asked = posixpath.normpath(terminal_env("TERMINAL_CWD", "") or "")
+            host_root = _host_workspace()
+        except Exception:
+            return _WORKSPACE
+        return _to_sandbox(asked, host_root) if _under(asked, host_root) else _WORKSPACE
 
     @property
     def cache_path_base(self):
@@ -482,6 +577,10 @@ def _install_workspace_fs() -> None:
             if self._under_host_root(asked):  # the UI places each entry under the folder it asked for
                 for entry in listing["entries"]:
                     entry["path"] = posixpath.join(asked, entry["name"])
+            if not listing.get("error"):  # a folder the UI is shown is one a session can be started in
+                folders = [entry["path"] for entry in listing["entries"] if entry["isDirectory"]
+                           and entry["name"] not in _SKIP_FOLDERS]
+                _note_folders([self.normalize(asked), *folders[:200]], self.host_root)
             return listing
 
         def _execute(self, command, *, stdin_data=None, timeout=None):
@@ -553,9 +652,189 @@ def _install_workspace_fs() -> None:
     module.get_ssh_workspace_fs = get_workspace_fs
 
 
+# --- The webapp's git: worktrees, branches, the review pane, a session's branch ------------------
+# What Hermes sets for its own git calls, by name. Nothing else of Hermes' environment goes to the
+# sandbox: it holds credentials.
+_GIT_ENV = re.compile(
+    r"^(GIT_(TERMINAL_PROMPT|CONFIG_(GLOBAL|SYSTEM|NOSYSTEM|COUNT|KEY_\d+|VALUE_\d+)|PAGER|EDITOR|OPTIONAL_LOCKS"
+    r"|(AUTHOR|COMMITTER)_(NAME|EMAIL|DATE))|GCM_INTERACTIVE|PAGER|GH_PROMPT_DISABLED)$")
+# The git commands whose output is a list of folders.
+_GIT_PATH_FLAGS = frozenset({"--show-toplevel", "--git-common-dir", "--absolute-git-dir", "--git-dir"})
+_WEB_GIT_NAMES = ("_run", "noninteractive_repo_git_env", "_is_dir", "_unique_dir", "_all_add_diff")
+_PROBE_MISS_TTL = 300.0
+_PROBE_LOCK = threading.Lock()
+_PROBE_MISSES: dict = {}
+
+
+def _git_sandbox():
+    """``(reader, Hermes' workspace folder or None)`` when this profile's terminal is the sandbox, else
+    None. The reader is the file browser's, so git and the browser read the same sandbox."""
+    terminal = _terminal_config()
+    backend = str(terminal.get("backend") or os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    if backend != CloudflareSandboxProvider.name:
+        return None
+    from hermes_cli import ssh_workspace_fs
+    fs = ssh_workspace_fs.get_ssh_workspace_fs("cloudflare-sandbox-git", terminal)
+    return (fs, fs.host_root) if fs is not None else None
+
+
+def _git_command(argv, cwd: str, env, host_root) -> str:
+    """One git (or gh) call as a sandbox command: in ``cwd``, with Hermes' git settings and no more."""
+    words = ["env"] + ["%s=%s" % (key, value) for key, value in (env or {}).items() if _GIT_ENV.match(key)]
+    words += [_to_sandbox(str(word), host_root) for word in argv]
+    return "cd -- %s || exit 128\n%s" % (shlex.quote(_to_sandbox(cwd, host_root)), shlex.join(words))
+
+
+def _git_shown(argv, output: str, host_root) -> str:
+    """Folders in a command's output, named the way the UI named the folder it asked about."""
+    args = [str(word) for word in argv]
+    listing = "worktree" in args and "list" in args
+    if not host_root or not (listing or _GIT_PATH_FLAGS.intersection(args)):
+        return output
+    lines = []
+    for line in output.split("\n"):
+        if listing and line.startswith("worktree "):
+            line = "worktree " + _to_host(line[9:], host_root)
+        elif not listing:
+            line = _to_host(line, host_root)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _install_git() -> None:
+    """Run the webapp's git in the sandbox. Hermes runs it beside itself, where the workspace folder is
+    empty: a worktree made there is one no command of the agent's ever sees, and a folder the agent
+    made is one git cannot find. Hermes has no hook for this, so the functions that reach the disk are
+    wrapped; every one is checked to be there first, and the image's tests fail when one moves."""
+    import subprocess
+    from hermes_cli import web_git
+    from hermes_cli._subprocess_compat import noninteractive_git_env
+    from tui_gateway import git_probe
+
+    if getattr(web_git._run, "_cloudflare_sandbox", False):
+        return
+    missing = [name for name in _WEB_GIT_NAMES if not callable(getattr(web_git, name, None))]
+    if missing or not callable(getattr(git_probe, "run_git", None)):
+        raise RuntimeError("Hermes' git functions moved: %s" % ", ".join(missing or ["git_probe.run_git"]))
+    original = {name: getattr(web_git, name) for name in _WEB_GIT_NAMES}
+    original_probe = git_probe.run_git
+
+    def execute(fs, command, timeout):
+        return fs._env._request("/exec", {"command": command, "timeout_s": int(timeout), "stdin": ""},
+                                timeout=timeout + 30)
+
+    def exists(fs, flag, path, host_root) -> bool:
+        return fs._execute("[ %s %s ]" % (flag, shlex.quote(_to_sandbox(path, host_root))))["returncode"] == 0
+
+    def run(argv, cwd, timeout, env):
+        sandbox = _git_sandbox()
+        if sandbox is None:
+            return original["_run"](argv, cwd, timeout, env)
+        fs, host_root = sandbox
+        cwd = str(cwd)
+        try:
+            result = execute(fs, _git_command(argv, cwd, env, host_root), timeout)
+        except Exception as exc:
+            logger.warning("cloudflare_sandbox: git did not run in the sandbox (%s)", exc)
+            return None
+        code = int(result.get("exit_code") or 0)
+        output = result.get("stdout") or ""
+        shown_as_host = _under(cwd, host_root)
+        if code == 0:
+            args = [str(word) for word in argv]
+            made = [word for word in args if "/.worktrees/" in word] if "worktree" in args and "add" in args else []
+            _note_folders([cwd, *made], host_root)
+            if made or "init" in args:
+                with _PROBE_LOCK:
+                    _PROBE_MISSES.clear()
+        return subprocess.CompletedProcess(
+            argv, code, _git_shown(argv, output, host_root) if shown_as_host else output, result.get("stderr") or "")
+
+    def repo_env(cwd, base=None):
+        # Hermes empties a repository's own filter commands before a read, by asking git beside itself
+        # which ones it names. Here the repository is in the sandbox, where any command of the agent's
+        # already runs; beside Hermes there is no repository to ask.
+        if _git_sandbox() is None:
+            return original["noninteractive_repo_git_env"](cwd, base)
+        return noninteractive_git_env(base)
+
+    def is_dir(cwd):
+        sandbox = _git_sandbox()
+        if sandbox is None:
+            return original["_is_dir"](cwd)
+        fs, host_root = sandbox
+        try:
+            found = exists(fs, "-d", str(cwd), host_root)
+        except Exception:
+            return False
+        if found:
+            _note_folders([str(cwd)], host_root)
+        return found
+
+    def unique_dir(base):
+        sandbox = _git_sandbox()
+        if sandbox is None:
+            return original["_unique_dir"](base)
+        fs, host_root = sandbox
+        for number in range(1, 100):
+            candidate = base if number == 1 else "%s-%d" % (base, number)
+            if not exists(fs, "-e", candidate, host_root):
+                return candidate
+        raise RuntimeError("No free folder name for %s" % base)
+
+    def all_add_diff(cwd, file_path):
+        sandbox = _git_sandbox()
+        if sandbox is None:
+            return original["_all_add_diff"](cwd, file_path)
+        fs, host_root = sandbox
+        if not exists(fs, "-f", posixpath.join(str(cwd), file_path), host_root):
+            return ""
+        return web_git._git(cwd, ["diff", "--no-index", "--", os.devnull, file_path])[1]
+
+    def probe(cwd, *args):
+        """A session's branch and repository, for the sidebar. A folder that is no repository is asked
+        about again only after a while: every question is a request that keeps the sandbox awake."""
+        import time
+        sandbox = _git_sandbox() if cwd else None
+        if sandbox is None:
+            return original_probe(cwd, *args)
+        fs, host_root = sandbox
+        key = (cwd, args)
+        with _PROBE_LOCK:
+            if _PROBE_MISSES.get(key, 0) > time.monotonic():
+                return ""
+        argv = ["git", "-C", cwd, *args]
+        try:
+            result = execute(fs, _git_command(argv, "/", noninteractive_git_env(), host_root), 10)
+        except Exception:
+            return ""
+        output = (result.get("stdout") or "").strip() if int(result.get("exit_code") or 0) == 0 else ""
+        if not output:
+            with _PROBE_LOCK:
+                _PROBE_MISSES[key] = time.monotonic() + _PROBE_MISS_TTL
+            return ""
+        return _git_shown(argv, output, host_root) if _under(cwd, host_root) else output
+
+    run._cloudflare_sandbox = True
+    web_git._run = run
+    web_git.noninteractive_repo_git_env = repo_env
+    web_git._is_dir = is_dir
+    web_git._unique_dir = unique_dir
+    web_git._all_add_diff = all_add_diff
+    git_probe.run_git = probe
+
+
 def register(ctx):
     ctx.register_terminal_environment_provider(CloudflareSandboxProvider())
     try:
         _install_workspace_fs()
     except Exception as exc:  # the terminal still works; the file browser shows Hermes' own disk
         logger.warning("cloudflare_sandbox: the file browser will not show the sandbox (%s)", exc)
+    try:
+        _install_git()
+    except Exception as exc:  # worktrees and the review pane act on Hermes' own disk
+        logger.warning("cloudflare_sandbox: git in the UI will not reach the sandbox (%s)", exc)
+    try:
+        _restore_noted_folders(_host_workspace())
+    except Exception as exc:
+        logger.warning("cloudflare_sandbox: workspace folders were not restored beside Hermes (%s)", exc)
