@@ -571,9 +571,20 @@ def _install_workspace_fs() -> None:
                 raw = self._env.cwd + raw[len(self.host_root):]
             return super().normalize(raw)
 
+        def _made_beside_hermes(self, asked) -> bool:
+            # The UI's "new folder" makes the folder on Hermes' own disk, whatever the terminal backend.
+            inside = _to_sandbox(asked, self.host_root)
+            return _under(inside, _WORKSPACE) and inside != _WORKSPACE and any(
+                os.path.isdir(name) for name in {asked, inside, _to_host(inside, self.host_root)})
+
         def list_dir(self, path, hidden_names):
             listing = super().list_dir(path, hidden_names)
             asked = posixpath.normpath(str(path or "").strip() or "/")
+            if listing.get("error") == "ENOENT" and self._made_beside_hermes(asked):
+                # A workspace folder that is beside Hermes and not in the sandbox is one the UI just made:
+                # it is made in the sandbox too, where the session started in it will run.
+                self._execute("mkdir -p -- %s" % shlex.quote(self.normalize(asked)))
+                listing = super().list_dir(path, hidden_names)
             if self._under_host_root(asked):  # the UI places each entry under the folder it asked for
                 for entry in listing["entries"]:
                     entry["path"] = posixpath.join(asked, entry["name"])

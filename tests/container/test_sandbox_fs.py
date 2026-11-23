@@ -272,6 +272,16 @@ class SandboxFs(unittest.TestCase):
         self.assertFalse(os.path.exists(str(self.home / "project").replace(str(self.work), HOST_WORKSPACE) + "-x"))
         self.assertEqual(os.listdir(HOST_WORKSPACE), ["sub"])
 
+    def test_a_folder_made_from_the_ui_is_made_in_the_sandbox(self):
+        # "New folder" in the project screen makes it on Hermes' own disk; the picker then lists it.
+        self.addCleanup(shutil.rmtree, HOST_WORKSPACE, True)
+        self.addCleanup(shutil.rmtree, self.work / "from-ui", True)
+        os.makedirs(HOST_WORKSPACE + "/from-ui")
+        self.assertEqual(self.fs.list_dir(HOST_WORKSPACE + "/from-ui", frozenset()), {"entries": []})
+        self.assertTrue((self.work / "from-ui").is_dir())
+        self.assertEqual(self.fs.list_dir(HOST_WORKSPACE + "/never-made", frozenset())["error"], "ENOENT")
+        self.assertFalse((self.work / "never-made").exists())
+
     def test_noted_folders_come_back_after_a_restart(self):
         self.addCleanup(shutil.rmtree, HOST_WORKSPACE, True)
         self.addCleanup(shutil.rmtree, self.work / "kept", True)
