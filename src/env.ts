@@ -2,6 +2,12 @@ import type { AgentSandbox } from "./sandbox";
 
 export interface Env {
   Sandbox: DurableObjectNamespace<AgentSandbox>;
+  /**
+   * Optional: the per-user dev-sandbox sidecar Worker (service binding).
+   * Unbound = the feature is off: no outbound intercept is registered, no
+   * plugin env is shipped, and the gateway answers 503.
+   */
+  DEV_SANDBOX?: Fetcher;
   /** Snapshots, indexes, templates and assignments. No secrets. */
   BACKUP_BUCKET: R2Bucket;
   /** Per-user secrets, always encrypted with MASTER_KEY. See secrets.ts. */

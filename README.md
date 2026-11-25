@@ -73,10 +73,10 @@ templates/<name>/files/...         files copied into the Hermes home on first la
 
 | Key | Applies | Who wins |
 |---|---|---|
-| `providers` | Every boot | The template, per provider name |
+| `providers` | Every boot, for keys and the selected model only. Nothing from here is written into config.yaml | The template, per provider name |
 | `files` | First time the user gets this template, if the file doesn't exist | The user, afterwards |
 | `config_defaults` | First launch, or when first assigned this template | The user, afterwards |
-| `config_managed` | Every boot | The template |
+| `config.yaml` (`templates/<name>/config.yaml`) | Seeds a new account once. Each account's own copy, in R2, is then the only one that counts; edit it on the account's page | The account |
 | `env` | Every boot; `"$NAME"` reads Worker secret `NAME` if `TEMPLATE_SECRETS` lists it. Removed from `.env` when dropped from the template | The template |
 
 Agent Flare's own `webapp` and `dashboard.trusted_proxies` keys always win, so a template can't change the port or public URL.
@@ -91,11 +91,11 @@ Each entry in `providers`:
 | `mode` | `api_token`: credential is the Worker secret `CLOUDFLARE_AI_API_TOKEN`, shared by everyone, with requests tagged per user. `user_env`: credential comes from the user's `.env` |
 | `base_url` | An `https://` OpenAI-compatible endpoint. For AI Gateway: `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/compat` |
 | `key_env` | The `.env` variable holding the credential |
-| `gateway_id` | `api_token` only. Sent as `cf-aig-gateway-id` |
+| `gateway_id` | `api_token` only. Validated, but not sent: config.yaml comes from the role's document |
 | `model` | The model to select. Defaults to the first of `models` |
 | `models` | Model IDs, with `context_length` and `max_length` |
 | `api_mode`, `discover_models` | Optional; defaults `chat_completions`, `false` |
-| `extra_headers` | Optional. A header carrying a credential must read it as `"Bearer ${VAR}"`, with `VAR` set through `env`, because `config.yaml` goes in snapshots |
+| `extra_headers` | Optional. Validated, but not sent: put request headers in the role's config.yaml. A header carrying a credential must read it as `"Bearer ${VAR}"`, with `VAR` set through `env` |
 
 **Selection.** Hermes uses only the selected provider, so listing one isn't enough. On every boot, if the user has no model selected, the first provider whose `key_env` has a value is selected. A choice the user makes in Hermes is never replaced. A selection Agent Flare made moves on if its credential is withdrawn.
 
@@ -139,7 +139,7 @@ An admin can also see and control a user's container from their page, and downlo
 
 Keys are write-only, and sealed in KV. Screens show only whether one is set and when it changed. Order: user, then role, then the Worker secret the provider names.
 
-Every change applies at the user's next boot, and the Users screen shows who's waiting. A user's page can apply it now: that snapshots and then restarts, and if the snapshot fails, nothing changes. A role's default model follows a role change only if the user hasn't picked their own. `config_managed` reapplies every boot; `config_defaults` applies once and is then the user's.
+Every change applies at the user's next boot, and the Users screen shows who's waiting. A user's page can apply it now: that snapshots and then restarts, and if the snapshot fails, nothing changes. A role's default model follows a role change only if the user hasn't picked their own. `config_defaults` applies once and is then the user's. Each account's config.yaml is kept in R2 and written into its container on every start. Admin edits there restart a running container; Hermes' own changes (such as `/model`) are copied back to R2 at each snapshot.
 
 The picker shows a model's cost at the start of its name: `..$` low, `.$$` medium, `$$$` high, `*$$$` far above the rest. It's ordinary Hermes config: a model alias maps the shown name to the real ID. The list is `config/model-tiers.json`, shared by every role; edit it with `scripts/templates.mjs tiers` (`low`, `medium`, `high`, `premium`) or by typing the mark before the model in a role's model list. A model with no entry shows no mark.
 

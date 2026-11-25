@@ -164,26 +164,21 @@ export function validateProviders(
 }
 
 export interface RenderedProviders {
-  customProviders: Record<string, unknown>[];
+  /** What reaches .env: the credentials, by variable name. Never config.yaml. */
   env: Record<string, string>;
-  /** config.yaml `model_aliases`: label -> the real model. */
-  modelAliases: Record<string, { model: string; provider: string; base_url: string }>;
+  /** The provider and model Agent Flare selects when the user has none. */
   candidates: ProviderCandidate[];
   warnings: string[];
 }
 
 /**
- * `user` tags api_token requests with the caller's identity (cf-aig-metadata), so AI Gateway
- * analytics and logs stay per user even though the credential is shared.
- * `keys` holds the resolved credential per provider name (see credentials.ts). They reach .env only.
+ * Turns a template's providers into the credentials and the selection candidates. Nothing is written
+ * into config.yaml from here: that file is the account's own document (see userconfig.ts).
+ * `keys` holds the resolved credential per provider name (see credentials.ts).
  */
-export function renderProviders(
-  entries: GatewayProviderEntry[], keys: Record<string, string>, user: string, tiers: ModelTiers = {},
-): RenderedProviders {
-  const customProviders: Record<string, unknown>[] = [];
+export function renderProviders(entries: GatewayProviderEntry[], keys: Record<string, string>): RenderedProviders {
   const env: Record<string, string> = {};
   const warnings: string[] = [];
-  const modelAliases: RenderedProviders["modelAliases"] = {};
   const candidates: ProviderCandidate[] = [];
   for (const e of entries) {
     if (e.mode === "api_token") {
@@ -195,29 +190,7 @@ export function renderProviders(
     } else if (keys[e.name]) {
       env[e.key_env] = keys[e.name];
     }
-    const headers: Record<string, string> = { ...e.extra_headers };
-    if (e.mode === "api_token" && e.gateway_id) {
-      headers["cf-aig-gateway-id"] = e.gateway_id;
-      headers["cf-aig-metadata"] = JSON.stringify({ user });
-    }
-    const models: Record<string, ProviderModelInfo> = {};
-    for (const [id, info] of Object.entries(e.models)) {
-      const tier = tiers[id];
-      const label = (tier && TIER_MARKS[tier]) || info.name ? modelLabel(id, tier, info) : id;
-      models[label in modelAliases ? id : label] = info;
-      if (label !== id && !(label in modelAliases)) modelAliases[label] = { model: id, provider: e.name, base_url: e.base_url };
-    }
-    customProviders.push({
-      name: e.name,
-      base_url: e.base_url,
-      key_env: e.key_env,
-      ...(e.model ? { model: e.model } : {}),
-      api_mode: e.api_mode ?? "chat_completions",
-      discover_models: e.discover_models === true,
-      ...(Object.keys(headers).length ? { extra_headers: headers } : {}),
-      models,
-    });
     candidates.push({ provider: e.name, model: e.model ?? Object.keys(e.models)[0], key_env: e.key_env });
   }
-  return { customProviders, env, modelAliases, candidates, warnings };
+  return { env, candidates, warnings };
 }

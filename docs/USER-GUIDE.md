@@ -68,6 +68,12 @@ Just after a restart, you may see "Setup is taking longer than usual". Give it a
 
 Only so many agents can be awake at once, and that many already are. Your work is safe. Try again in a little while.
 
+## A terminal where the agent works
+
+A terminal tab opens beside Hermes, not where your agent runs its commands and keeps its files. To get a shell there, type `sandbox` in a terminal tab. The prompt changes to `sandbox:/workspace#`. Type `exit` to come back.
+
+If you leave that shell alone for 10 minutes with nothing else running, the sandbox saves your files and stops, and the tab says so. Run `sandbox` again to carry on.
+
 ## Picking a model
 
 Tap the small arrow in the box where you type. You'll see a list of models. Tap one to use it.

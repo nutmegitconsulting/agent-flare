@@ -33,9 +33,20 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # build-essential is required by install.sh's node-pty native build.
 # squashfs-tools: createBackup/restoreBackup run mksquashfs/unsquashfs in-container.
 # openssh-client: for an agent's outbound git over SSH. There's no SSH server in this image.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# AF_APT_MIRROR (optional): another Ubuntu mirror for this one step, for when archive.ubuntu.com can't be
+# reached from the build host, e.g. http://mirrors.edge.kernel.org/ubuntu. apt checks Ubuntu's signatures
+# whichever server answers, and the image keeps the stock sources.list.
+# There is no browser in this image: with a dev sandbox bound, the browser is in the sandbox image, next to
+# the terminal's files (cf-dev-sandbox/Dockerfile).
+ARG AF_APT_MIRROR=
+RUN cp /etc/apt/sources.list /tmp/sources.list.stock \
+    && if [ -n "$AF_APT_MIRROR" ]; then \
+         sed -i -E "s#http://(archive|security)\.ubuntu\.com/ubuntu/?#${AF_APT_MIRROR%/}/#g" /etc/apt/sources.list; \
+       fi \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
          curl ca-certificates git squashfs-tools build-essential openssh-client \
+    && mv /tmp/sources.list.stock /etc/apt/sources.list \
     && rm -rf /var/lib/apt/lists/*
 
 # --- hermes user (install + runtime data owner) ---
@@ -62,7 +73,7 @@ WORKDIR /home/hermes
 ENV HOME=/home/hermes
 # Tested Hermes commit. The webapp and its auth internals move fast, so bump this
 # deliberately and re-run tests/container/run.sh.
-ARG HERMES_COMMIT=ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df
+ARG HERMES_COMMIT=31ce88f86e6cf4a66ef6aa315e4657a31bcf9915
 RUN --mount=type=secret,id=build_ca,uid=1000,required=false \
     . /usr/local/lib/af-build-ca-env \
     && UV_PYTHON_INSTALL_DIR=/opt/uv/python \
@@ -112,13 +123,24 @@ RUN chown root:root /opt/hermes-install /opt/hermes-install/hermes-agent /opt/uv
 # --- Agent Flare additions ---
 # Bundled plugin location: discovered like Hermes' own dashboard auth providers.
 COPY --chown=root:root container/plugins/cloudflare_access /opt/hermes-install/hermes-agent/plugins/dashboard_auth/cloudflare_access
+# Baked dev-sandbox terminal backend (route A). Per-user installs also work; baking makes it
+# present for every user at the next image build. It stays inert until CF_DEV_SANDBOX_URL is set.
+COPY --chown=root:root container/plugins/cloudflare_sandbox /opt/hermes-install/hermes-agent/plugins/cloudflare_sandbox
 COPY --chown=root:root container/af_state.py /usr/local/lib/af_state.py
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
 COPY --chown=root:root container/desktop-plugins/agent-flare/plugin.js /usr/local/lib/af-desktop-plugin.js
 # af-python: Hermes' own venv, which provides ruamel.yaml for af_state.py.
+# sandbox: typed in Hermes' terminal pane, which is always a shell beside Hermes, it opens a shell in the
+# user's dev sandbox (the plugin's shell_client.py, which needs the venv's websockets).
+# .install_method: the marker Hermes' own image carries. With it Hermes neither checks for nor offers an
+# update: one applied in a container is gone at the next stop, and the version is this image's to set.
 RUN chmod +x /usr/local/bin/start-hermes.sh \
+    && printf 'docker\n' > /opt/hermes-install/hermes-agent/.install_method \
     && printf '#!/bin/sh\nexec %s "$@"\n' "$(ls -d /opt/hermes-install/installs/*/environments/*/venv/bin/python | head -1)" > /usr/local/bin/af-python \
     && chmod +x /usr/local/bin/af-python \
+    && printf '#!/bin/sh\nexec /usr/local/bin/af-python /opt/hermes-install/hermes-agent/plugins/cloudflare_sandbox/shell_client.py "$@"\n' > /usr/local/bin/sandbox \
+    && chmod +x /usr/local/bin/sandbox \
+    && af-python -c "import websockets.sync.client" \
     && af-python -c "import ruamel.yaml" \
     && HERMES_HOME=/opt/hermes-install hermes --version
 

@@ -50,9 +50,14 @@ PROVIDER='"custom_providers":[{"name":"team-gateway","base_url":"http://127.0.0.
   "$$$⠀CF⠀GLM⠀5⠀(64k)":{"model":"@cf/zai-org/glm-5","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"},
   "*$$$⠀Claude⠀5⠀(64k)":{"model":"anthropic/claude-5","provider":"team-gateway","base_url":"http://127.0.0.1:9555/v1"}}'
 CANDIDATES='"provider_candidates":[{"provider":"team-gateway","model":"m1","key_env":"TEAM_KEY"}]'
+# The account's config.yaml travels as one string: the provider block above, written as JSON (valid YAML).
+DOC=$(printf '{%s}' "$PROVIDER" | "$PYHOST" -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
 echo "== unit tests"
 docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_af_state.py 2>&1 | tail -4
+docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_sandbox_fs.py 2>&1 | tail -4
+docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_sandbox_shell.py 2>&1 | tail -4
+docker run --rm --entrypoint sandbox "$IMAGE" --help | grep -q "Opens a shell in your sandbox" && ok "the sandbox command is on the path" || { echo "FAIL - no sandbox command"; exit 1; }
 
 echo "== webapp"
 dx() { docker exec -i "$NAME" bash -c "$1"; }
@@ -65,7 +70,7 @@ dx "curl -s -m 2 http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && die "port
 
 docker exec -d "$NAME" "$PY" /t/stub_provider.py
 report=$(start_hydrated <<J
-{"config_managed":{$PLATFORM,$PROVIDER},"env":{"TEAM_KEY":"team-secret-value"},$CANDIDATES,
+{"config_platform":{$PLATFORM},"config_yaml":$DOC,"env":{"TEAM_KEY":"team-secret-value"},$CANDIDATES,
  "session_token":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"}
 J
 )
@@ -151,7 +156,7 @@ echo "== first launch with the provider's secret missing"
 new_container
 docker exec -d "$NAME" "$PY" /t/stub_provider.py
 report=$(start_hydrated <<J
-{"config_managed":{$PLATFORM},$CANDIDATES,"session_token":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"}
+{"config_platform":{$PLATFORM},$CANDIDATES,"session_token":"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"}
 J
 )
 ok "the container still starts"

@@ -88,7 +88,6 @@ export async function configFingerprint(effective: Effective, keys: unknown = nu
     tiers: shown,
     role: effective.role,
     providers: effective.providers,
-    managed: t?.configManaged ?? null,
     defaults: t?.configDefaults ?? null,
     env: Object.keys(t?.env ?? {}).sort(),
     files: (t?.files ?? []).map((f) => f.path).sort(),

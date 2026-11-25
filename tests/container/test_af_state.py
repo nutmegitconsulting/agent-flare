@@ -1,6 +1,7 @@
 """Run with the image's Python: see tests/container/run.sh."""
 import base64
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -9,7 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, "/usr/local/lib")
+sys.path.insert(0, os.environ.get("AF_STATE_LIB", "/usr/local/lib"))  # the repo copy in CI
 import af_state  # noqa: E402
 
 
@@ -131,6 +132,22 @@ class UserDataStays(Hydrated):
         af_state.stage(self.home, self.stage)
         names = {str(p.relative_to(self.stage)) for p in self.stage.rglob("*") if p.is_file()}
         self.assertEqual(names, {*keep, "config.yaml", af_state.MANIFEST})
+
+    def test_each_profile_drops_the_same_rebuildable_files_as_the_home(self):
+        keep = ["profiles/r/config.yaml", "profiles/r/sessions/a.json", "profiles/r/skills/x/cache/data.json",
+                "profiles/r/workspace/app/logs/out.txt", "workspace/models_dev_cache.json",
+                "profiles/notes.lock"]
+        drop = ["profiles/r/cache/scratch/big.bin", "profiles/r/logs/agent.log", "profiles/r/tmp/x",
+                "profiles/r/models_dev_cache.json", "profiles/r/models_dev_cache.etag", "profiles/r/gateway.pid",
+                "profiles/r/auth.lock", "models_dev_cache.json", "models_dev_cache.etag", "cache/web/a.md"]
+        for rel in keep + drop:
+            path = self.home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x")
+        af_state.stage(self.home, self.stage)
+        names = {str(p.relative_to(self.stage)) for p in self.stage.rglob("*") if p.is_file()}
+        self.assertEqual(names, {*keep, "config.yaml", af_state.MANIFEST})
+        self.assertFalse((self.stage / "profiles/r/cache").exists())
 
     def test_a_broken_project_database_does_not_block_snapshots_or_restores(self):
         (self.home / "workspace").mkdir()
@@ -261,26 +278,108 @@ class Apply(Base):
 
     def test_a_broken_config_is_set_aside_not_fatal(self):
         (self.home / "config.yaml").write_text("a: [unclosed\n  b: :\n")
-        report = self.bundle(config_managed={"webapp": {"port": 9120}})
+        report = self.bundle(config_platform={"webapp": {"port": 9120}})
         self.assertTrue(report["config_recovered"])
         self.assertEqual(self.config()["webapp"]["port"], 9120)
         self.assertEqual(len(list(self.home.glob("config.yaml.corrupt.*"))), 1)
 
-    def test_managed_keys_win_every_boot_and_keep_user_keys_and_comments(self):
-        (self.home / "config.yaml").write_text("# my note\nmodel: mine\nwebapp:\n  port: 1\n  extra: keep\n")
-        self.bundle(config_managed={"webapp": {"port": 9120, "enabled": True}})
+    def test_the_account_document_replaces_the_file_and_platform_keys_win(self):
+        (self.home / "config.yaml").write_text("# old restored copy\nmodel: stale\nwebapp:\n  port: 1\n")
+        self.bundle(config_yaml="# admin note\nmodel: chosen\nwebapp:\n  port: 1\n  extra: keep\n",
+                    config_platform={"webapp": {"port": 9120, "enabled": True}})
         text = (self.home / "config.yaml").read_text()
-        self.assertIn("# my note", text)
+        self.assertIn("# admin note", text)
+        self.assertNotIn("stale", text)
         config = self.config()
-        self.assertEqual(config["model"], "mine")
+        self.assertEqual(config["model"], "chosen")
         self.assertEqual(dict(config["webapp"]), {"port": 9120, "extra": "keep", "enabled": True})
 
-    def test_named_lists_merge_by_name(self):
-        (self.home / "config.yaml").write_text(
-            "custom_providers:\n- name: mine\n  base_url: u\n- name: gw\n  base_url: old\n")
-        self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "new"}]})
-        providers = {p["name"]: p["base_url"] for p in self.config()["custom_providers"]}
-        self.assertEqual(providers, {"mine": "u", "gw": "new"})
+    # Hermes reads config.yaml with ruamel's strict safe parser (hermes_yaml), not the round-trip one.
+    def strict_load(self):
+        from ruamel.yaml import YAML
+        return YAML(typ="safe").load((self.home / "config.yaml").read_text())
+
+    PROXIES = ["10.0.0.0/8", "127.0.0.1", "::1", "fc00::/7"]
+
+    def test_a_json_document_comes_out_readable_by_hermes(self):
+        doc = json.dumps({"model": {"default": "m1"}, "custom_providers": [{"name": "p", "base_url": "http://x/v1"}]})
+        self.bundle(config_yaml=doc, config_platform={"webapp": {"port": 9120, "public_url": "https://a.example.com"},
+                                                      "dashboard": {"trusted_proxies": self.PROXIES}})
+        config = self.strict_load()
+        self.assertEqual(config["dashboard"]["trusted_proxies"], self.PROXIES)
+        self.assertEqual(config["model"]["default"], "m1")
+        self.assertEqual(config["custom_providers"][0]["name"], "p")
+        self.assertNotIn("{", (self.home / "config.yaml").read_text())
+
+    def test_a_block_document_keeps_its_layout_and_comments(self):
+        doc = "# my notes\nmodel:\n  default: m1  # the one I use\nterminal:\n  backend: local\n"
+        self.bundle(config_yaml=doc, config_platform={"dashboard": {"trusted_proxies": self.PROXIES}})
+        text = (self.home / "config.yaml").read_text()
+        self.assertTrue(text.startswith(doc), text)
+        self.assertEqual(self.strict_load()["dashboard"]["trusted_proxies"], self.PROXIES)
+
+    def test_a_long_value_stays_on_its_keys_line(self):
+        url = "https://gateway.ai.cloudflare.com/v1/0123456789abcdef0123456789abcdef/a-team-gateway/compat"
+        doc = f"custom_providers:\n- name: gw\n  base_url: {url}\n"
+        self.bundle(config_yaml=doc)
+        self.assertIn(f"  base_url: {url}\n", (self.home / "config.yaml").read_text())
+
+    def test_a_bound_dev_sandbox_is_on_from_the_first_boot(self):
+        self.bundle(config_yaml="terminal:\n  cwd: /w\n", dev_sandbox=True)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], ["cloudflare-sandbox"])
+        self.assertEqual(config["terminal"], {"cwd": "/w", "backend": "cloudflare_sandbox"})
+        self.bundle(dev_sandbox=True)
+        self.assertEqual(self.strict_load()["plugins"]["enabled"], ["cloudflare-sandbox"])
+
+    def test_a_dev_sandbox_keeps_other_plugins_and_yields_to_the_users_choices(self):
+        self.bundle(config_yaml="plugins:\n  enabled:\n  - mine\nterminal:\n  backend: docker\n", dev_sandbox=True)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], ["mine", "cloudflare-sandbox"])
+        self.assertEqual(config["terminal"]["backend"], "docker")
+        self.bundle(config_yaml="plugins:\n  disabled:\n  - cloudflare-sandbox\n", dev_sandbox=True)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], [])
+        self.assertNotIn("backend", config.get("terminal") or {})
+
+    def test_without_the_binding_the_dev_sandbox_is_taken_out_again(self):
+        doc = "plugins:\n  enabled:\n  - mine\n  - cloudflare-sandbox\nterminal:\n  cwd: /w\n  backend: cloudflare_sandbox\n"
+        self.bundle(config_yaml=doc)
+        config = self.strict_load()
+        self.assertEqual(config["plugins"]["enabled"], ["mine"])
+        self.assertEqual(config["terminal"], {"cwd": "/w"})
+        self.bundle(config_yaml="terminal:\n  backend: docker\n")
+        self.assertEqual(self.strict_load()["terminal"]["backend"], "docker")
+
+    def test_a_dev_sandbox_reaches_every_profile_and_leaves_the_rest_of_its_file_alone(self):
+        doc = "# mine\nterminal:\n  cwd: /w\ncustom_providers:\n  - name: gw\n    base_url: https://example.com/a/very/long/path/that/goes/past/eighty/columns/of/text/v1\n"
+        for name in ("researcher", "tester"):
+            (self.home / "profiles" / name).mkdir(parents=True)
+            (self.home / "profiles" / name / "config.yaml").write_text(doc)
+        (self.home / "profiles" / "broken").mkdir()
+        (self.home / "profiles" / "broken" / "config.yaml").write_text("a: [unclosed\n")
+        report = self.bundle(dev_sandbox=True)
+        self.assertEqual(report["profiles_dev_sandbox"], ["researcher", "tester"])
+        text = (self.home / "profiles/researcher/config.yaml").read_text()
+        self.assertEqual(text, doc.replace("  cwd: /w\n", "  cwd: /w\n  backend: cloudflare_sandbox\n") + "plugins:\n  enabled:\n    - cloudflare-sandbox\n")
+        self.assertEqual((self.home / "profiles/broken/config.yaml").read_text(), "a: [unclosed\n")
+        self.assertEqual(self.bundle(dev_sandbox=True)["profiles_dev_sandbox"], [])
+        self.assertEqual(self.bundle()["profiles_dev_sandbox"], ["researcher", "tester"])
+        self.assertEqual((self.home / "profiles/researcher/config.yaml").read_text(), doc + "plugins:\n  enabled: []\n")
+
+    def test_a_document_that_is_not_a_mapping_fails_the_boot(self):
+        with self.assertRaises(ValueError):
+            self.bundle(config_yaml="- a\n- b\n")
+
+    def test_a_provider_removed_from_the_document_is_gone_on_the_next_boot(self):
+        self.bundle(config_yaml="custom_providers:\n- name: gw\n  base_url: b\n- name: mine\n  base_url: u\n")
+        self.bundle(config_yaml="custom_providers:\n- name: mine\n  base_url: u\n")
+        self.assertEqual([p["name"] for p in self.config()["custom_providers"]], ["mine"])
+
+    def test_a_restored_file_is_replaced_by_the_document_each_boot(self):
+        (self.home / "config.yaml").write_text("custom_providers:\n- name: left-over\n  base_url: old\n")
+        self.bundle(config_yaml="model: m\n")
+        self.assertNotIn("custom_providers", self.config())
 
     def test_env_defaults_yield_to_the_user_and_managed_env_does_not(self):
         (self.home / ".env").write_text("USER_KEY=mine\nMANAGED=old\n")
@@ -352,6 +451,21 @@ class Apply(Base):
         self.bundle(provider_candidates=[self.GW, self.BYO])
         self.assertNotIn("model", self.config())
 
+    def test_with_no_role_offering_a_provider_the_documents_model_is_left_alone(self):
+        self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
+        self.assertEqual(self.config()["model"]["provider"], "gw")
+        # What a backup brings into a deployment that has no roles: our earlier selection, and no candidates.
+        self.bundle()
+        self.assertEqual(self.config()["model"]["provider"], "gw")
+
+    def test_a_restored_layout_survives_a_boot_unchanged(self):
+        doc = ("custom_providers:\n  - name: gw\n    base_url: https://example.com/v1\n    models:\n      m1:\n        context_length: 64000\n"
+               "dashboard:\n  trusted_proxies:\n    - 127.0.0.1\n")
+        (self.home / "config.yaml").write_text(doc)
+        (self.home / ".agent-flare-template.json").write_text("{}")
+        self.bundle(config_yaml=doc, config_platform={"dashboard": {"trusted_proxies": ["127.0.0.1"]}})
+        self.assertEqual((self.home / "config.yaml").read_text(), doc)
+
     def test_a_role_change_moves_our_default_but_not_a_users_pick(self):
         self.bundle(env={"GW_KEY": "t"}, provider_candidates=[self.GW])
         moved = {**self.GW, "model": "m3"}
@@ -394,15 +508,9 @@ class Apply(Base):
         self.assertEqual(self.bundle(ui_defaults={mode: "dark"})["ui_defaults"], [])
         self.assertEqual(store.read_text(), "not json")
 
-    def test_a_provider_the_template_dropped_leaves_and_a_users_own_stays(self):
-        (self.home / "config.yaml").write_text("custom_providers:\n- name: mine\n  base_url: u\n")
-        self.bundle(config_managed={"custom_providers": [{"name": "gw", "base_url": "b"}]})
-        self.bundle(config_managed={})
-        self.assertEqual([p["name"] for p in self.config()["custom_providers"]], ["mine"])
-
     def test_provider_credentials_stay_out_of_config_and_the_stage(self):
         self.bundle(env={"GW_KEY": "s3cret-value"}, provider_candidates=[self.GW],
-                    config_managed={"custom_providers": [{"name": "gw", "base_url": "b", "key_env": "GW_KEY"}]})
+                    config_yaml="custom_providers:\n- name: gw\n  base_url: b\n  key_env: GW_KEY\n")
         self.assertNotIn("s3cret-value", (self.home / "config.yaml").read_text())
 
     def test_paths_cannot_escape_home(self):

@@ -17,7 +17,8 @@ import { Sandbox } from "@cloudflare/sandbox";
 import type { AccessIdentity } from "./access";
 import type { Env } from "./env";
 import { AF_STATE, createSnapshot, HERMES_HOME, restoreNewest, type RestoreOutcome } from "./persistence";
-import { keyStatuses, resolveProviderKey } from "./credentials";
+import { accountConfigFor, checkConfigText, saveUserConfig, syncAccountConfig } from "./userconfig";
+import { bootKeyStatuses, resolveEnv, resolveProviderKey } from "./credentials";
 import { configFingerprint, resolveEffective } from "./effective";
 import { capMs, leaseView, nextLease, type LeaseState, type LeaseView } from "./lease";
 import { renderProviders } from "./providers";
@@ -25,6 +26,7 @@ import { pruneSnapshots } from "./prune";
 import { deriveUserSecret, getSealed, prefillKey, seal, sealedFilesKey, unseal } from "./secrets";
 import { underAwakeCap } from "./settings";
 import { fetchAccessGroups, loadAssignments, loadTiers, templateSecrets } from "./templates";
+import { DEV_SANDBOX_INTERNAL_HOST } from "./gateway";
 
 /**
  * Hermes' default webapp port, inside the container only. Browsers reach it on 443 at Cloudflare; TLS
@@ -37,6 +39,8 @@ const IDENTITY_KEY = "identity";
 const SEALED_COPY_KEY = "sealed-files";
 const LAST_RESTORE_KEY = "last-restore";
 const CONFIG_STATUS_KEY = "config-status";
+/** Set while R2's config.yaml is behind the container's: the last snapshot couldn't copy it over. */
+const CONFIG_UNSYNCED_KEY = "config-unsynced";
 const LEASE_KEY = "lease";
 /** Set when a container stopped so that nothing but a person starts it again. */
 const PARKED_KEY = "parked";
@@ -201,6 +205,32 @@ export class AgentSandbox extends Sandbox<Env> {
     await this.ctx.storage.put(IDENTITY_KEY, identity);
     await this.env.BACKUP_BUCKET.put(`${ACTIVE_PREFIX}${identity.sub}`, identity.email);
 
+    // Route A: let the container's dev-sandbox plugin reach the sidecar with this
+    // user's verified identity stamped in-process. Intercepts last until the
+    // container stops, and hydrate reruns on cold start and DO restart, so
+    // re-registering here covers both. Fail-soft: a failed registration only
+    // means the plugin's URL won't resolve until the next hydrate.
+    if (this.env.DEV_SANDBOX) {
+      const surface = this.ctx as unknown as {
+        container?: { interceptOutboundHttp?: (addr: string, binding: Fetcher) => Promise<void> };
+        exports?: Record<string, (options: { props: { sub: string } }) => Fetcher>;
+      };
+      if (!surface.container?.interceptOutboundHttp) {
+        console.warn(`[dev-sandbox:${identity.sub}] no container intercept surface on this ctx`);
+      } else if (!surface.exports?.SandboxGateway) {
+        console.warn(`[dev-sandbox:${identity.sub}] SandboxGateway is not exported by this Worker`);
+      } else {
+        try {
+          await surface.container.interceptOutboundHttp(
+            DEV_SANDBOX_INTERNAL_HOST,
+            surface.exports.SandboxGateway({ props: { sub: identity.sub } }),
+          );
+        } catch (err) {
+          console.warn(`[dev-sandbox:${identity.sub}] intercept not registered: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+
     // Durable Objects can be evicted while their container keeps running.
     if (await this.hasReadyFile()) {
       await this.waitForWebapp(assertCurrent);
@@ -241,11 +271,12 @@ export class AgentSandbox extends Sandbox<Env> {
     const keys = Object.fromEntries(await Promise.all(effective.providers.map(async (p) =>
       [p.name, await resolveProviderKey(env, identity.email, templateName, p)] as const)));
     const tiers = await loadTiers(env.BACKUP_BUCKET);
-    const providers = renderProviders(effective.providers, keys, identity.email, tiers);
+    const providers = renderProviders(effective.providers, keys);
     warnings.push(...providers.warnings);
     const providerCount = effective.providers.length;
     const fingerprint = await configFingerprint(
-      effective, await keyStatuses(env, identity.email, templateName, effective.providers), tiers);
+      effective, await bootKeyStatuses(env, identity.email, templateName, effective.providers), tiers);
+    const namedEnv = await resolveEnv(env, identity.email);
     await this.ctx.storage.put(IDENTITY_KEY, { ...identity, groups });
 
     // The Durable Object's copy first: KV can serve a value up to a minute stale, which would undo a
@@ -259,31 +290,34 @@ export class AgentSandbox extends Sandbox<Env> {
       env.CREDENTIALS_KV, env.MASTER_KEY, prefillKey(identity.email));
 
     // Platform keys come last so a template can never move the port or the public URL.
+    // Platform-owned .env values likewise win over template/provider values and carry no secrets.
+    const platformEnv = this.env.DEV_SANDBOX ? { CF_DEV_SANDBOX_URL: `http://${DEV_SANDBOX_INTERNAL_HOST}` } : {};
     const platformConfig = {
       webapp: { enabled: true, host: "0.0.0.0", port: WEBAPP_PORT, public_url: identity.publicUrl },
       // Only the Worker can reach this listener, so whatever address it arrives from is the Worker's.
       dashboard: { trusted_proxies: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.1", "::1", "fc00::/7"] },
     };
+    const configYaml = await this.accountConfig(identity, templateName, warnings);
     const bundle = {
       sealed: sealed ?? {},
       template: template ? { name: template.name, files: template.files } : null,
       // Inside the home, so that what an agent makes is what gets snapshotted.
       platform_defaults: { terminal: { cwd: `${HERMES_HOME}/workspace` } },
       config_defaults: template?.configDefaults ?? {},
+      // The account's whole config.yaml, from R2. Null means no document anywhere, so the container starts from defaults.
+      config_yaml: configYaml,
+      // Forced over the document on every boot. Nothing else in config.yaml is managed.
+      config_platform: platformConfig,
+      // With the sidecar bound, the container turns its plugin on and points the terminal at it, unless the
+      // document says otherwise. Without it, the container takes both out again.
+      dev_sandbox: Boolean(this.env.DEV_SANDBOX),
       // The container picks from these, because only it can see which credentials are in .env.
       provider_candidates: providers.candidates,
-      config_managed: {
-        ...template?.configManaged,
-        ...(providers.customProviders.length ? { custom_providers: providers.customProviders } : {}),
-        ...(Object.keys(providers.modelAliases).length
-          ? { model_aliases: { ...(template?.configManaged.model_aliases as object | undefined), ...providers.modelAliases } }
-          : {}),
-        ...platformConfig,
-      },
       // A prefill is the user's own value: it applies only while they haven't set one. Template and
       // provider values are managed and apply on every boot.
       env_defaults: prefill ?? {},
-      env: { ...template?.env, ...providers.env },
+      // Variables set by name for everyone, then the role's, then this user's own.
+      env: { ...namedEnv.base, ...template?.env, ...providers.env, ...namedEnv.user, ...platformEnv },
       ui_defaults: UI_DEFAULTS,
       session_token: await deriveUserSecret(env.MASTER_KEY, "webapp-browser", identity.sub),
     };
@@ -309,6 +343,73 @@ export class AgentSandbox extends Sandbox<Env> {
     await this.ctx.storage.put(CONFIG_STATUS_KEY, { template: templateName, inference, warnings, fingerprint, at: Date.now() });
     if (warnings.length) console.warn(`[config:${identity.sub}] ${warnings.join("; ")}`);
     console.log(`[config:${identity.sub}] ${result.stdout}`);
+  }
+
+  /**
+   * The account's config.yaml: R2's document, or on first use the file a restored snapshot brought back.
+   * Null leaves the container's own file in place. See accountConfigFor.
+   */
+  private async accountConfig(identity: StoredIdentity, templateName: string | null, warnings: string[]): Promise<string | null> {
+    const unsynced = (await this.ctx.storage.get<boolean>(CONFIG_UNSYNCED_KEY)) === true;
+    const { text, warning } = await accountConfigFor(
+      this.env.BACKUP_BUCKET, identity.sub, () => this.containerConfig(), templateName, unsynced);
+    if (warning) warnings.push(warning);
+    else if (unsynced) await this.ctx.storage.delete(CONFIG_UNSYNCED_KEY);
+    return text;
+  }
+
+  /** The container's config.yaml as it is now, or null when there isn't one. */
+  private async containerConfig(): Promise<string | null> {
+    const result = await this.exec(`cat ${HERMES_HOME}/config.yaml`);
+    return result.exitCode === 0 ? result.stdout : null;
+  }
+
+  /**
+   * Hermes changes its own config.yaml (a /model switch, a dashboard save), so a snapshot copies the container's
+   * file back to R2, and that file wins. See syncAccountConfig for the one case that's held back.
+   */
+  private async syncConfigFromContainer(sub: string): Promise<void> {
+    let failure: string | null = null;
+    try {
+      const result = await syncAccountConfig(this.env.BACKUP_BUCKET, sub, await this.containerConfig());
+      if (typeof result === "object") failure = result.refused;
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    // The archive still carries the file. Remembering that R2 missed it lets the next boot use the archive's
+    // copy, where R2's older one would otherwise be written over it.
+    if (failure === null) return void (await this.ctx.storage.delete(CONFIG_UNSYNCED_KEY));
+    await this.ctx.storage.put(CONFIG_UNSYNCED_KEY, true);
+    console.warn(`[config-sync:${sub}] not saved to R2: ${failure}`);
+  }
+
+  /**
+   * An admin's save. The document is stored and a running container restarts onto it. The snapshot comes first,
+   * so Hermes' own changes reach R2 before the admin's document replaces them.
+   */
+  async applyConfigEdit(text: string): Promise<{ status: "saved" | "restarted" } | { error: string }> {
+    return this.serial(async () => {
+      const identity = await this.ctx.storage.get<StoredIdentity>(IDENTITY_KEY);
+      if (!identity) return { error: "no user bound to this sandbox" };
+      const check = checkConfigText(text);
+      if (!check.ok) return { error: check.error };
+      const running = await this.isRunning();
+      if (running) {
+        try {
+          await this.takeSnapshot();
+        } catch (err) {
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+      await saveUserConfig(this.env.BACKUP_BUCKET, identity.sub, text);
+      // An admin's document is the newest there is, whatever the last snapshot managed.
+      await this.ctx.storage.delete(CONFIG_UNSYNCED_KEY);
+      if (!running) return { status: "saved" as const };
+      await this.clearActiveMarker();
+      this.stopping = true;
+      await this.stop();
+      return { status: "restarted" as const };
+    });
   }
 
   private async waitForWebapp(assertCurrent: () => void): Promise<void> {
@@ -346,6 +447,9 @@ export class AgentSandbox extends Sandbox<Env> {
     if (this.stopping) return { skipped: "container stopping" };
     if (!(await this.isRunning())) return { skipped: "container not running" };
     if (!(await this.hasReadyFile())) return { skipped: "container not hydrated" };
+
+    // Before the archive, so that what Hermes changed since the last snapshot is in R2 with it.
+    await this.syncConfigFromContainer(identity.sub).catch((err) => console.warn(`[config-sync:${identity.sub}] ${err}`));
 
     // A failure sealing secrets must not also cost the user their state backup.
     let sealError: unknown = null;

@@ -12,7 +12,10 @@ import { chooseTheme, contrastWarnings, customCookie, CUSTOM_FIELDS, DEFAULT_THE
  */
 import type { Context, Hono } from "hono";
 import type { AccessIdentity } from "./access";
-import { clearProviderKey, keyStatuses, setProviderKey, type KeyScope, type KeyStatus } from "./credentials";
+import {
+  bootKeyStatuses, clearEnvValue, clearProviderKey, ENV_NAME_RE, envStatuses, keyStatuses, setEnvValue, setProviderKey,
+  type EnvScope, type KeyScope, type KeyStatus,
+} from "./credentials";
 import { configFingerprint, overrideKey, resolveEffective, type Effective, type UserOverride } from "./effective";
 import type { Env } from "./env";
 import { escapeHtml as e } from "./pages";
@@ -21,6 +24,7 @@ import { awakeCount, loadSettings, saveSettings } from "./settings";
 import { parseLeaseHours } from "./lease";
 import { TIER_MARKS, validateProviders, type GatewayProviderEntry, type ModelTier, type ModelTiers } from "./providers";
 import type { AgentSandbox } from "./sandbox";
+import { checkConfigText, loadBaseConfig, loadRoleConfig, loadUserConfig, saveBaseConfig, saveRoleConfig } from "./userconfig";
 import { loadAssignments, loadTiers, templateSecrets, TIERS_KEY, type Assignments, type TemplateDefinition } from "./templates";
 
 type Vars = { identity: AccessIdentity; jwt: string };
@@ -125,12 +129,38 @@ const problem = (message: string, back: string) =>
   page("That didn't save", `<p class="warn">${e(message)}</p><p>Nothing was changed. <a href="${e(back)}">Back</a></p>`, 400);
 
 const seeOther = (location: string) => new Response(null, { status: 303, headers: { location } });
+
+/** The config.yaml editor, shared by a user's page and a role's page. The text is the whole file. */
+const configForm = (action: string, text: string | null) => `
+  <form method="post" action="${e(action)}">
+    <label for="cfg">config.yaml</label>
+    <textarea id="cfg" name="config" rows="32" spellcheck="false" style="font-family:monospace">${e(text ?? "")}</textarea>
+    <p class="muted">Put a secret in <code>.env</code> and name it with <code>key_env</code>; a literal key is refused. Hermes sets <code>_config_version</code> itself: leave it in place. The webapp and dashboard settings are set by the platform and overwrite this file's values on every start.</p>
+    <button>Save</button>
+  </form>`;
 const when = (iso: string | null | undefined) => (iso ? e(iso.replace("T", " ").slice(0, 16)) + " UTC" : "not recorded");
 
 function keyText(status: KeyStatus | undefined): string {
   if (!status || status.source === "none") return `<span class="warn">Not set</span>`;
   if (status.source === "worker-secret") return "Set, from the Worker secret";
   return `Set, for this ${status.source}. Changed ${when(status.changedAt)}`;
+}
+
+/** Variables set by name in one scope, each with a remove button, and a form to set one. Never a value. */
+function envSection(action: string, set: Record<string, string | null>, inherited: Record<string, string | null> = {}): string {
+  const rows = Object.entries(set).map(([name, changedAt]) => `<tr><td><code>${e(name)}</code></td><td>Set. Changed ${when(changedAt)}</td>
+    <td><form method="post" action="${action}" class="inline"><input type="hidden" name="name" value="${e(name)}">
+      <button name="action" value="clear">Remove</button></form></td></tr>`).join("");
+  const fromBase = Object.keys(inherited).filter((name) => !(name in set));
+  return `
+    <div class="scroll"><table><tr><th>Variable</th><th>Status</th><th></th></tr>
+      ${rows || `<tr><td colspan="3" class="muted">None set here.</td></tr>`}</table></div>
+    ${fromBase.length ? `<p class="muted">Set for everyone, and used here unless replaced: ${fromBase.map((n) => `<code>${e(n)}</code>`).join(", ")}.</p>` : ""}
+    <form method="post" action="${action}">
+      <label for="env-name">Variable name in .env</label><input id="env-name" type="text" name="name" autocomplete="off" placeholder="TEAM_GATEWAY_API_KEY">
+      <label for="env-value">Value</label><input id="env-value" type="password" name="value" autocomplete="off">
+      <button name="action" value="set">Save variable</button></form>
+    <p class="muted">A value is written to <code>.env</code> at the next boot and can't be read back here. Saving a name that is already set replaces it.</p>`;
 }
 
 function roleOptions(roles: string[], selected: string | null | undefined, none: string): string {
@@ -172,7 +202,8 @@ async function readUser(c: Ctx, sandboxFor: SandboxFor, sub: string): Promise<Us
   const keys = await keyStatuses(c.env, email, effective.role, effective.providers);
   const tiers = await loadTiers(c.env.BACKUP_BUCKET);
   const applied = (details.config as { fingerprint?: string } | null)?.fingerprint;
-  return { sub, email, details, backups, effective, keys, tiers, pending: !!applied && applied !== await configFingerprint(effective, keys, tiers) };
+  const bootKeys = await bootKeyStatuses(c.env, email, effective.role, effective.providers);
+  return { sub, email, details, backups, effective, keys, tiers, pending: !!applied && applied !== await configFingerprint(effective, bootKeys, tiers) };
 }
 
 const minutesFrom = (at: number | null | undefined) => (at ? `${Math.max(0, Math.ceil((at - Date.now()) / 60_000))} min` : "unknown");
@@ -293,6 +324,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return page(user.email, `
       <p>${statusText(user)}. ${user.backups} backup(s). ${user.pending ? PENDING : "Running config is up to date."}</p>
       ${user.details.status.state === "failed" ? `<p class="warn">${e(user.details.status.error)}</p>` : ""}
+      <p><a href="${base}/config">Edit config.yaml</a></p>
       <h2>Container</h2>
       ${(() => {
         const lease = user.details.lease as { state: string; reason?: string; stopsAt?: number; idleAt?: number };
@@ -310,9 +342,13 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
       <h2>Effective config</h2>
       <p>Role: <strong>${e(eff.role ?? "none")}</strong>, from ${e(SOURCE_TEXT[eff.source])}. Order: per-user override, then assigned role, then group, domain and default assignments.</p>
       ${providers || `<p class="muted">No providers. This user opens Hermes's own setup.</p>`}
-      <p>Reapplied every boot, and the role wins: ${e(Object.keys(templateKeys?.configManaged ?? {}).join(", ") || "none")}.<br>
+      <p>This account's config.yaml is <a href="${base}/config">edited here</a>. Saving restarts a running container, so an open session is disconnected.<br>
          Set once, then the user's to change: ${e(Object.keys(templateKeys?.configDefaults ?? {}).join(", ") || "none")}.<br>
          Environment variables from the role: ${e(Object.keys(templateKeys?.env ?? {}).join(", ") || "none")}.</p>
+
+      <h2>Environment variables for this user</h2>
+      <p class="muted">For keys that don't come from a role, such as one a base config.yaml names with <code>key_env</code>. These replace a value of the same name set for everyone or by the role.</p>
+      ${envSection(`${base}/env`, await envStatuses(c.env, { kind: "user", email: user.email }), await envStatuses(c.env, { kind: "base" }))}
 
       <h2>Role</h2>
       <form method="post" action="${base}/role"><label for="role">Assigned role</label>
@@ -439,6 +475,72 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return saveKey(c, { kind: "user", email }, email, back);
   });
 
+  admin.post("/u/:sub/env", async (c) => {
+    const sub = c.req.param("sub");
+    const back = `/__af/admin/u/${encodeURIComponent(sub)}`;
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return problem("No one with this ID has logged in.", "/__af/admin");
+    return saveEnv(c, { kind: "user", email }, email, back);
+  });
+
+  admin.get("/u/:sub/config", async (c) => {
+    const sub = c.req.param("sub");
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return page("Unknown user", `<p>No one with this ID has logged in.</p>`, 404);
+    const text = await loadUserConfig(c.env.BACKUP_BUCKET, sub);
+    const base = `/__af/admin/u/${encodeURIComponent(sub)}`;
+    return page(`config.yaml: ${email}`, `
+      <p><a href="${base}">Back to ${e(email)}</a></p>
+      ${text === null ? `<p class="muted">No config.yaml yet. It's created from the role's on this account's first start.</p>`
+        : `<p><a href="${base}/config.yaml">Download config.yaml</a></p>`}
+      <form method="post" action="${base}/config" enctype="multipart/form-data">
+        <label for="cfg-file">Upload a config.yaml</label>
+        <input type="file" id="cfg-file" name="file" accept=".yaml,.yml,text/yaml,text/plain" required>
+        <button>Upload and save</button>
+        <p class="muted">Replaces the whole file, with the same checks as Save below.</p>
+      </form>
+      ${configForm(`${base}/config`, text)}`);
+  });
+
+  admin.get("/u/:sub/config.yaml", async (c) => {
+    const sub = c.req.param("sub");
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    const text = email ? await loadUserConfig(c.env.BACKUP_BUCKET, sub) : null;
+    if (!email || text === null) return c.text("Not found", 404);
+    await audit(c, "config.download", email);
+    return new Response(text, {
+      headers: {
+        "content-type": "text/yaml; charset=utf-8",
+        "content-disposition": `attachment; filename="config.yaml"`,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  });
+
+  admin.post("/u/:sub/config", async (c) => {
+    const sub = c.req.param("sub");
+    const back = `/__af/admin/u/${encodeURIComponent(sub)}/config`;
+    const { identity: email } = await sandboxFor(c.env, sub).describe();
+    if (!email) return problem("No one with this ID has logged in.", "/__af/admin");
+    const body = await c.req.parseBody();
+    // The upload form sends a file, the editor sends text. Either way it's the whole document.
+    const raw = body.file instanceof File ? await body.file.text() : String(body.config ?? "");
+    // Editors on Windows can save a byte-order mark and CRLF line ends.
+    const text = raw.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+    const check = checkConfigText(text);
+    if (!check.ok) return problem(check.error, back);
+    const result = await sandboxFor(c.env, sub).applyConfigEdit(check.text);
+    if ("error" in result) {
+      // The detail can quote files or logs, so it goes to the logs and not the page.
+      console.error(`[admin:config:${sub}] ${result.error}`);
+      await audit(c, "config.failed", email);
+      return problem("The snapshot failed, so the container stays up and nothing changed. Check the logs and try again.", back);
+    }
+    await audit(c, "config.save", email, { result: result.status, bytes: new TextEncoder().encode(check.text).length });
+    return seeOther(`/__af/admin/u/${encodeURIComponent(sub)}`);
+  });
+
   admin.post("/u/:sub/apply", async (c) => {
     const sub = c.req.param("sub");
     const back = `/__af/admin/u/${encodeURIComponent(sub)}`;
@@ -467,6 +569,7 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return page("Roles", `<p class="muted">A role sets which models people see in the picker, their default and the provider settings. Roles make choosing easy; they don't limit access. The provider key is readable by each user's agent, so anyone can reach what that key allows.</p>
       <div class="scroll"><table><tr><th>Role</th><th>Models</th><th>Assigned people</th></tr>${rows.join("") || `<tr><td colspan="3" class="muted">No roles yet.</td></tr>`}</table></div>
       <p>Everyone else gets: <code>${e(assignments.default ?? "nothing")}</code>.</p>
+      <p><a href="/__af/admin/base-config">Edit the base config.yaml</a>: what a new account starts with when its role has no config.yaml, or it has no role.</p>
       <h2>Create a role</h2>
       <form method="get" action="/__af/admin/roles/new"><label for="name">Name</label><input id="name" type="text" name="name"><button>Continue</button></form>
       <h2>Assign someone who hasn't logged in yet</h2>
@@ -483,11 +586,58 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     return error ? problem(error, "/__af/admin/roles") : seeOther("/__af/admin/roles");
   });
 
+  admin.get("/base-config", async (c) => {
+    const text = await loadBaseConfig(c.env.BACKUP_BUCKET);
+    return page("Base config.yaml", `
+      <p><a href="/__af/admin/roles">Back to roles</a></p>
+      <p class="muted">Seeds each new account that has no config.yaml yet, on its first start, unless its role has a config.yaml of its own. Accounts that already have one keep it, including everyone restored from a backup: change those on the account's page.</p>
+      ${text === null ? `<p class="muted">There is no base config.yaml yet.</p>` : ""}
+      ${configForm("/__af/admin/base-config", text)}
+      <h2>Environment variables for everyone</h2>
+      <p class="muted">Written to every account's <code>.env</code> at its next boot, whatever its role: the place for a shared key that the base config.yaml names with <code>key_env</code>. A role's value of the same name replaces it, and a user's own replaces both.</p>
+      ${envSection("/__af/admin/base-env", await envStatuses(c.env, { kind: "base" }))}`);
+  });
+
+  admin.post("/base-env", (c) => saveEnv(c, { kind: "base" }, "base", "/__af/admin/base-config"));
+
+  admin.post("/base-config", async (c) => {
+    const text = String((await c.req.parseBody()).config ?? "").replace(/\r\n/g, "\n");
+    const check = checkConfigText(text);
+    if (!check.ok) return problem(check.error, "/__af/admin/base-config");
+    await saveBaseConfig(c.env.BACKUP_BUCKET, check.text);
+    await audit(c, "base.config.save", "base", { bytes: new TextEncoder().encode(check.text).length });
+    return seeOther("/__af/admin/roles");
+  });
+
   // Registered before /roles/:name would match "new".
   admin.get("/roles/new", (c) => {
     const name = (c.req.query("name") ?? "").trim();
     if (!ROLE_RE.test(name)) return problem("Role names are letters, digits, dashes and underscores.", "/__af/admin/roles");
     return seeOther(`/__af/admin/roles/${encodeURIComponent(name)}`);
+  });
+
+  admin.get("/roles/:name/config", async (c) => {
+    const role = c.req.param("name");
+    if (!ROLE_RE.test(role)) return page("Unknown role", `<p>That isn't a role name.</p>`, 404);
+    const text = await loadRoleConfig(c.env.BACKUP_BUCKET, role);
+    const base = `/__af/admin/roles/${encodeURIComponent(role)}`;
+    return page(`config.yaml: role ${role}`, `
+      <p><a href="${base}">Back to role ${e(role)}</a></p>
+      <p class="muted">Seeds each account in this role that has no config.yaml yet, on its first start. Accounts that already have one keep it: change those on the account's page.</p>
+      ${text === null ? `<p class="muted">This role has no config.yaml yet.</p>` : ""}
+      ${configForm(`${base}/config`, text)}`);
+  });
+
+  admin.post("/roles/:name/config", async (c) => {
+    const role = c.req.param("name");
+    const back = `/__af/admin/roles/${encodeURIComponent(role)}/config`;
+    if (!ROLE_RE.test(role)) return problem("Role names are letters, digits, dashes and underscores.", "/__af/admin/roles");
+    const text = String((await c.req.parseBody()).config ?? "").replace(/\r\n/g, "\n");
+    const check = checkConfigText(text);
+    if (!check.ok) return problem(check.error, back);
+    await saveRoleConfig(c.env.BACKUP_BUCKET, role, check.text);
+    await audit(c, "role.config.save", role, { bytes: new TextEncoder().encode(check.text).length });
+    return seeOther(`/__af/admin/roles/${encodeURIComponent(role)}`);
   });
 
   admin.get("/roles/:name", async (c) => {
@@ -522,8 +672,11 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
       <form method="post" action="${base}/key"><input type="hidden" name="provider" value="${e(provider.name)}">
         <label for="r-key">New key</label><input id="r-key" type="password" name="value" autocomplete="off">
         <button name="action" value="set">Save key</button><button name="action" value="clear">Remove this role's key</button></form>` : ""}
+      <h2>config.yaml</h2>
+      <p class="warn">Only the keys and the selected model come from this form. Models, endpoints, gateway names and headers are not written into config.yaml: the role's config.yaml sets those.</p>
+      <p><a href="${base}/config">Edit the role's config.yaml</a></p>
       <h2>When changes take effect</h2>
-      <p>At each assigned user's next boot. The Users screen shows who is waiting, and their page can apply it now. Other settings in this role's template, such as <code>config_managed</code>, stay as they are.</p>`);
+      <p>Keys and environment variables apply at each assigned user's next boot. The config.yaml applies only to accounts that don't have one yet.</p>`);
   });
 
   admin.post("/roles/:name", async (c) => {
@@ -610,6 +763,23 @@ export function adminScreens(admin: App, sandboxFor: SandboxFor, activeUsers: (b
     if (value.length > MAX_KEY_LENGTH || /[\r\n]/.test(value)) return problem("A key is a single line of up to 4096 characters.", back);
     await setProviderKey(c.env, scope, provider, value);
     await audit(c, "key.set", target, { scope: scope.kind, provider });
+    return seeOther(back);
+  }
+
+  async function saveEnv(c: Ctx, scope: EnvScope, target: string, back: string): Promise<Response> {
+    const body = await c.req.parseBody();
+    const name = String(body.name ?? "").trim();
+    if (!ENV_NAME_RE.test(name)) return problem("A variable name is letters, digits and underscores, and doesn't start with a digit.", back);
+    if (body.action === "clear") {
+      await clearEnvValue(c.env, scope, name);
+      await audit(c, "env.clear", target, { scope: scope.kind, name });
+      return seeOther(back);
+    }
+    const value = String(body.value ?? "").trim();
+    if (!value) return problem("Enter a value, or use remove.", back);
+    if (value.length > MAX_KEY_LENGTH || /[\r\n]/.test(value)) return problem("A value is a single line of up to 4096 characters.", back);
+    await setEnvValue(c.env, scope, name, value);
+    await audit(c, "env.set", target, { scope: scope.kind, name });
     return seeOther(back);
   }
 }

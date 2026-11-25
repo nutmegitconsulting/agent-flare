@@ -17,3 +17,6 @@ templates/*
 !templates/assignments.example.json
 !templates/model-tiers.example.json
 AGENTS.md
+IDEA.md
+# Local working notes and handoffs; never committed.
+handoffs/
