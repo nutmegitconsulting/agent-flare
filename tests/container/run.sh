@@ -56,6 +56,8 @@ DOC=$(printf '{%s}' "$PROVIDER" | "$PYHOST" -c 'import json,sys; print(json.dump
 echo "== unit tests"
 docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_af_state.py 2>&1 | tail -4
 docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_sandbox_fs.py 2>&1 | tail -4
+docker run --rm --entrypoint "$PY" -v "$PWD/tests/container:/t:ro" "$IMAGE" /t/test_sandbox_shell.py 2>&1 | tail -4
+docker run --rm --entrypoint sandbox "$IMAGE" --help | grep -q "Opens a shell in your sandbox" && ok "the sandbox command is on the path" || { echo "FAIL - no sandbox command"; exit 1; }
 
 echo "== webapp"
 dx() { docker exec -i "$NAME" bash -c "$1"; }

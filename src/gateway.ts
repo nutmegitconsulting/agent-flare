@@ -50,8 +50,9 @@ export class SandboxGateway extends WorkerEntrypoint<Env> {
     headers.delete("CF-Access-Client-Id");
     headers.delete("CF-Access-Client-Secret");
 
-    // Bodies are small JSON commands (capped at 64 KB by the sidecar), so buffer
-    // rather than stream; the plugin never sends a streaming body.
+    // Bodies are JSON commands the sidecar caps, so buffer rather than stream; the plugin never
+    // sends a streaming body. The `sandbox` command's shell is a WebSocket upgrade (GET /pty): it
+    // has no body, and the binding's 101 response goes back as it is.
     const body = request.method === "GET" ? undefined : await request.arrayBuffer();
     return binding.fetch(new Request(request, { headers, body }));
   }

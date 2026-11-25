@@ -55,7 +55,8 @@ Browser ──Access──▶ agent-flare Worker ──▶ AgentSandbox DO (one 
    COPY, or installed per user) subclasses Hermes' `BaseEnvironment` and implements only `_run_bash()` —
    the same primitive the built-in SSH backend implements — inheriting background-process plumbing, env
    bookkeeping, cwd tracking, stdin, bounded output and the timeout backstop. Its local client POSTs the
-   command to the gateway hostname and streams the result through a real `Popen`, so the inherited machinery
+   command to the gateway hostname and hands back the result, which arrives whole when the command ends,
+   through a real `Popen`, so the inherited machinery
    is exercised identically to SSH.
 
 ---
@@ -103,7 +104,7 @@ plugin's URL simply doesn't resolve and Hermes reports a command failure. No sil
 | `ONBOARDING.md` | build-variable row + "per-user dev sandboxes" section |
 
 **Sidecar** (`~/cf-dev-sandbox/`, tarball at `~/cf-dev-sandbox.tar.gz`): `worker/` (Worker + `DevSandbox` DO:
-`/exec`, `/home`, `/status`, alarm snapshot recipe, output cap 1 MiB, 64 KB command cap, server-side exec
+`/exec`, `/home`, `/status`, `/pty`, alarm snapshot recipe, output cap 1 MiB, 1 MiB command cap, server-side exec
 deadline with the documented safe AbortController pattern), `plugin/cloudflare_sandbox/` (the Hermes
 backend), `scripts/smoke.sh`, `tests/` (contract test), `README.md`.
 
@@ -174,7 +175,34 @@ names for Path-B testing; nothing needs setting in Path A.)
 4. Persistence: drop a marker file in the sandbox, let it idle past the snapshot+stop cycle
    (check every 60 s, idle limit 10 min), then run a command again — the marker should still be there.
 
-### 4.5 Roll back / turn off
+5. The `sandbox` command: open a terminal tab in Hermes and run `sandbox`. The prompt changes to the
+   sandbox's (`root@...:/workspace#`), `ls` shows the agent's files, and `exit` returns to the tab's own
+   shell. `wrangler tail` on the sidecar shows `GET /pty 101`.
+
+### 4.5 A shell in the sandbox for the user: the `sandbox` command
+
+Hermes' terminal pane always opens a shell beside Hermes (`/api/host-terminal` spawns a local PTY and never
+asks the terminal backend), and it has no hook for another kind of terminal. So the pane is left alone and
+the image carries a command: `sandbox`, typed in any terminal tab, attaches that tab to an interactive shell
+in the user's sandbox. Tabs where it isn't typed stay local.
+
+- **Sidecar:** `GET /pty` is a WebSocket. The Durable Object runs `bash -l` on a pseudo-terminal in the
+  container (`container.exec` with `pty`) and carries the terminal's bytes as binary frames both ways. Text
+  frames are control: `{"resize":[cols,rows]}` in; `{"exit":code}` or `{"error":message}` out, before the
+  close. At most 8 shells per sandbox.
+- **Idle:** a shell with input or output in the last minute counts as a command in flight, so no snapshot or
+  stop lands under someone typing. A shell left alone doesn't hold the sandbox up: after the usual 10 minutes
+  with no activity the sandbox is saved and stopped, and the tab is told why. Files are kept; what was
+  running in the shell is not.
+- **Closing the tab** hangs up everything on that shell's terminal, as closing a real terminal does.
+- **Client:** `container/plugins/cloudflare_sandbox/shell_client.py`, run by `/usr/local/bin/sandbox` with
+  Hermes' Python. It uses the plugin's settings from the environment or Hermes' `.env`, and goes through the
+  same gateway, so the sandbox is the one named by the verified identity. A tab opened in a folder of
+  Hermes' workspace starts in the same folder of `/workspace`.
+- **Tests:** `tests/container/test_sandbox_shell.py` drives the command under a pseudo-terminal against a
+  stand-in for `/pty`; `SANDBOX_SHELL_URL=http://localhost:PORT` points it at a sidecar under `wrangler dev`.
+
+### 4.6 Roll back / turn off
 
 Remove `AF_DEV_SANDBOX_WORKER` from the build variables and redeploy: the rendered config loses the binding;
 running containers lose nothing (their snapshot survives in the sidecar until the 30-day TTL; an unused

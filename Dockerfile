@@ -130,12 +130,17 @@ COPY --chown=root:root container/af_state.py /usr/local/lib/af_state.py
 COPY --chown=root:root start-hermes.sh /usr/local/bin/start-hermes.sh
 COPY --chown=root:root container/desktop-plugins/agent-flare/plugin.js /usr/local/lib/af-desktop-plugin.js
 # af-python: Hermes' own venv, which provides ruamel.yaml for af_state.py.
+# sandbox: typed in Hermes' terminal pane, which is always a shell beside Hermes, it opens a shell in the
+# user's dev sandbox (the plugin's shell_client.py, which needs the venv's websockets).
 # .install_method: the marker Hermes' own image carries. With it Hermes neither checks for nor offers an
 # update: one applied in a container is gone at the next stop, and the version is this image's to set.
 RUN chmod +x /usr/local/bin/start-hermes.sh \
     && printf 'docker\n' > /opt/hermes-install/hermes-agent/.install_method \
     && printf '#!/bin/sh\nexec %s "$@"\n' "$(ls -d /opt/hermes-install/installs/*/environments/*/venv/bin/python | head -1)" > /usr/local/bin/af-python \
     && chmod +x /usr/local/bin/af-python \
+    && printf '#!/bin/sh\nexec /usr/local/bin/af-python /opt/hermes-install/hermes-agent/plugins/cloudflare_sandbox/shell_client.py "$@"\n' > /usr/local/bin/sandbox \
+    && chmod +x /usr/local/bin/sandbox \
+    && af-python -c "import websockets.sync.client" \
     && af-python -c "import ruamel.yaml" \
     && HERMES_HOME=/opt/hermes-install hermes --version
 
