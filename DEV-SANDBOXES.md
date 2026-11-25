@@ -176,7 +176,7 @@ names for Path-B testing; nothing needs setting in Path A.)
    (check every 60 s, idle limit 10 min), then run a command again — the marker should still be there.
 
 5. The `sandbox` command: open a terminal tab in Hermes and run `sandbox`. The prompt changes to the
-   sandbox's (`root@...:/workspace#`), `ls` shows the agent's files, and `exit` returns to the tab's own
+   sandbox's (`sandbox:/workspace#`), `ls` shows the agent's files, and `exit` returns to the tab's own
    shell. `wrangler tail` on the sidecar shows `GET /pty 101`.
 
 ### 4.5 A shell in the sandbox for the user: the `sandbox` command

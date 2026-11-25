@@ -70,7 +70,7 @@ Only so many agents can be awake at once, and that many already are. Your work i
 
 ## A terminal where the agent works
 
-A terminal tab opens beside Hermes, not where your agent runs its commands and keeps its files. To get a shell there, type `sandbox` in a terminal tab. The prompt changes to `root@...:/workspace#`. Type `exit` to come back.
+A terminal tab opens beside Hermes, not where your agent runs its commands and keeps its files. To get a shell there, type `sandbox` in a terminal tab. The prompt changes to `sandbox:/workspace#`. Type `exit` to come back.
 
 If you leave that shell alone for 10 minutes with nothing else running, the sandbox saves your files and stops, and the tab says so. Run `sandbox` again to carry on.
 
